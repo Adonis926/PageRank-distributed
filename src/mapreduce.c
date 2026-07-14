@@ -634,10 +634,11 @@ static int run_worker(const worker_args *args, Mapper map, Reducer reduce,
     }
 
     if (!args->quiet) {
-        printf("worker[%" PRIu64 "]: backend=%s path=%s payload_max=%" PRIu64
-               " queue=%" PRIu64 " notify=hydrarpc-poll\n",
+        printf("worker[%" PRIu64 "]: backend=%s path=%s size=%" PRIu64
+               " payload_max=%" PRIu64 " queue=%" PRIu64
+               " notify=hydrarpc-poll\n",
                args->worker_id, mr_backend_name(args->backend), args->path,
-               hydra_payload_max(ctx), hydra_queue_capacity(ctx));
+               args->map_size, hydra_payload_max(ctx), hydra_queue_capacity(ctx));
         fflush(stdout);
     }
 
@@ -780,10 +781,10 @@ static int run_master(const master_args *args)
     intermediate_init = true;
 
     if (!args->quiet) {
-        printf("master: workers=%zu reducers=%d backend=%s payload_max=%" PRIu64
-               " map_chunks=%zu notify=hydrarpc-poll\n",
+        printf("master: workers=%zu reducers=%d backend=%s size=%" PRIu64
+               " payload_max=%" PRIu64 " map_chunks=%zu notify=hydrarpc-poll\n",
                args->workers.len, reducer_count, mr_backend_name(args->backend),
-               args->payload_max, slice_count);
+               args->map_size, args->payload_max, slice_count);
         fflush(stdout);
     }
 

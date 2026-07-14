@@ -49,6 +49,7 @@ Common distributed options:
   --payload-max=N
   --map-chunk=N
   --queue-capacity=N
+  --size=N
   --repeat=N
   --warmup=N
 
@@ -56,7 +57,8 @@ This script does not start QEMU VMs by default. It uses SSH to start commands
 inside already-running VMs and leaves HydraRPC backend paths as the data plane.
 Prefer the comma-separated --worker form for devdax/ivshmem paths, because PCI
 BDF paths contain ':' characters. Remote configure/build output is copied into
-logs/prepare_<host>.log instead of stdout.
+logs/prepare_<host>.log instead of stdout. For devdax, --size must match the
+mapped device size.
 USAGE
 }
 
@@ -77,6 +79,7 @@ reducers=""
 payload_max=1048576
 map_chunk=""
 queue_capacity=4096
+map_size=67108864
 ssh_user=""
 ssh_key=""
 remote_dir="/tmp/mr-bench"
@@ -103,6 +106,7 @@ while (($#)); do
     --payload-max=*) payload_max=${1#*=} ;;
     --map-chunk=*) map_chunk=${1#*=} ;;
     --queue-capacity=*) queue_capacity=${1#*=} ;;
+    --size=*) map_size=${1#*=} ;;
     --ssh-user=*) ssh_user=${1#*=} ;;
     --ssh-key=*) ssh_key=${1#*=} ;;
     --remote-dir=*) remote_dir=${1#*=} ;;
@@ -278,6 +282,7 @@ run_local_once() {
     --workers="$worker_paths" \
     --payload-max="$payload_max" \
     --queue-capacity="$queue_capacity" \
+    --size="$map_size" \
     ${reducers:+--reducers="$reducers"} \
     ${map_chunk:+--map-chunk="$map_chunk"} \
     --quiet > "$output_dir/logs/${phase}_${index}_master.log" 2>&1 &
@@ -294,6 +299,7 @@ run_local_once() {
       --worker-id="$i" \
       --payload-max="$payload_max" \
       --queue-capacity="$queue_capacity" \
+      --size="$map_size" \
       --quiet > "$output_dir/logs/${phase}_${index}_worker${i}.log" 2>&1 &
     worker_pids+=("$!")
   done
@@ -385,14 +391,14 @@ run_ssh_once() {
   worker_arg=$(IFS=,; printf '%s' "${master_paths[*]}")
 
   start=$(now_ms)
-  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --workers='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
+  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --workers='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
   master_pid=$!
 
   sleep 0.5
   worker_pids=()
   local i
   for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
-    remote_cmd "${worker_hosts[$i]}" "'${remote_repo:-$repo}/build/mr_hydra' worker --backend='$backend' --path='${worker_paths[$i]}' --worker-id='$i' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
+    remote_cmd "${worker_hosts[$i]}" "'${remote_repo:-$repo}/build/mr_hydra' worker --backend='$backend' --path='${worker_paths[$i]}' --worker-id='$i' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
     worker_pids+=("$!")
   done
 
@@ -492,7 +498,7 @@ read -r run_ms_avg run_ms_min run_ms_max < <(
 
 throughput_mib_s=$(awk -v bytes="$input_bytes" -v ms="$run_ms_avg" 'BEGIN { if (ms <= 0) print "0"; else printf "%.3f", bytes / 1048576 / (ms / 1000) }')
 worker_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
-details="mode=${mode};backend=${backend};workers=${worker_count};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity}"
+details="mode=${mode};backend=${backend};workers=${worker_count};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size}"
 
 cat > "$output_dir/result.env" <<EOF
 impl_name=distributed
@@ -524,6 +530,7 @@ cat > "$output_dir/result.json" <<EOF
   "payload_max": $payload_max,
   "map_chunk": "${map_chunk:-auto}",
   "queue_capacity": $queue_capacity,
+  "size": $map_size,
   "input_bytes": $input_bytes
 }
 EOF

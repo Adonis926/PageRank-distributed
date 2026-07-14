@@ -66,21 +66,23 @@ master 默认创建并初始化 file backend；worker 默认 attach。master 结
 
 ## 多机运行
 
-每个 worker 使用一段能被 master 和该 worker 同时访问的 HydraRPC 后端，例如 CXL/DAX、ivshmem resource，或实验环境中的共享文件后端：
+每个 worker 使用一段能被 master 和该 worker 同时访问的 HydraRPC 后端，例如 devdax、ivshmem resource，或实验环境中的共享文件后端。当前 QEMU 测试默认使用 devdax：
 
 ```bash
 # master 节点
 ./build/mr_hydra master \
-  --backend=ivshmem \
+  --backend=devdax \
   --input=input.txt \
   --output=wc.out \
-  --worker=/sys/bus/pci/devices/0000:00:05.0/resource2
+  --worker=/dev/dax0.0 \
+  --size=2097152000
 
 # worker 节点
 ./build/mr_hydra worker \
-  --backend=ivshmem \
-  --path=/sys/bus/pci/devices/0000:00:05.0/resource2 \
-  --worker-id=0
+  --backend=devdax \
+  --path=/dev/dax0.0 \
+  --worker-id=0 \
+  --size=2097152000
 ```
 
 常用参数：
@@ -93,6 +95,7 @@ master 默认创建并初始化 file backend；worker 默认 attach。master 结
 - `--payload-max=N`：单条 HydraRPC payload 上限，默认 `1048576`。
 - `--map-chunk=N`：map 输入分片大小，默认约为 `payload-max / 4`。
 - `--queue-capacity=N`：HydraRPC 队列容量，默认 `4096`。
+- `--size=N`：HydraRPC 后端映射大小；devdax 场景应与设备映射大小一致，例如 `2097152000`。
 - `--create`：worker 侧也创建/初始化后端，主要用于调试；正常多机运行由 master 创建。
 
 通信轮询固定使用 HydraRPC 的 busy poll 等待路径，即 `hydrarpc-poll`。
@@ -106,14 +109,15 @@ scripts/mr-bench.sh \
   --impl=distributed \
   --dist-mode=ssh \
   --dist-master-host=127.0.0.1:2401 \
-  --dist-worker=127.0.0.1:2402,/sys/bus/pci/devices/0000:00:05.0/resource2,/sys/bus/pci/devices/0000:00:05.0/resource2 \
-  --dist-backend=ivshmem \
+  --dist-worker=127.0.0.1:2402,/dev/dax0.0,/dev/dax0.0 \
+  --dist-backend=devdax \
+  --dist-size=2097152000 \
   --dist-reducers=4 \
   --dist-payload-max=4194304 \
   --dist-map-chunk=524288
 ```
 
-`--dist-worker` 推荐使用逗号分隔格式 `HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH`，因为 PCI BDF 路径包含 `:`，冒号分隔格式容易产生歧义。
+`--dist-worker` 推荐使用逗号分隔格式 `HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH`；对 devdax 来说，master 和 worker 侧路径通常都是 `/dev/dax0.0`，但仍保留两端路径字段，便于不同 VM 中设备名不一致时覆盖。
 
 根目录的 `scripts/example.sh` 封装了两台普通 QEMU VM 的默认场景：
 
@@ -123,8 +127,10 @@ VM2=127.0.0.1:2402 \
 SSH_USER=xtl \
 REMOTE_REPO=/home/xtl/mr/mr-distributed \
 REMOTE_HYDRARPC_ROOT=/home/xtl/HydraRPC \
-MASTER_TO_VM2_PATH=/sys/bus/pci/devices/0000:00:05.0/resource2 \
-VM2_WORKER_PATH=/sys/bus/pci/devices/0000:00:05.0/resource2 \
+BACKEND=devdax \
+MASTER_TO_VM2_PATH=/dev/dax0.0 \
+VM2_WORKER_PATH=/dev/dax0.0 \
+SIZE=2097152000 \
 scripts/example.sh
 ```
 
