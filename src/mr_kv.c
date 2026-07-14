@@ -1,6 +1,7 @@
 #include "mr_kv.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,6 +85,80 @@ void mr_partitions_sort(mr_partitions *partitions)
     }
 }
 
+static void partition_emit(mr_partition *partition, const char *key,
+                           const char *value)
+{
+    ensure_capacity(partition);
+    partition->pairs[partition->len].key = mr_xstrdup(key);
+    partition->pairs[partition->len].value = mr_xstrdup(value);
+    partition->len++;
+}
+
+static bool parse_count_value(const char *value, uint64_t *out)
+{
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0') {
+        return false;
+    }
+    *out = (uint64_t)parsed;
+    return true;
+}
+
+void mr_partitions_combine_counts(mr_partitions *partitions)
+{
+    mr_partitions_sort(partitions);
+
+    for (int i = 0; i < partitions->count; i++) {
+        mr_partition *partition = &partitions->items[i];
+        mr_partition combined_partition = {0};
+        size_t read = 0;
+
+        while (read < partition->len) {
+            char *key = partition->pairs[read].key;
+            uint64_t total = 0;
+            bool can_combine = true;
+            size_t group_start = read;
+
+            while (read < partition->len &&
+                   strcmp(partition->pairs[read].key, key) == 0) {
+                uint64_t value = 0;
+                if (!parse_count_value(partition->pairs[read].value, &value)) {
+                    can_combine = false;
+                } else {
+                    total += value;
+                }
+                read++;
+            }
+
+            if (can_combine) {
+                char combined[32];
+                int n = snprintf(combined, sizeof(combined), "%" PRIu64, total);
+                if (n < 0 || (size_t)n >= sizeof(combined)) {
+                    fprintf(stderr, "combined count overflow\n");
+                    exit(1);
+                }
+
+                partition_emit(&combined_partition, partition->pairs[group_start].key,
+                               combined);
+            } else {
+                for (size_t j = group_start; j < read; j++) {
+                    partition_emit(&combined_partition, partition->pairs[j].key,
+                                   partition->pairs[j].value);
+                }
+            }
+        }
+
+        for (size_t j = 0; j < partition->len; j++) {
+            free(partition->pairs[j].key);
+            free(partition->pairs[j].value);
+        }
+        free(partition->pairs);
+        *partition = combined_partition;
+    }
+}
+
 char *mr_partitions_get_next(mr_partitions *partitions, char *key,
                              int partition_number)
 {
@@ -105,15 +180,20 @@ char *mr_partitions_get_next(mr_partitions *partitions, char *key,
     return pair->value;
 }
 
-static int serialize_pair(byte_buf *out, uint64_t partition_id,
-                          const mr_kv_pair *pair, size_t payload_limit)
+size_t mr_kv_pair_wire_size(const mr_kv_pair *pair)
+{
+    return sizeof(mr_kv_wire_entry) + strlen(pair->key) + strlen(pair->value);
+}
+
+int mr_kv_pair_serialize(byte_buf *out, uint64_t partition_id,
+                         const mr_kv_pair *pair, size_t payload_limit)
 {
     mr_kv_wire_entry entry = {
         .partition_id = partition_id,
         .key_len = strlen(pair->key),
         .value_len = strlen(pair->value),
     };
-    size_t need = sizeof(entry) + (size_t)entry.key_len + (size_t)entry.value_len;
+    size_t need = mr_kv_pair_wire_size(pair);
 
     if (payload_limit > 0 && out->len + need > payload_limit) {
         return EMSGSIZE;
@@ -131,8 +211,8 @@ int mr_partitions_serialize(const mr_partitions *partitions, byte_buf *out,
     for (int i = 0; i < partitions->count; i++) {
         const mr_partition *partition = &partitions->items[i];
         for (size_t j = 0; j < partition->len; j++) {
-            int err = serialize_pair(out, (uint64_t)i, &partition->pairs[j],
-                                     payload_limit);
+            int err = mr_kv_pair_serialize(out, (uint64_t)i,
+                                           &partition->pairs[j], payload_limit);
             if (err != 0) {
                 return err;
             }
@@ -150,8 +230,8 @@ int mr_partition_serialize(const mr_partitions *partitions, int partition_number
 
     const mr_partition *partition = &partitions->items[partition_number];
     for (size_t i = 0; i < partition->len; i++) {
-        int err = serialize_pair(out, (uint64_t)partition_number,
-                                 &partition->pairs[i], payload_limit);
+        int err = mr_kv_pair_serialize(out, (uint64_t)partition_number,
+                                       &partition->pairs[i], payload_limit);
         if (err != 0) {
             return err;
         }

@@ -4,6 +4,33 @@
 
 当前示例应用是 word count。分布式 runtime 保留了接近单机多线程版的结构：应用只实现 `map` / `reduce`，map 和 reduce 都通过 `MR_Emit` 产出 KV，runtime 负责 partition、排序、`Getter get_next`、HydraRPC 调度和结果写出。
 
+## 运行时结构
+
+当前数据流分为三个阶段：
+
+1. master 将输入按 `--map-chunk` 切片，向 worker 发送 map 任务。
+2. worker 在本地执行 map、partition、排序，并执行 count 型 combiner：同一 partition 内相同 key 且 value 均为十进制无符号整数时会先累加成一条 KV；不能安全累加的 KV 会原样保留。
+3. master 汇总中间结果并按 reducer partition 进行 shuffle。shuffle 使用 `ShuffleChunkHeader` 分块发送，每个 partition 至少包含一个带 `SHUFFLE_CHUNK_FIRST` 和 `SHUFFLE_CHUNK_LAST` 标志的 chunk；大 partition 会拆成多个 chunk，worker 端按 `job_id`、`reducer_id`、`partition_seq`、`chunk_seq` 顺序重组后再执行 reduce。
+
+`ShuffleChunkHeader` 当前字段如下：
+
+```c
+typedef struct ShuffleChunkHeader {
+    uint64_t job_id;
+    uint32_t mapper_id;
+    uint32_t reducer_id;
+
+    uint64_t partition_seq;
+    uint32_t chunk_seq;
+    uint32_t flags;
+
+    uint32_t record_count;
+    uint32_t payload_bytes;
+} ShuffleChunkHeader;
+```
+
+`mapper_id` 当前由 master 侧 shuffle 填 0；`record_count` 用于描述 chunk 内 KV 条数，便于后续统计和协议扩展。
+
 ## 构建
 
 ```bash
@@ -69,3 +96,44 @@ master 默认创建并初始化 file backend；worker 默认 attach。master 结
 - `--create`：worker 侧也创建/初始化后端，主要用于调试；正常多机运行由 master 创建。
 
 通信轮询固定使用 HydraRPC 的 busy poll 等待路径，即 `hydrarpc-poll`。
+
+## Benchmark 脚本
+
+推荐从仓库根目录使用通用脚本：
+
+```bash
+scripts/mr-bench.sh \
+  --impl=distributed \
+  --dist-mode=ssh \
+  --dist-master-host=127.0.0.1:2401 \
+  --dist-worker=127.0.0.1:2402,/sys/bus/pci/devices/0000:00:05.0/resource2,/sys/bus/pci/devices/0000:00:05.0/resource2 \
+  --dist-backend=ivshmem \
+  --dist-reducers=4 \
+  --dist-payload-max=4194304 \
+  --dist-map-chunk=524288
+```
+
+`--dist-worker` 推荐使用逗号分隔格式 `HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH`，因为 PCI BDF 路径包含 `:`，冒号分隔格式容易产生歧义。
+
+根目录的 `scripts/example.sh` 封装了两台普通 QEMU VM 的默认场景：
+
+```bash
+VM1=127.0.0.1:2401 \
+VM2=127.0.0.1:2402 \
+SSH_USER=xtl \
+REMOTE_REPO=/home/xtl/mr/mr-distributed \
+REMOTE_HYDRARPC_ROOT=/home/xtl/HydraRPC \
+MASTER_TO_VM2_PATH=/sys/bus/pci/devices/0000:00:05.0/resource2 \
+VM2_WORKER_PATH=/sys/bus/pci/devices/0000:00:05.0/resource2 \
+scripts/example.sh
+```
+
+脚本不会启动虚拟机；QEMU、ivshmem 后端和 SSH 端口转发需要提前准备好。SSH 只作为控制面，用于远端 build、启动 master/worker、复制输入和结果；HydraRPC 的共享内存后端才是被测数据面。远端 configure/build 输出会写入结果目录中的 `runs/distributed/logs/prepare_<host>.log`，每次运行结束都会生成结果目录和同名 `.tar.gz` 压缩包。
+
+两 VM 场景建议先使用如下基线：
+
+- `REDUCERS=4`：降低单个 reducer partition 的峰值 payload，同时保持请求数量可控。
+- `PAYLOAD_MAX=4194304`：给 chunk header 和 KV payload 留出余量，避免普通 wordcount 输入过早碰到单请求上限。
+- `MAP_CHUNK=524288`：map 输入切片足够细，便于观察通信开销，又不会制造过多调度请求。
+
+如果 workload 的词表很小、热点 key 很集中，可以继续增大 `REDUCERS` 或减小 `MAP_CHUNK`；如果关注纯吞吐并且已经确认不会触发 payload 上限，可以增大 `MAP_CHUNK` 减少 map 请求数量。

@@ -67,6 +67,15 @@ typedef struct worker_args {
     bool quiet;
 } worker_args;
 
+typedef struct shuffle_accumulator {
+    bool active;
+    uint64_t job_id;
+    uint32_t reducer_id;
+    uint64_t partition_seq;
+    uint32_t next_chunk_seq;
+    byte_buf payload;
+} shuffle_accumulator;
+
 static emit_context current_emit;
 static mr_partitions *current_reduce_input;
 static int current_reduce_partition_number;
@@ -359,6 +368,7 @@ static int worker_map(Mapper map, Partitioner partitioner, const char *data,
     map(data, len);
     clear_emit_context();
 
+    mr_partitions_combine_counts(&partitions);
     int err = mr_partitions_serialize(&partitions, out, payload_limit);
     mr_partitions_destroy(&partitions);
     return err;
@@ -401,6 +411,216 @@ static int worker_reduce(Reducer reduce, const char *data, size_t len,
     return err;
 }
 
+static void shuffle_accumulator_reset(shuffle_accumulator *acc)
+{
+    byte_buf_clear(&acc->payload);
+    memset(acc, 0, sizeof(*acc));
+}
+
+static int parse_shuffle_chunk(const char *data, size_t len,
+                               ShuffleChunkHeader *chunk,
+                               const char **payload, size_t *payload_len)
+{
+    if (len < sizeof(*chunk)) {
+        return EINVAL;
+    }
+
+    memcpy(chunk, data, sizeof(*chunk));
+    if (chunk->payload_bytes > len - sizeof(*chunk)) {
+        return EINVAL;
+    }
+    if (chunk->flags & ~(SHUFFLE_CHUNK_FIRST | SHUFFLE_CHUNK_LAST)) {
+        return EINVAL;
+    }
+
+    *payload = data + sizeof(*chunk);
+    *payload_len = chunk->payload_bytes;
+    return 0;
+}
+
+static int worker_reduce_chunk(Reducer reduce, shuffle_accumulator *acc,
+                               const char *data, size_t len,
+                               size_t payload_limit, byte_buf *out)
+{
+    ShuffleChunkHeader chunk = {0};
+    const char *payload = NULL;
+    size_t payload_len = 0;
+    int err = parse_shuffle_chunk(data, len, &chunk, &payload, &payload_len);
+    if (err != 0) {
+        return err;
+    }
+
+    bool first = (chunk.flags & SHUFFLE_CHUNK_FIRST) != 0;
+    bool last = (chunk.flags & SHUFFLE_CHUNK_LAST) != 0;
+
+    if (first) {
+        shuffle_accumulator_reset(acc);
+        acc->active = true;
+        acc->job_id = chunk.job_id;
+        acc->reducer_id = chunk.reducer_id;
+        acc->partition_seq = chunk.partition_seq;
+        acc->next_chunk_seq = 0;
+    }
+
+    if (!acc->active || chunk.job_id != acc->job_id ||
+        chunk.reducer_id != acc->reducer_id ||
+        chunk.partition_seq != acc->partition_seq ||
+        chunk.chunk_seq != acc->next_chunk_seq) {
+        shuffle_accumulator_reset(acc);
+        return EPROTO;
+    }
+
+    byte_buf_append(&acc->payload, payload, payload_len);
+    acc->next_chunk_seq++;
+
+    if (!last) {
+        return 0;
+    }
+
+    err = worker_reduce(reduce, acc->payload.data ? acc->payload.data : "",
+                        acc->payload.len, chunk.reducer_id, payload_limit, out);
+    shuffle_accumulator_reset(acc);
+    return err;
+}
+
+static int send_reduce_chunk(mr_endpoint *eps, size_t worker_count,
+                             size_t endpoint_index, uint64_t task_id,
+                             uint64_t job_id, int reducer_id,
+                             int reducer_count, uint64_t partition_seq,
+                             uint32_t chunk_seq, uint32_t flags,
+                             const byte_buf *payload, uint32_t record_count,
+                             mr_partitions *final_output)
+{
+    if (payload->len > UINT32_MAX) {
+        return EMSGSIZE;
+    }
+
+    ShuffleChunkHeader chunk = {
+        .job_id = job_id,
+        .mapper_id = 0,
+        .reducer_id = (uint32_t)reducer_id,
+        .partition_seq = partition_seq,
+        .chunk_seq = chunk_seq,
+        .flags = flags,
+        .record_count = record_count,
+        .payload_bytes = (uint32_t)payload->len,
+    };
+
+    byte_buf body = {0};
+    byte_buf_append(&body, &chunk, sizeof(chunk));
+    if (payload->len > 0) {
+        byte_buf_append(&body, payload->data, payload->len);
+    }
+
+    int err = send_task(&eps[endpoint_index], MR_TASK_REDUCE, task_id,
+                        (uint64_t)reducer_id, (uint64_t)reducer_count,
+                        body.data, body.len);
+    byte_buf_clear(&body);
+    if (err != 0) {
+        return err;
+    }
+
+    size_t worker_index = 0;
+    mr_wire_header hdr = {0};
+    byte_buf response = {0};
+    err = collect_one_response(eps, worker_count, &worker_index, &hdr, &response);
+    if (err != 0) {
+        byte_buf_clear(&response);
+        return err;
+    }
+    (void)worker_index;
+    if (hdr.kind != MR_TASK_REDUCE ||
+        hdr.task_id != task_id || hdr.partition_id != (uint64_t)reducer_id) {
+        byte_buf_clear(&response);
+        return EPROTO;
+    }
+
+    if (flags & SHUFFLE_CHUNK_LAST) {
+        err = mr_partitions_parse(final_output,
+                                  response.data ? response.data : "",
+                                  response.len, false, reducer_id);
+    }
+    byte_buf_clear(&response);
+    return err;
+}
+
+static int send_reduce_partition_chunks(mr_endpoint *eps, size_t worker_count,
+                                        size_t endpoint_index,
+                                        const mr_partitions *intermediate,
+                                        int reducer_id, int reducer_count,
+                                        size_t chunk_payload_limit,
+                                        uint64_t *next_task_id,
+                                        mr_partitions *final_output)
+{
+    const mr_partition *partition = &intermediate->items[reducer_id];
+    uint64_t job_id = 1;
+    uint64_t partition_seq = (uint64_t)reducer_id;
+    uint32_t chunk_seq = 0;
+    size_t pair_index = 0;
+
+    if (partition->len == 0) {
+        byte_buf empty = {0};
+        return send_reduce_chunk(eps, worker_count, endpoint_index,
+                                 (*next_task_id)++, job_id, reducer_id,
+                                 reducer_count, partition_seq, chunk_seq,
+                                 SHUFFLE_CHUNK_FIRST | SHUFFLE_CHUNK_LAST,
+                                 &empty, 0, final_output);
+    }
+
+    while (pair_index < partition->len) {
+        byte_buf payload = {0};
+        uint32_t record_count = 0;
+        bool first = chunk_seq == 0;
+
+        while (pair_index < partition->len) {
+            const mr_kv_pair *pair = &partition->pairs[pair_index];
+            size_t record_size = mr_kv_pair_wire_size(pair);
+            if (record_size > chunk_payload_limit) {
+                byte_buf_clear(&payload);
+                return EMSGSIZE;
+            }
+            if (payload.len > 0 &&
+                payload.len + record_size > chunk_payload_limit) {
+                break;
+            }
+
+            int err = mr_kv_pair_serialize(&payload, (uint64_t)reducer_id,
+                                           pair, 0);
+            if (err != 0) {
+                byte_buf_clear(&payload);
+                return err;
+            }
+            record_count++;
+            pair_index++;
+
+            if (payload.len >= chunk_payload_limit) {
+                break;
+            }
+        }
+
+        uint32_t flags = 0;
+        if (first) {
+            flags |= SHUFFLE_CHUNK_FIRST;
+        }
+        if (pair_index == partition->len) {
+            flags |= SHUFFLE_CHUNK_LAST;
+        }
+
+        int err = send_reduce_chunk(eps, worker_count, endpoint_index,
+                                    (*next_task_id)++, job_id, reducer_id,
+                                    reducer_count, partition_seq, chunk_seq,
+                                    flags, &payload, record_count,
+                                    final_output);
+        byte_buf_clear(&payload);
+        if (err != 0) {
+            return err;
+        }
+        chunk_seq++;
+    }
+
+    return 0;
+}
+
 static int run_worker(const worker_args *args, Mapper map, Reducer reduce,
                       Partitioner partitioner)
 {
@@ -420,6 +640,8 @@ static int run_worker(const worker_args *args, Mapper map, Reducer reduce,
                hydra_payload_max(ctx), hydra_queue_capacity(ctx));
         fflush(stdout);
     }
+
+    shuffle_accumulator shuffle = {0};
 
     for (;;) {
         uint64_t offset = 0;
@@ -450,6 +672,7 @@ static int run_worker(const worker_args *args, Mapper map, Reducer reduce,
             err = mr_hydra_send_response_poll(ctx, msg, 0, &wire);
             byte_buf_clear(&wire);
             hydra_release_message(ctx, offset);
+            shuffle_accumulator_reset(&shuffle);
             hydra_close(ctx);
             return err == 0 ? 0 : 1;
         } else if (hdr.kind == MR_TASK_MAP) {
@@ -458,9 +681,10 @@ static int run_worker(const worker_args *args, Mapper map, Reducer reduce,
                              (size_t)(args->payload_max - sizeof(mr_wire_header)),
                              &response_body);
         } else if (hdr.kind == MR_TASK_REDUCE) {
-            err = worker_reduce(reduce, body, body_len, hdr.partition_id,
-                                (size_t)(args->payload_max - sizeof(mr_wire_header)),
-                                &response_body);
+            err = worker_reduce_chunk(reduce, &shuffle, body, body_len,
+                                      (size_t)(args->payload_max -
+                                               sizeof(mr_wire_header)),
+                                      &response_body);
         } else {
             err = EINVAL;
         }
@@ -473,6 +697,7 @@ static int run_worker(const worker_args *args, Mapper map, Reducer reduce,
             byte_buf_append(&response_body, text, strlen(text));
             response_kind = MR_TASK_ERROR;
             status = 1;
+            shuffle_accumulator_reset(&shuffle);
         }
 
         byte_buf wire = mr_wire_make(response_kind, hdr.task_id, hdr.partition_id,
@@ -518,7 +743,6 @@ static int run_master(const master_args *args)
     mr_endpoint *eps = NULL;
     char *input = NULL;
     task_slice *slices = NULL;
-    byte_buf *reduce_payloads = NULL;
     mr_partitions intermediate = {0};
     mr_partitions final_output = {0};
     bool intermediate_init = false;
@@ -606,60 +830,28 @@ static int run_master(const master_args *args)
     }
 
     mr_partitions_sort(&intermediate);
-    reduce_payloads = mr_xcalloc((size_t)reducer_count, sizeof(reduce_payloads[0]));
-    for (int i = 0; i < reducer_count; i++) {
-        int err = mr_partition_serialize(&intermediate, i, &reduce_payloads[i],
-                                         max_body);
-        if (err != 0) {
-            fprintf(stderr, "master: reduce partition %d exceeds payload-max\n", i);
-            goto cleanup;
-        }
+    if (max_body <= sizeof(ShuffleChunkHeader)) {
+        fprintf(stderr, "payload-max is too small for shuffle chunk header\n");
+        goto cleanup;
     }
 
     mr_partitions_init(&final_output, reducer_count);
     final_init = true;
-    size_t next_reduce = 0;
-    completed = 0;
-    while (completed < (size_t)reducer_count) {
-        for (size_t i = 0; i < args->workers.len &&
-                           next_reduce < (size_t)reducer_count; i++) {
-            if (!eps[i].busy) {
-                int err = send_task(&eps[i], MR_TASK_REDUCE, next_reduce,
-                                    next_reduce, (uint64_t)reducer_count,
-                                    reduce_payloads[next_reduce].data,
-                                    reduce_payloads[next_reduce].len);
-                if (err != 0) {
-                    fprintf(stderr, "master: send reduce task failed: %s\n",
-                            hydra_strerror(err));
-                    goto cleanup;
-                }
-                next_reduce++;
-            }
-        }
-
-        size_t worker_index = 0;
-        mr_wire_header hdr = {0};
-        byte_buf body = {0};
-        int err = collect_one_response(eps, args->workers.len, &worker_index,
-                                       &hdr, &body);
+    size_t chunk_payload_limit = max_body - sizeof(ShuffleChunkHeader);
+    uint64_t next_reduce_task_id = slice_count;
+    for (int i = 0; i < reducer_count; i++) {
+        size_t endpoint_index = (size_t)i % args->workers.len;
+        int err = send_reduce_partition_chunks(eps, args->workers.len,
+                                               endpoint_index, &intermediate,
+                                               i, reducer_count,
+                                               chunk_payload_limit,
+                                               &next_reduce_task_id,
+                                               &final_output);
         if (err != 0) {
-            byte_buf_clear(&body);
+            fprintf(stderr, "master: reduce partition %d shuffle failed: %s\n",
+                    i, strerror(err));
             goto cleanup;
         }
-        if (hdr.kind != MR_TASK_REDUCE || hdr.task_id >= (uint64_t)reducer_count) {
-            fprintf(stderr, "master: unexpected reduce response\n");
-            byte_buf_clear(&body);
-            goto cleanup;
-        }
-        err = mr_partitions_parse(&final_output, body.data ? body.data : "",
-                                  body.len, false, (int)hdr.task_id);
-        byte_buf_clear(&body);
-        if (err != 0) {
-            fprintf(stderr, "master: parse reduce response failed\n");
-            goto cleanup;
-        }
-        completed++;
-        (void)worker_index;
     }
 
     rc = mr_partitions_write_text(&final_output, args->output);
@@ -679,18 +871,12 @@ cleanup:
             }
         }
     }
-    if (reduce_payloads != NULL) {
-        for (int i = 0; i < reducer_count; i++) {
-            byte_buf_clear(&reduce_payloads[i]);
-        }
-    }
     if (final_init) {
         mr_partitions_destroy(&final_output);
     }
     if (intermediate_init) {
         mr_partitions_destroy(&intermediate);
     }
-    free(reduce_payloads);
     free(slices);
     free(input);
     free(eps);

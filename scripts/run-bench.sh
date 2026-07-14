@@ -54,6 +54,9 @@ Common distributed options:
 
 This script does not start QEMU VMs by default. It uses SSH to start commands
 inside already-running VMs and leaves HydraRPC backend paths as the data plane.
+Prefer the comma-separated --worker form for devdax/ivshmem paths, because PCI
+BDF paths contain ':' characters. Remote configure/build output is copied into
+logs/prepare_<host>.log instead of stdout.
 USAGE
 }
 
@@ -334,13 +337,22 @@ parse_worker_spec() {
   printf '%s\t%s\t%s\n' "$host" "$master_path" "$worker_path"
 }
 
+host_label() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
 prepare_remote_host() {
   local host=$1
   local repo_on_host=$2
-  remote_cmd "$host" "mkdir -p '$remote_dir/input' '$remote_dir/output' '$remote_dir/logs'"
-  if ((remote_build)); then
-    remote_cmd "$host" "cmake -S '$repo_on_host' -B '$repo_on_host/build' ${remote_hydrarpc_root:+-DHYDRARPC_ROOT='$remote_hydrarpc_root'} && cmake --build '$repo_on_host/build'"
-  fi
+  local log_file="$output_dir/logs/prepare_$(host_label "$host").log"
+
+  {
+    printf 'prepare host=%s repo=%s remote_dir=%s\n' "$host" "$repo_on_host" "$remote_dir"
+    remote_cmd "$host" "mkdir -p '$remote_dir/input' '$remote_dir/output' '$remote_dir/logs'"
+    if ((remote_build)); then
+      remote_cmd "$host" "cmake -S '$repo_on_host' -B '$repo_on_host/build' ${remote_hydrarpc_root:+-DHYDRARPC_ROOT='$remote_hydrarpc_root'} && cmake --build '$repo_on_host/build'"
+    fi
+  } >> "$log_file" 2>&1
 }
 
 run_ssh_once() {
@@ -480,7 +492,7 @@ read -r run_ms_avg run_ms_min run_ms_max < <(
 
 throughput_mib_s=$(awk -v bytes="$input_bytes" -v ms="$run_ms_avg" 'BEGIN { if (ms <= 0) print "0"; else printf "%.3f", bytes / 1048576 / (ms / 1000) }')
 worker_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
-details="mode=${mode};backend=${backend};workers=${worker_count};reducers=${reducers:-$worker_count};payload_max=${payload_max}"
+details="mode=${mode};backend=${backend};workers=${worker_count};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity}"
 
 cat > "$output_dir/result.env" <<EOF
 impl_name=distributed
@@ -509,6 +521,9 @@ cat > "$output_dir/result.json" <<EOF
   "backend": "$backend",
   "workers": $worker_count,
   "reducers": ${reducers:-$worker_count},
+  "payload_max": $payload_max,
+  "map_chunk": "${map_chunk:-auto}",
+  "queue_capacity": $queue_capacity,
   "input_bytes": $input_bytes
 }
 EOF
