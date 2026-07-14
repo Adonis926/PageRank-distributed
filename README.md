@@ -2,13 +2,19 @@
 
 基于 HydraRPC 的多机 MapReduce 示例实现，通信方式使用 `hydrarpc-poll`：master 和每个 worker 通过一段共享内存后端建立 HydraRPC request/response 队列，worker 轮询请求队列处理 map/reduce/shutdown 任务。
 
-当前内置任务是 word count。
+当前示例应用是 word count。分布式 runtime 保留了接近单机多线程版的结构：应用只实现 `map` / `reduce`，map 和 reduce 都通过 `MR_Emit` 产出 KV，runtime 负责 partition、排序、`Getter get_next`、HydraRPC 调度和结果写出。
 
 ## 构建
 
 ```bash
-cmake -S . -B build -DHYDRARPC_ROOT=/home/liulingling/GVM/HydraRPC
+cmake -S . -B build
 cmake --build build
+```
+
+默认按源码相对路径查找 HydraRPC：`../../HydraRPC`。如果目录布局不同，可以显式指定：
+
+```bash
+cmake -S . -B build -DHYDRARPC_ROOT=/path/to/HydraRPC
 ```
 
 ## 本地两 worker 烟测
@@ -56,6 +62,7 @@ master 默认创建并初始化 file backend；worker 默认 attach。master 结
 - `--worker=PATH`：master 添加一个 worker 后端路径，可重复。
 - `--workers=A,B,C`：master 一次添加多个 worker 后端路径。
 - `--path=PATH`：worker 使用的后端路径。
+- `--reducers=N`：reducer partition 数量，默认等于 worker 数量。
 - `--payload-max=N`：单条 HydraRPC payload 上限，默认 `1048576`。
 - `--map-chunk=N`：map 输入分片大小，默认约为 `payload-max / 4`。
 - `--queue-capacity=N`：HydraRPC 队列容量，默认 `4096`。
