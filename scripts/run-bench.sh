@@ -34,6 +34,7 @@ QEMU/SSH control-plane mode:
   --master-host=HOST[:PORT]
   --worker=HOST:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH
   --worker=[HOST:PORT]:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH
+  --worker=HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH
   --ssh-user=USER
   --ssh-key=PATH
   --remote-dir=DIR
@@ -307,6 +308,17 @@ run_local_once() {
 parse_worker_spec() {
   local spec=$1
   local host rest
+  if [[ "$spec" == *,*,* ]]; then
+    host=${spec%%,*}
+    rest=${spec#*,}
+    local master_path=${rest%%,*}
+    local worker_path=${rest#*,}
+    [[ -n "$host" && "$master_path" != "$rest" && -n "$worker_path" ]] ||
+      die "worker spec must be HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH"
+    printf '%s\t%s\t%s\n' "$host" "$master_path" "$worker_path"
+    return
+  fi
+
   if [[ "$spec" == \[*\]:* ]]; then
     host=${spec%%\]:*}
     host="${host}]"
