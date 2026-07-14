@@ -121,29 +121,47 @@ mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' |
 combined_input="$output_dir/combined-input.txt"
 cat "${input_files[@]}" > "$combined_input"
 
-host_without_brackets() {
-  local host=$1
-  if [[ "$host" == \[*\] ]]; then
-    host=${host#\[}
-    host=${host%\]}
+ssh_base_opts=()
+if [[ -n "$ssh_key" ]]; then
+  ssh_base_opts+=(-i "$ssh_key")
+fi
+
+split_ssh_endpoint() {
+  local endpoint=$1
+  local user=""
+  local hostport
+  local host
+  local port=""
+
+  if [[ "$endpoint" == \[*\] ]]; then
+    endpoint=${endpoint#\[}
+    endpoint=${endpoint%\]}
   fi
-  printf '%s' "$host"
+
+  if [[ "$endpoint" == *@* ]]; then
+    user=${endpoint%%@*}
+    hostport=${endpoint#*@}
+  else
+    user=$ssh_user
+    hostport=$endpoint
+  fi
+
+  if [[ "$hostport" == *:* ]]; then
+    host=${hostport%:*}
+    port=${hostport##*:}
+  else
+    host=$hostport
+  fi
+
+  printf '%s\t%s\t%s\n' "$user" "$host" "$port"
 }
 
-ssh_target() {
-  local host=$1
-  host=$(host_without_brackets "$host")
-  local user=""
-  if [[ "$host" == *@* ]]; then
-    user=${host%%@*}
-    host=${host#*@}
-  elif [[ -n "$ssh_user" ]]; then
-    user=$ssh_user
-  fi
-
-  if [[ "$host" == *:* ]]; then
-    host=${host%:*}
-  fi
+ssh_endpoint_target() {
+  local endpoint=$1
+  local parsed user host
+  parsed=$(split_ssh_endpoint "$endpoint")
+  user=$(printf '%s' "$parsed" | awk -F '\t' '{print $1}')
+  host=$(printf '%s' "$parsed" | awk -F '\t' '{print $2}')
 
   if [[ -n "$user" ]]; then
     printf '%s@%s' "$user" "$host"
@@ -152,19 +170,12 @@ ssh_target() {
   fi
 }
 
-ssh_port() {
-  local host=$1
-  host=$(host_without_brackets "$host")
-  [[ "$host" == *@* ]] && host=${host#*@}
-  if [[ "$host" == *:* ]]; then
-    printf '%s' "${host##*:}"
-  fi
+ssh_endpoint_port() {
+  local endpoint=$1
+  local parsed
+  parsed=$(split_ssh_endpoint "$endpoint")
+  printf '%s' "$parsed" | awk -F '\t' '{print $3}'
 }
-
-ssh_base_opts=()
-if [[ -n "$ssh_key" ]]; then
-  ssh_base_opts+=(-i "$ssh_key")
-fi
 
 remote_cmd() {
   local host=$1
@@ -173,10 +184,10 @@ remote_cmd() {
     bash -lc "$*"
   else
     local port
-    port=$(ssh_port "$host")
+    port=$(ssh_endpoint_port "$host")
     ssh_opts=("${ssh_base_opts[@]}")
     [[ -n "$port" ]] && ssh_opts+=(-p "$port")
-    ssh "${ssh_opts[@]}" "$(ssh_target "$host")" "$*"
+    ssh "${ssh_opts[@]}" "$(ssh_endpoint_target "$host")" "$*"
   fi
 }
 
@@ -189,10 +200,10 @@ remote_copy_to() {
     cp -R "$src" "$dest"
   else
     local port
-    port=$(ssh_port "$host")
+    port=$(ssh_endpoint_port "$host")
     scp_opts=("${ssh_base_opts[@]}")
     [[ -n "$port" ]] && scp_opts+=(-P "$port")
-    scp "${scp_opts[@]}" -r "$src" "$(ssh_target "$host"):$dest"
+    scp "${scp_opts[@]}" -r "$src" "$(ssh_endpoint_target "$host"):$dest"
   fi
 }
 
@@ -204,10 +215,10 @@ remote_copy_from() {
     cp "$src" "$dest"
   else
     local port
-    port=$(ssh_port "$host")
+    port=$(ssh_endpoint_port "$host")
     scp_opts=("${ssh_base_opts[@]}")
     [[ -n "$port" ]] && scp_opts+=(-P "$port")
-    scp "${scp_opts[@]}" "$(ssh_target "$host"):$src" "$dest"
+    scp "${scp_opts[@]}" "$(ssh_endpoint_target "$host"):$src" "$dest"
   fi
 }
 
