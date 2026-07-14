@@ -31,8 +31,9 @@ Local file-backend mode:
 
 QEMU/SSH control-plane mode:
   --mode=ssh
-  --master-host=HOST
+  --master-host=HOST[:PORT]
   --worker=HOST:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH
+  --worker=[HOST:PORT]:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH
   --ssh-user=USER
   --ssh-key=PATH
   --remote-dir=DIR
@@ -120,18 +121,49 @@ mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' |
 combined_input="$output_dir/combined-input.txt"
 cat "${input_files[@]}" > "$combined_input"
 
+host_without_brackets() {
+  local host=$1
+  if [[ "$host" == \[*\] ]]; then
+    host=${host#\[}
+    host=${host%\]}
+  fi
+  printf '%s' "$host"
+}
+
 ssh_target() {
   local host=$1
-  if [[ -n "$ssh_user" && "$host" != *@* ]]; then
-    printf '%s@%s' "$ssh_user" "$host"
+  host=$(host_without_brackets "$host")
+  local user=""
+  if [[ "$host" == *@* ]]; then
+    user=${host%%@*}
+    host=${host#*@}
+  elif [[ -n "$ssh_user" ]]; then
+    user=$ssh_user
+  fi
+
+  if [[ "$host" == *:* ]]; then
+    host=${host%:*}
+  fi
+
+  if [[ -n "$user" ]]; then
+    printf '%s@%s' "$user" "$host"
   else
     printf '%s' "$host"
   fi
 }
 
-ssh_opts=()
+ssh_port() {
+  local host=$1
+  host=$(host_without_brackets "$host")
+  [[ "$host" == *@* ]] && host=${host#*@}
+  if [[ "$host" == *:* ]]; then
+    printf '%s' "${host##*:}"
+  fi
+}
+
+ssh_base_opts=()
 if [[ -n "$ssh_key" ]]; then
-  ssh_opts+=(-i "$ssh_key")
+  ssh_base_opts+=(-i "$ssh_key")
 fi
 
 remote_cmd() {
@@ -140,6 +172,10 @@ remote_cmd() {
   if [[ "$host" == local || "$host" == localhost || -z "$host" ]]; then
     bash -lc "$*"
   else
+    local port
+    port=$(ssh_port "$host")
+    ssh_opts=("${ssh_base_opts[@]}")
+    [[ -n "$port" ]] && ssh_opts+=(-p "$port")
     ssh "${ssh_opts[@]}" "$(ssh_target "$host")" "$*"
   fi
 }
@@ -152,7 +188,11 @@ remote_copy_to() {
     mkdir -p "$(dirname "$dest")"
     cp -R "$src" "$dest"
   else
-    scp "${ssh_opts[@]}" -r "$src" "$(ssh_target "$host"):$dest"
+    local port
+    port=$(ssh_port "$host")
+    scp_opts=("${ssh_base_opts[@]}")
+    [[ -n "$port" ]] && scp_opts+=(-P "$port")
+    scp "${scp_opts[@]}" -r "$src" "$(ssh_target "$host"):$dest"
   fi
 }
 
@@ -163,7 +203,11 @@ remote_copy_from() {
   if [[ "$host" == local || "$host" == localhost || -z "$host" ]]; then
     cp "$src" "$dest"
   else
-    scp "${ssh_opts[@]}" "$(ssh_target "$host"):$src" "$dest"
+    local port
+    port=$(ssh_port "$host")
+    scp_opts=("${ssh_base_opts[@]}")
+    [[ -n "$port" ]] && scp_opts+=(-P "$port")
+    scp "${scp_opts[@]}" "$(ssh_target "$host"):$src" "$dest"
   fi
 }
 
@@ -234,8 +278,15 @@ run_local_once() {
 
 parse_worker_spec() {
   local spec=$1
-  local host=${spec%%:*}
-  local rest=${spec#*:}
+  local host rest
+  if [[ "$spec" == \[*\]:* ]]; then
+    host=${spec%%\]:*}
+    host="${host}]"
+    rest=${spec#"$host":}
+  else
+    host=${spec%%:*}
+    rest=${spec#*:}
+  fi
   local master_path=${rest%%:*}
   local worker_path=${rest#*:}
   [[ "$host" != "$spec" && "$master_path" != "$rest" && -n "$worker_path" ]] ||
