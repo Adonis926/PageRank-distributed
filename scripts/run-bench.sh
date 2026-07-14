@@ -222,6 +222,23 @@ remote_copy_from() {
   fi
 }
 
+remote_file_exists() {
+  local host=$1
+  local path=$2
+  remote_cmd "$host" "test -f '$path'"
+}
+
+copy_remote_log() {
+  local host=$1
+  local remote_path=$2
+  local local_path=$3
+  if remote_file_exists "$host" "$remote_path"; then
+    remote_copy_from "$host" "$remote_path" "$local_path" || true
+  else
+    printf 'remote log not found: %s:%s\n' "$host" "$remote_path" > "$local_path"
+  fi
+}
+
 build_local() {
   local start end
   start=$(now_ms)
@@ -361,7 +378,24 @@ run_ssh_once() {
     wait "$pid" || rc=$?
   done
   end=$(now_ms)
-  remote_copy_from "$master_host" "$remote_output" "$local_output"
+
+  copy_remote_log "$master_host" \
+    "$remote_dir/logs/${phase}_${index}_master.log" \
+    "$output_dir/logs/${phase}_${index}_master.remote.log"
+  for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
+    copy_remote_log "${worker_hosts[$i]}" \
+      "$remote_dir/logs/${phase}_${index}_worker${i}.log" \
+      "$output_dir/logs/${phase}_${index}_worker${i}.remote.log"
+  done
+
+  if ((rc != 0)) || ! remote_file_exists "$master_host" "$remote_output"; then
+    printf 'missing remote output: %s:%s\n' "$master_host" "$remote_output" \
+      > "$output_dir/logs/${phase}_${index}_missing_output.log"
+    rc=1
+  else
+    remote_copy_from "$master_host" "$remote_output" "$local_output" || rc=$?
+  fi
+
   echo "$((end - start)):$rc"
 }
 
@@ -410,13 +444,17 @@ for ((i = 0; i < total_runs; i++)); do
     correctness=failed
   fi
 
-  normalize_wordcount "$raw" "$norm"
-  if diff -u "$expected" "$norm" > "$output_dir/logs/${phase}_${logical_index}.diff"; then
+  if [[ -f "$raw" ]] && normalize_wordcount "$raw" "$norm" &&
+     diff -u "$expected" "$norm" > "$output_dir/logs/${phase}_${logical_index}.diff"; then
     correct=yes
   else
     correct=no
     status=failed
     correctness=failed
+    if [[ ! -f "$raw" ]]; then
+      printf 'output file not produced: %s\n' "$raw" \
+        > "$output_dir/logs/${phase}_${logical_index}.diff"
+    fi
   fi
 
   printf '%s,%s,%s,%s\n' "$phase" "$logical_index" "$run_ms" "$correct" >> "$run_csv"
