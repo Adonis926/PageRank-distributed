@@ -361,21 +361,23 @@ prepare_remote_host() {
   } >> "$log_file" 2>&1
 }
 
-run_ssh_once() {
-  local phase=$1
-  local index=$2
-  local local_output=$3
-  local repo_on_master=${remote_repo:-$repo}
-  local remote_input="$remote_dir/input/combined-input.txt"
-  local remote_output="$remote_dir/output/${phase}_${index}.out"
+repo_on_master=${remote_repo:-$repo}
+remote_input="$remote_dir/input/combined-input.txt"
+master_paths=()
+worker_hosts=()
+worker_paths=()
+worker_arg=""
 
-  prepare_remote_host "$master_host" "$repo_on_master"
-  remote_copy_to "$combined_input" "$master_host" "$remote_input"
+prepare_ssh_environment() {
+  local start end spec parsed host master_path worker_path
 
   master_paths=()
   worker_hosts=()
   worker_paths=()
-  local spec parsed host master_path worker_path
+
+  start=$(now_ms)
+  prepare_remote_host "$master_host" "$repo_on_master"
+
   for spec in "${workers[@]}"; do
     parsed=$(parse_worker_spec "$spec")
     host=$(printf '%s' "$parsed" | awk -F '\t' '{print $1}')
@@ -387,8 +389,23 @@ run_ssh_once() {
     prepare_remote_host "$host" "${remote_repo:-$repo}"
   done
 
-  local worker_arg
   worker_arg=$(IFS=,; printf '%s' "${master_paths[*]}")
+  end=$(now_ms)
+
+  if ((remote_build)); then
+    build_ms=$((end - start))
+  else
+    build_ms=0
+  fi
+}
+
+run_ssh_once() {
+  local phase=$1
+  local index=$2
+  local local_output=$3
+  local remote_output="$remote_dir/output/${phase}_${index}.out"
+
+  remote_copy_to "$combined_input" "$master_host" "$remote_input"
 
   start=$(now_ms)
   remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --workers='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
@@ -436,11 +453,15 @@ fi
 build_start=$(now_ms)
 if [[ "$mode" == local ]]; then
   build_ms=$(build_local)
+elif [[ "$mode" == ssh ]]; then
+  prepare_ssh_environment
 else
   build_ms=0
 fi
 build_end=$(now_ms)
-((build_ms == 0)) && build_ms=$((build_end - build_start))
+if [[ "$mode" == local && "$build_ms" == 0 ]]; then
+  build_ms=$((build_end - build_start))
+fi
 
 total_runs=$((warmup + repeat))
 run_csv="$output_dir/runs.csv"
