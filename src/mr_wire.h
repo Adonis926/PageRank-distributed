@@ -16,6 +16,7 @@ typedef enum mr_task_kind {
     MR_TASK_REDUCE = 2,
     MR_TASK_SHUTDOWN = 3,
     MR_TASK_ERROR = 4,
+    MR_TASK_SHUFFLE_FETCH = 5,
 } mr_task_kind;
 
 typedef struct mr_wire_header {

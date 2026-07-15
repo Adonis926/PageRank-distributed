@@ -1,6 +1,6 @@
 # mr-distributed
 
-基于 HydraRPC 的多机 MapReduce 示例实现，通信方式使用 `hydrarpc-poll`：master 和每个 worker 通过一段共享内存后端建立 HydraRPC request/response 队列，worker 轮询请求队列处理 map/reduce/shutdown 任务。
+基于 HydraRPC 的多机 MapReduce 示例实现，通信方式使用 `hydrarpc-poll`。控制面为 `master <-> node agent`，node agent 在本 VM 内 fork 多个 worker 子进程；数据面继续复用每个 VM 的 node-level HydraRPC endpoint，通过 `shared_pair` 多逻辑连接拉取远端 intermediate partition。
 
 当前示例应用是 word count。分布式 runtime 保留了接近单机多线程版的结构：应用只实现 `map` / `reduce`，map 和 reduce 都通过 `MR_Emit` 产出 KV，runtime 负责 partition、排序、`Getter get_next`、HydraRPC 调度和结果写出。
 
@@ -8,9 +8,20 @@
 
 当前数据流分为三个阶段：
 
-1. master 将输入按 `--map-chunk` 切片，向 worker 发送 map 任务。
-2. worker 在本地执行 map、partition、排序，并执行 count 型 combiner：同一 partition 内相同 key 且 value 均为十进制无符号整数时会先累加成一条 KV；不能安全累加的 KV 会原样保留。
-3. master 汇总中间结果并按 reducer partition 进行 shuffle。shuffle 使用 `ShuffleChunkHeader` 分块发送，每个 partition 至少包含一个带 `SHUFFLE_CHUNK_FIRST` 和 `SHUFFLE_CHUNK_LAST` 标志的 chunk；大 partition 会拆成多个 chunk，worker 端按 `job_id`、`reducer_id`、`partition_seq`、`chunk_seq` 顺序重组后再执行 reduce。
+1. master 将输入按 `--map-chunk` 切片，只把 map task descriptor 和输入片段发给 node agent。
+2. node agent 通过本地共享内存 slot 把任务交给 worker 子进程。map worker 执行 map、partition、排序和 count 型 combiner，并把每个 reducer partition 写成本地 KV wire-format 文件；返回给 master 的只有 `IntermediateLocation` metadata。
+3. master 按 reducer 汇总 locations，并把 reduce task descriptor 发给 node agent。reduce worker 对本地 location 直接读文件；对远端 location 通过远端 node agent endpoint 拉取文件 chunk，append 到本地 spill file，最后 parse/sort/reduce。
+
+外部进程角色是：
+
+```text
+mr_hydra master
+mr_hydra agent --workers=N
+```
+
+`agent` 会 fork 本地 worker 子进程。worker 子进程不作为独立 CLI role 暴露，也不会实例化 HydraRPC endpoint；本地 agent/worker 之间使用共享内存 descriptor queue 传递任务和结果，避免 UDS 大 payload copy。
+
+HydraRPC endpoint 是 node-level 的：一个 agent endpoint 同时接收 master 控制请求和远端 reducer 的 `MR_TASK_SHUFFLE_FETCH` 请求。`--shuffle-connections=N` 配合 `--queue-policy=shared_pair` 用于在同一对节点之间复用 request/response queue，并用 `connection_id` 区分本机 worker 的逻辑 shuffle 流。
 
 `ShuffleChunkHeader` 当前字段如下：
 
@@ -29,7 +40,12 @@ typedef struct ShuffleChunkHeader {
 } ShuffleChunkHeader;
 ```
 
-`mapper_id` 当前由 master 侧 shuffle 填 0；`record_count` 用于描述 chunk 内 KV 条数，便于后续统计和协议扩展。
+`ShuffleChunkHeader` 用于 shuffle fetch response。HydraRPC payload 生命周期只覆盖单次 req/resp，因此 reducer 收到 chunk 后立即 append 到 spill file，不长期保存 payload 指针。
+
+调度默认是静态、可重复的：
+
+- map task：`task_id % agent_count` 选择 agent，`task_id / agent_count % workers_per_agent` 选择本地 worker。
+- reduce task：`reducer_id % agent_count` 选择 agent，`reducer_id / agent_count % workers_per_agent` 选择本地 worker。
 
 ## 构建
 
@@ -44,29 +60,45 @@ cmake --build build
 cmake -S . -B build -DHYDRARPC_ROOT=/path/to/HydraRPC
 ```
 
-## 本地两 worker 烟测
+## 本地两 agent 烟测
 
-默认由 master 创建并初始化 file backend，所以先启动 master，让它创建共享文件并等待 worker 响应：
+默认由 master 创建并初始化控制面 file backend，所以先启动 master，让它创建共享文件并等待 agent 响应：
 
 ```bash
 ./build/mr_hydra master \
   --input=input.txt \
   --output=wc.out \
-  --workers=/tmp/mr-worker0.raw,/tmp/mr-worker1.raw
+  --agents=/tmp/mr-agent0.raw,/tmp/mr-agent1.raw
 ```
 
-然后在另外两个终端启动 worker：
+然后在另外两个终端启动 agent，每个 agent fork 两个本地 worker：
 
 ```bash
-./build/mr_hydra worker --path=/tmp/mr-worker0.raw --worker-id=0
-./build/mr_hydra worker --path=/tmp/mr-worker1.raw --worker-id=1
+./build/mr_hydra agent \
+  --path=/tmp/mr-agent0.raw \
+  --node-id=0 \
+  --agent-count=2 \
+  --workers=2 \
+  --store-dir=/tmp/mr-store0 \
+  --shuffle-connections=2 \
+  --queue-policy=shared_pair
+
+./build/mr_hydra agent \
+  --path=/tmp/mr-agent1.raw \
+  --node-id=1 \
+  --agent-count=2 \
+  --workers=2 \
+  --global-worker-base=2 \
+  --store-dir=/tmp/mr-store1 \
+  --shuffle-connections=2 \
+  --queue-policy=shared_pair
 ```
 
-master 默认创建并初始化 file backend；worker 默认 attach。master 结束时会向所有 worker 发送 shutdown。
+master 默认创建并初始化 file backend；agent 默认 attach。master 结束时会向所有 agent 发送 shutdown，agent 再关闭本地 worker。
 
 ## 多机运行
 
-每个 worker 使用一段能被 master 和该 worker 同时访问的 HydraRPC 后端，例如 devdax、ivshmem resource，或实验环境中的共享文件后端。当前 QEMU 测试默认使用 devdax：
+每个 agent 使用一段能被 master 和该 agent 同时访问的 HydraRPC node-level endpoint 后端；同一个 endpoint 也服务远端 shuffle fetch。当前 QEMU 测试默认使用 devdax：
 
 ```bash
 # master 节点
@@ -74,29 +106,39 @@ master 默认创建并初始化 file backend；worker 默认 attach。master 结
   --backend=devdax \
   --input=input.txt \
   --output=wc.out \
-  --worker=/dev/dax0.0 \
-  --size=2097152000
+  --agent=/dev/dax0.0 \
+  --size=2097152000 \
+  --connections=2 \
+  --queue-policy=shared_pair
 
-# worker 节点
-./build/mr_hydra worker \
+# agent 节点
+./build/mr_hydra agent \
   --backend=devdax \
   --path=/dev/dax0.0 \
-  --worker-id=0 \
-  --size=2097152000
+  --node-id=1 \
+  --workers=1 \
+  --size=2097152000 \
+  --shuffle-connections=2 \
+  --queue-policy=shared_pair
 ```
 
 常用参数：
 
 - `--backend=file|devdax|ivshmem`：HydraRPC 后端。
-- `--worker=PATH`：master 添加一个 worker 后端路径，可重复。
-- `--workers=A,B,C`：master 一次添加多个 worker 后端路径。
-- `--path=PATH`：worker 使用的后端路径。
-- `--reducers=N`：reducer partition 数量，默认等于 worker 数量。
+- `--agent=PATH`：master 添加一个 agent endpoint 后端路径，可重复。
+- `--agents=A,B,C`：master 一次添加多个 agent endpoint 后端路径。
+- `--path=PATH`：agent 使用的 node-level endpoint 后端路径。
+- `--workers=N`：agent fork 的本地 worker 子进程数量。
+- `--agent-count=N`：全局 agent 数量，用于静态本地 worker 调度。
+- `--connections=N`：master 打开 agent endpoint 时使用的 HydraRPC 多连接数量，应与 agent 的 `--shuffle-connections` 一致。
+- `--shuffle-connections=N`：agent endpoint 的 HydraRPC 多连接数量。
+- `--queue-policy=shared_pair|per_connection`：endpoint queue policy，默认 `shared_pair`。
+- `--reducers=N`：reducer partition 数量，默认等于 agent 数量。
 - `--payload-max=N`：单条 HydraRPC payload 上限，默认 `1048576`。
 - `--map-chunk=N`：map 输入分片大小，默认约为 `payload-max / 4`。
 - `--queue-capacity=N`：HydraRPC 队列容量，默认 `4096`。
 - `--size=N`：HydraRPC 后端映射大小；devdax 场景应与设备映射大小一致，例如 `2097152000`。
-- `--create`：worker 侧也创建/初始化后端，主要用于调试；正常多机运行由 master 创建。
+- `--create`：agent 侧也创建/初始化后端，主要用于调试；正常多机运行由 master 创建。
 
 通信轮询固定使用 HydraRPC 的 busy poll 等待路径，即 `hydrarpc-poll`。
 
@@ -109,15 +151,19 @@ scripts/mr-bench.sh \
   --impl=distributed \
   --dist-mode=ssh \
   --dist-master-host=127.0.0.1:2401 \
+  --dist-worker=127.0.0.1:2401,/dev/dax0.0,/dev/dax0.0 \
   --dist-worker=127.0.0.1:2402,/dev/dax0.0,/dev/dax0.0 \
   --dist-backend=devdax \
   --dist-size=2097152000 \
+  --dist-workers-per-agent=1 \
+  --dist-shuffle-connections=1 \
+  --dist-queue-policy=shared_pair \
   --dist-reducers=4 \
   --dist-payload-max=4194304 \
   --dist-map-chunk=524288
 ```
 
-`--dist-worker` 推荐使用逗号分隔格式 `HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH`；对 devdax 来说，master 和 worker 侧路径通常都是 `/dev/dax0.0`，但仍保留两端路径字段，便于不同 VM 中设备名不一致时覆盖。
+`--dist-worker` 当前表示一个 node agent：`HOST,MASTER_ENDPOINT_PATH,AGENT_ENDPOINT_PATH`。逗号分隔格式便于保留不同 VM 中设备名不一致时的路径覆盖。两 VM 场景建议传两个 `--dist-worker`，分别启动 VM1 和 VM2 的 node agent；worker 身份通过 task metadata、`worker_id` 和 HydraRPC `connection_id` 区分。
 
 根目录的 `scripts/example.sh` 封装了两台普通 QEMU VM 的默认场景：
 
@@ -130,11 +176,18 @@ REMOTE_HYDRARPC_ROOT=/home/xtl/HydraRPC \
 BACKEND=devdax \
 MASTER_TO_VM2_PATH=/dev/dax0.0 \
 VM2_WORKER_PATH=/dev/dax0.0 \
+VM1_AGENT_MASTER_PATH=/dev/dax0.0 \
+VM1_AGENT_PATH=/dev/dax0.0 \
+VM2_AGENT_MASTER_PATH=/dev/dax0.0 \
+VM2_AGENT_PATH=/dev/dax0.0 \
 SIZE=2097152000 \
+WORKERS_PER_AGENT=1 \
+SHUFFLE_CONNECTIONS=1 \
+QUEUE_POLICY=shared_pair \
 scripts/example.sh
 ```
 
-脚本不会启动虚拟机；QEMU、ivshmem 后端和 SSH 端口转发需要提前准备好。SSH 只作为控制面，用于远端 build、启动 master/worker、复制输入和结果；HydraRPC 的共享内存后端才是被测数据面。远端 configure/build 输出会写入结果目录中的 `runs/distributed/logs/prepare_<host>.log`，每次运行结束都会生成结果目录和同名 `.tar.gz` 压缩包。
+脚本不会启动虚拟机；QEMU、devdax/ivshmem 后端和 SSH 端口转发需要提前准备好。SSH 只用于远端 build、启动 master/agent、复制输入和结果；HydraRPC 的共享内存后端才是被测通信路径。远端 configure/build 输出会写入结果目录中的 `runs/distributed/logs/prepare_<host>.log`，每次运行结束都会生成结果目录和同名 `.tar.gz` 压缩包。
 
 两 VM 场景建议先使用如下基线：
 

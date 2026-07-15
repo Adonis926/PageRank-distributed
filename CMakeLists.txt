@@ -12,6 +12,7 @@ if(NOT EXISTS "${HYDRARPC_ROOT}/CMakeLists.txt")
 endif()
 
 add_subdirectory("${HYDRARPC_ROOT}" "${CMAKE_BINARY_DIR}/_deps/HydraRPC" EXCLUDE_FROM_ALL)
+find_package(Threads REQUIRED)
 
 add_executable(mr_hydra
   src/mapreduce.c
@@ -23,5 +24,5 @@ add_executable(mr_hydra
 )
 
 target_include_directories(mr_hydra PRIVATE include src)
-target_link_libraries(mr_hydra PRIVATE hydrarpc)
+target_link_libraries(mr_hydra PRIVATE hydrarpc Threads::Threads)
 target_compile_options(mr_hydra PRIVATE -Wall -Wextra -Wpedantic)

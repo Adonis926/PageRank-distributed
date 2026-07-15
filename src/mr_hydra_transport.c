@@ -37,27 +37,56 @@ const char *mr_backend_name(mr_backend backend)
     }
 }
 
-int mr_hydra_open(hydra_ctx **ctx, mr_backend backend, const char *path,
-                  uint64_t map_size, uint64_t queue_capacity,
-                  uint64_t payload_max, bool create)
+mr_queue_policy mr_queue_policy_parse(const char *value)
+{
+    if (strcmp(value, "shared_pair") == 0) {
+        return MR_QUEUE_SHARED_PAIR;
+    }
+    if (strcmp(value, "per_connection") == 0) {
+        return MR_QUEUE_PER_CONNECTION;
+    }
+
+    fprintf(stderr, "invalid queue policy: %s\n", value);
+    exit(2);
+}
+
+const char *mr_queue_policy_name(mr_queue_policy policy)
+{
+    switch (policy) {
+    case MR_QUEUE_SHARED_PAIR:
+        return "shared_pair";
+    case MR_QUEUE_PER_CONNECTION:
+        return "per_connection";
+    default:
+        return "unknown";
+    }
+}
+
+static hydra_queue_policy to_hydra_queue_policy(mr_queue_policy policy)
+{
+    return policy == MR_QUEUE_PER_CONNECTION ? HYDRA_QUEUE_POLICY_PER_CONNECTION
+                                             : HYDRA_QUEUE_POLICY_SHARED_PAIR;
+}
+
+int mr_hydra_open_ex(hydra_ctx **ctx, const mr_hydra_open_config *config)
 {
     hydra_open_options opts = {
-        .path = path,
-        .map_size = map_size,
-        .queue_capacity = queue_capacity,
-        .payload_max = payload_max,
-        .connections = 1,
-        .connection_id = 0,
-        .node_id = 0,
-        .peer_node_id = 1,
-        .service_id = 1,
-        .queue_policy = HYDRA_QUEUE_POLICY_PER_CONNECTION,
-        .create = create,
-        .truncate_file = create && backend == MR_BACKEND_FILE,
+        .path = config->path,
+        .map_size = config->map_size,
+        .queue_capacity = config->queue_capacity,
+        .payload_max = config->payload_max,
+        .connections = config->connections ? config->connections : 1,
+        .connection_id = config->connection_id,
+        .node_id = config->node_id,
+        .peer_node_id = config->peer_node_id,
+        .service_id = config->service_id,
+        .queue_policy = to_hydra_queue_policy(config->queue_policy),
+        .create = config->create,
+        .truncate_file = config->create && config->backend == MR_BACKEND_FILE,
         .checksum_enabled = true,
     };
 
-    switch (backend) {
+    switch (config->backend) {
     case MR_BACKEND_FILE:
         return hydra_open_file(ctx, &opts);
     case MR_BACKEND_DEVDAX:
@@ -67,6 +96,27 @@ int mr_hydra_open(hydra_ctx **ctx, mr_backend backend, const char *path,
     default:
         return EINVAL;
     }
+}
+
+int mr_hydra_open(hydra_ctx **ctx, mr_backend backend, const char *path,
+                  uint64_t map_size, uint64_t queue_capacity,
+                  uint64_t payload_max, bool create)
+{
+    mr_hydra_open_config config = {
+        .backend = backend,
+        .path = path,
+        .map_size = map_size,
+        .queue_capacity = queue_capacity,
+        .payload_max = payload_max,
+        .connections = 1,
+        .connection_id = 0,
+        .node_id = 0,
+        .peer_node_id = 1,
+        .service_id = 1,
+        .queue_policy = MR_QUEUE_PER_CONNECTION,
+        .create = create,
+    };
+    return mr_hydra_open_ex(ctx, &config);
 }
 
 int mr_hydra_send_request_poll(hydra_ctx *ctx, uint64_t req_id,

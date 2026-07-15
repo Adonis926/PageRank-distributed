@@ -32,9 +32,9 @@ Local file-backend mode:
 QEMU/SSH control-plane mode:
   --mode=ssh
   --master-host=HOST[:PORT]
-  --worker=HOST:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH
-  --worker=[HOST:PORT]:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH
-  --worker=HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH
+  --worker=HOST:MASTER_BACKEND_PATH:AGENT_ENDPOINT_PATH
+  --worker=[HOST:PORT]:MASTER_BACKEND_PATH:AGENT_ENDPOINT_PATH
+  --worker=HOST,MASTER_BACKEND_PATH,AGENT_ENDPOINT_PATH
   --ssh-user=USER
   --ssh-key=PATH
   --remote-dir=DIR
@@ -50,11 +50,15 @@ Common distributed options:
   --map-chunk=N
   --queue-capacity=N
   --size=N
+  --workers-per-agent=N
+  --shuffle-connections=N
+  --queue-policy=shared_pair|per_connection
   --repeat=N
   --warmup=N
 
 This script does not start QEMU VMs by default. It uses SSH to start commands
-inside already-running VMs and leaves HydraRPC backend paths as the data plane.
+inside already-running VMs and leaves HydraRPC backend paths as the measured
+agent endpoint/data plane.
 Prefer the comma-separated --worker form for devdax/ivshmem paths, because PCI
 BDF paths contain ':' characters. Remote configure/build output is copied into
 logs/prepare_<host>.log instead of stdout. For devdax, --size must match the
@@ -72,14 +76,18 @@ repeat=3
 warmup=1
 mode=local
 local_workers=2
+workers_per_agent=1
 master_host=local
 workers=()
 backend=file
+shuffle_backend=file
 reducers=""
 payload_max=1048576
 map_chunk=""
 queue_capacity=4096
 map_size=67108864
+shuffle_connections=1
+queue_policy=shared_pair
 ssh_user=""
 ssh_key=""
 remote_dir="/tmp/mr-bench"
@@ -99,14 +107,18 @@ while (($#)); do
     --warmup=*) warmup=${1#*=} ;;
     --mode=*) mode=${1#*=} ;;
     --local-workers=*) local_workers=${1#*=} ;;
+    --workers-per-agent=*) workers_per_agent=${1#*=} ;;
     --master-host=*) master_host=${1#*=} ;;
     --worker=*) workers+=("${1#*=}") ;;
     --backend=*) backend=${1#*=} ;;
+    --shuffle-backend=*) shuffle_backend=${1#*=} ;;
     --reducers=*) reducers=${1#*=} ;;
     --payload-max=*) payload_max=${1#*=} ;;
     --map-chunk=*) map_chunk=${1#*=} ;;
     --queue-capacity=*) queue_capacity=${1#*=} ;;
     --size=*) map_size=${1#*=} ;;
+    --shuffle-connections=*) shuffle_connections=${1#*=} ;;
+    --queue-policy=*) queue_policy=${1#*=} ;;
     --ssh-user=*) ssh_user=${1#*=} ;;
     --ssh-key=*) ssh_key=${1#*=} ;;
     --remote-dir=*) remote_dir=${1#*=} ;;
@@ -256,12 +268,12 @@ build_local() {
   echo $((end - start))
 }
 
-make_worker_paths_local() {
+make_agent_paths_local() {
   local run_id=$1
   local paths=()
   local i
   for ((i = 0; i < local_workers; i++)); do
-    paths+=("/tmp/mr-bench-${run_id}-worker${i}.raw")
+    paths+=("/tmp/mr-bench-${run_id}-agent${i}.raw")
   done
   (IFS=,; printf '%s' "${paths[*]}")
 }
@@ -271,46 +283,55 @@ run_local_once() {
   local index=$2
   local master_output=$3
   local run_id="${phase}-${index}-$$"
-  local worker_paths
-  worker_paths=$(make_worker_paths_local "$run_id")
+  local agent_paths
+  agent_paths=$(make_agent_paths_local "$run_id")
 
   start=$(now_ms)
   "$repo/build/mr_hydra" master \
     --backend="$backend" \
     --input="$combined_input" \
     --output="$master_output" \
-    --workers="$worker_paths" \
+    --agents="$agent_paths" \
     --payload-max="$payload_max" \
     --queue-capacity="$queue_capacity" \
     --size="$map_size" \
+    --connections="$shuffle_connections" \
+    --queue-policy="$queue_policy" \
     ${reducers:+--reducers="$reducers"} \
     ${map_chunk:+--map-chunk="$map_chunk"} \
     --quiet > "$output_dir/logs/${phase}_${index}_master.log" 2>&1 &
   master_pid=$!
 
   sleep 0.2
-  IFS=, read -r -a path_array <<< "$worker_paths"
-  worker_pids=()
+  IFS=, read -r -a path_array <<< "$agent_paths"
+  agent_pids=()
   local i
   for ((i = 0; i < ${#path_array[@]}; i++)); do
-    "$repo/build/mr_hydra" worker \
+    "$repo/build/mr_hydra" agent \
       --backend="$backend" \
       --path="${path_array[$i]}" \
-      --worker-id="$i" \
+      --node-id="$i" \
+      --agent-count="$local_workers" \
+      --workers="$workers_per_agent" \
+      --global-worker-base="$((i * workers_per_agent))" \
+      --store-dir="$output_dir/store/agent${i}_${phase}_${index}" \
+      --shuffle-backend="$shuffle_backend" \
+      --shuffle-connections="$shuffle_connections" \
+      --queue-policy="$queue_policy" \
       --payload-max="$payload_max" \
       --queue-capacity="$queue_capacity" \
       --size="$map_size" \
       --quiet > "$output_dir/logs/${phase}_${index}_worker${i}.log" 2>&1 &
-    worker_pids+=("$!")
+    agent_pids+=("$!")
   done
 
   local rc=0
   wait "$master_pid" || rc=$?
-  for pid in "${worker_pids[@]}"; do
+  for pid in "${agent_pids[@]}"; do
     wait "$pid" || rc=$?
   done
-  end=$(now_ms)
   rm -f "${path_array[@]}"
+  end=$(now_ms)
   echo "$((end - start)):$rc"
 }
 
@@ -323,7 +344,7 @@ parse_worker_spec() {
     local master_path=${rest%%,*}
     local worker_path=${rest#*,}
     [[ -n "$host" && "$master_path" != "$rest" && -n "$worker_path" ]] ||
-      die "worker spec must be HOST,MASTER_BACKEND_PATH,WORKER_BACKEND_PATH"
+      die "worker spec must be HOST,MASTER_BACKEND_PATH,AGENT_ENDPOINT_PATH"
     printf '%s\t%s\t%s\n' "$host" "$master_path" "$worker_path"
     return
   fi
@@ -339,7 +360,7 @@ parse_worker_spec() {
   local master_path=${rest%%:*}
   local worker_path=${rest#*:}
   [[ "$host" != "$spec" && "$master_path" != "$rest" && -n "$worker_path" ]] ||
-    die "worker spec must be HOST:MASTER_BACKEND_PATH:WORKER_BACKEND_PATH"
+    die "worker spec must be HOST:MASTER_BACKEND_PATH:AGENT_ENDPOINT_PATH"
   printf '%s\t%s\t%s\n' "$host" "$master_path" "$worker_path"
 }
 
@@ -408,14 +429,14 @@ run_ssh_once() {
   remote_copy_to "$combined_input" "$master_host" "$remote_input"
 
   start=$(now_ms)
-  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --workers='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
+  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
   master_pid=$!
 
   sleep 0.5
   worker_pids=()
   local i
   for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
-    remote_cmd "${worker_hosts[$i]}" "'${remote_repo:-$repo}/build/mr_hydra' worker --backend='$backend' --path='${worker_paths[$i]}' --worker-id='$i' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
+    remote_cmd "${worker_hosts[$i]}" "'${remote_repo:-$repo}/build/mr_hydra' agent --backend='$backend' --path='${worker_paths[$i]}' --node-id='$i' --agent-count='${#worker_hosts[@]}' --workers='$workers_per_agent' --global-worker-base='$((i * workers_per_agent))' --store-dir='$remote_dir/store/agent${i}_${phase}_${index}' --shuffle-backend='$backend' --shuffle-connections='$shuffle_connections' --queue-policy='$queue_policy' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
     worker_pids+=("$!")
   done
 
@@ -518,8 +539,9 @@ read -r run_ms_avg run_ms_min run_ms_max < <(
 )
 
 throughput_mib_s=$(awk -v bytes="$input_bytes" -v ms="$run_ms_avg" 'BEGIN { if (ms <= 0) print "0"; else printf "%.3f", bytes / 1048576 / (ms / 1000) }')
-worker_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
-details="mode=${mode};backend=${backend};workers=${worker_count};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size}"
+agent_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
+worker_count=$((agent_count * workers_per_agent))
+details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy}"
 
 cat > "$output_dir/result.env" <<EOF
 impl_name=distributed
@@ -546,12 +568,16 @@ cat > "$output_dir/result.json" <<EOF
   "throughput_mib_s": $throughput_mib_s,
   "mode": "$mode",
   "backend": "$backend",
+  "agents": $agent_count,
   "workers": $worker_count,
+  "workers_per_agent": $workers_per_agent,
   "reducers": ${reducers:-$worker_count},
   "payload_max": $payload_max,
   "map_chunk": "${map_chunk:-auto}",
   "queue_capacity": $queue_capacity,
   "size": $map_size,
+  "shuffle_connections": $shuffle_connections,
+  "queue_policy": "$queue_policy",
   "input_bytes": $input_bytes
 }
 EOF
