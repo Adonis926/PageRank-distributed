@@ -32,6 +32,7 @@
 #define MR_JOB_ID 1ULL
 #define MR_AGENT_OPEN_RETRY_COUNT 10000U
 #define MR_AGENT_OPEN_RETRY_US 1000U
+#define MR_TARGET_WORKER_AUTO UINT32_MAX
 
 #define MR_LOCAL_SLOT_EMPTY 0U
 #define MR_LOCAL_SLOT_READY 1U
@@ -86,7 +87,7 @@ typedef struct control_map_task {
     uint64_t job_id;
     uint64_t map_task_id;
     uint32_t reducer_count;
-    uint32_t reserved;
+    uint32_t target_worker_id;
     uint64_t data_len;
 } control_map_task;
 
@@ -94,6 +95,8 @@ typedef struct control_reduce_task {
     uint64_t job_id;
     uint32_t reducer_id;
     uint32_t reducer_count;
+    uint32_t target_worker_id;
+    uint32_t reserved;
     uint64_t location_count;
 } control_reduce_task;
 
@@ -116,6 +119,7 @@ typedef struct master_args {
     str_list agents;
     const char *input;
     const char *output;
+    const char *schedule;
     uint64_t map_size;
     uint64_t queue_capacity;
     uint64_t payload_max;
@@ -125,6 +129,19 @@ typedef struct master_args {
     mr_queue_policy queue_policy;
     bool quiet;
 } master_args;
+
+typedef struct schedule_entry {
+    mr_task_kind kind;
+    uint64_t task_id;
+    uint32_t node_id;
+    uint32_t worker_id;
+} schedule_entry;
+
+typedef struct schedule_table {
+    schedule_entry *items;
+    size_t len;
+    size_t cap;
+} schedule_table;
 
 typedef struct agent_args {
     mr_backend backend;
@@ -240,6 +257,197 @@ static void location_vec_destroy(location_vec *vec)
 {
     free(vec->items);
     memset(vec, 0, sizeof(*vec));
+}
+
+static void schedule_table_push(schedule_table *table, const schedule_entry *entry)
+{
+    if (table->len == table->cap) {
+        table->cap = table->cap ? table->cap * 2 : 32;
+        table->items = mr_xrealloc(table->items,
+                                   table->cap * sizeof(table->items[0]));
+    }
+    table->items[table->len++] = *entry;
+}
+
+static void schedule_table_destroy(schedule_table *table)
+{
+    free(table->items);
+    memset(table, 0, sizeof(*table));
+}
+
+static char *trim_ascii(char *s)
+{
+    while (isspace((unsigned char)*s)) {
+        s++;
+    }
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+    return s;
+}
+
+static int parse_u64_field(const char *text, uint64_t *out)
+{
+    if (*text == '-') {
+        return EINVAL;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *trim_ascii(end) != '\0') {
+        return EINVAL;
+    }
+    *out = (uint64_t)value;
+    return 0;
+}
+
+static int parse_schedule_kind(const char *text, mr_task_kind *out)
+{
+    if (strcmp(text, "map") == 0 || strcmp(text, "m") == 0) {
+        *out = MR_TASK_MAP;
+        return 0;
+    }
+    if (strcmp(text, "reduce") == 0 || strcmp(text, "r") == 0) {
+        *out = MR_TASK_REDUCE;
+        return 0;
+    }
+    return EINVAL;
+}
+
+static int parse_schedule_file(const char *path, schedule_table *table)
+{
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        return errno;
+    }
+
+    char line[512];
+    size_t line_no = 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line_no++;
+        char *comment = strchr(line, '#');
+        if (comment != NULL) {
+            *comment = '\0';
+        }
+        char *fields[4] = {0};
+        size_t field_count = 0;
+        char *save = NULL;
+        for (char *tok = strtok_r(line, ",", &save); tok != NULL;
+             tok = strtok_r(NULL, ",", &save)) {
+            if (field_count >= 4) {
+                fclose(fp);
+                fprintf(stderr, "schedule %s:%zu has too many fields\n",
+                        path, line_no);
+                return EINVAL;
+            }
+            fields[field_count++] = trim_ascii(tok);
+        }
+        if (field_count == 0) {
+            continue;
+        }
+        if (field_count == 4 && strcmp(fields[0], "kind") == 0) {
+            continue;
+        }
+        if (field_count != 4) {
+            fclose(fp);
+            fprintf(stderr,
+                    "schedule %s:%zu expected kind,id,node_id,worker_id\n",
+                    path, line_no);
+            return EINVAL;
+        }
+
+        schedule_entry entry = {0};
+        uint64_t node_id = 0;
+        uint64_t worker_id = 0;
+        int err = parse_schedule_kind(fields[0], &entry.kind);
+        if (err == 0) {
+            err = parse_u64_field(fields[1], &entry.task_id);
+        }
+        if (err == 0) {
+            err = parse_u64_field(fields[2], &node_id);
+        }
+        if (err == 0) {
+            err = parse_u64_field(fields[3], &worker_id);
+        }
+        if (err != 0 || node_id > UINT32_MAX || worker_id > UINT32_MAX) {
+            fclose(fp);
+            fprintf(stderr, "schedule %s:%zu has invalid field\n", path, line_no);
+            return EINVAL;
+        }
+        entry.node_id = (uint32_t)node_id;
+        entry.worker_id = (uint32_t)worker_id;
+        schedule_table_push(table, &entry);
+    }
+
+    if (ferror(fp)) {
+        int err = errno ? errno : EIO;
+        fclose(fp);
+        return err;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static bool schedule_lookup(const schedule_table *table, mr_task_kind kind,
+                            uint64_t task_id, schedule_entry *out)
+{
+    for (size_t i = 0; i < table->len; i++) {
+        const schedule_entry *entry = &table->items[i];
+        if (entry->kind == kind && entry->task_id == task_id) {
+            *out = *entry;
+            return true;
+        }
+    }
+    return false;
+}
+
+static int validate_schedule_table(const schedule_table *table, size_t agent_count,
+                                   size_t map_count, size_t reduce_count)
+{
+    for (size_t i = 0; i < table->len; i++) {
+        const schedule_entry *entry = &table->items[i];
+        if (entry->node_id >= agent_count) {
+            fprintf(stderr, "schedule entry node_id=%u out of range\n",
+                    entry->node_id);
+            return EINVAL;
+        }
+        if (entry->kind == MR_TASK_MAP && entry->task_id >= map_count) {
+            fprintf(stderr, "schedule map id=%" PRIu64 " out of range\n",
+                    entry->task_id);
+            return EINVAL;
+        }
+        if (entry->kind == MR_TASK_REDUCE && entry->task_id >= reduce_count) {
+            fprintf(stderr, "schedule reduce id=%" PRIu64 " out of range\n",
+                    entry->task_id);
+            return EINVAL;
+        }
+        for (size_t j = i + 1; j < table->len; j++) {
+            const schedule_entry *other = &table->items[j];
+            if (entry->kind == other->kind && entry->task_id == other->task_id) {
+                fprintf(stderr, "schedule duplicate entry for %s %" PRIu64 "\n",
+                        entry->kind == MR_TASK_MAP ? "map" : "reduce",
+                        entry->task_id);
+                return EINVAL;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < map_count; i++) {
+        schedule_entry ignored = {0};
+        if (!schedule_lookup(table, MR_TASK_MAP, i, &ignored)) {
+            fprintf(stderr, "schedule missing map task %zu\n", i);
+            return EINVAL;
+        }
+    }
+    for (size_t i = 0; i < reduce_count; i++) {
+        schedule_entry ignored = {0};
+        if (!schedule_lookup(table, MR_TASK_REDUCE, i, &ignored)) {
+            fprintf(stderr, "schedule missing reduce task %zu\n", i);
+            return EINVAL;
+        }
+    }
+    return 0;
 }
 
 static int mkdir_p(const char *path)
@@ -1010,15 +1218,41 @@ static int agent_handle_request(local_worker *workers, size_t worker_count,
         return handle_shuffle_fetch(hdr, body, body_len, payload_max, response);
     }
     if (hdr->kind == MR_TASK_MAP) {
-        size_t worker_index = (size_t)((hdr->task_id / agent_count) % worker_count);
+        if (body_len < sizeof(control_map_task)) {
+            return EINVAL;
+        }
+        control_map_task task = {0};
+        memcpy(&task, body, sizeof(task));
+        size_t worker_index = 0;
+        if (task.target_worker_id == MR_TARGET_WORKER_AUTO) {
+            worker_index = (size_t)((hdr->task_id / agent_count) % worker_count);
+        } else {
+            worker_index = (size_t)task.target_worker_id;
+        }
+        if (worker_index >= worker_count) {
+            return EINVAL;
+        }
         return local_send_task(workers[worker_index].slot,
                                (uint64_t)(payload_max), MR_TASK_MAP,
                                hdr->task_id, hdr->partition_id,
                                hdr->partition_count, body, body_len, response);
     }
     if (hdr->kind == MR_TASK_REDUCE) {
-        size_t worker_index =
-            (size_t)((hdr->partition_id / agent_count) % worker_count);
+        if (body_len < sizeof(control_reduce_task)) {
+            return EINVAL;
+        }
+        control_reduce_task task = {0};
+        memcpy(&task, body, sizeof(task));
+        size_t worker_index = 0;
+        if (task.target_worker_id == MR_TARGET_WORKER_AUTO) {
+            worker_index =
+                (size_t)((hdr->partition_id / agent_count) % worker_count);
+        } else {
+            worker_index = (size_t)task.target_worker_id;
+        }
+        if (worker_index >= worker_count) {
+            return EINVAL;
+        }
         return local_send_task(workers[worker_index].slot,
                                (uint64_t)(payload_max), MR_TASK_REDUCE,
                                hdr->task_id, hdr->partition_id,
@@ -1194,6 +1428,8 @@ static int run_master(const master_args *args)
     task_slice *slices = NULL;
     mr_endpoint *agents = NULL;
     location_vec locations = {0};
+    schedule_table schedule = {0};
+    bool use_file_schedule = false;
     mr_partitions final_output = {0};
     bool final_init = false;
     int rc = 1;
@@ -1221,24 +1457,59 @@ static int run_master(const master_args *args)
     size_t slice_count = 0;
     slices = make_slices(input, input_len, chunk_size, &slice_count);
 
+    if (args->schedule != NULL && strcmp(args->schedule, "static") != 0) {
+        const char *prefix = "file:";
+        size_t prefix_len = strlen(prefix);
+        if (strncmp(args->schedule, prefix, prefix_len) != 0 ||
+            args->schedule[prefix_len] == '\0') {
+            fprintf(stderr, "master: --schedule must be static or file:PATH\n");
+            goto cleanup;
+        }
+        const char *schedule_path = args->schedule + prefix_len;
+        int err = parse_schedule_file(schedule_path, &schedule);
+        if (err != 0) {
+            fprintf(stderr, "master: parse schedule %s failed: %s\n",
+                    schedule_path, strerror(err));
+            goto cleanup;
+        }
+        err = validate_schedule_table(&schedule, args->agents.len, slice_count,
+                                      (size_t)reducer_count);
+        if (err != 0) {
+            goto cleanup;
+        }
+        use_file_schedule = true;
+    }
+
     if (!args->quiet) {
-        printf("master: agents=%zu reducers=%d map_tasks=%zu schedule=static\n",
-               args->agents.len, reducer_count, slice_count);
+        printf("master: agents=%zu reducers=%d map_tasks=%zu schedule=%s\n",
+               args->agents.len, reducer_count, slice_count,
+               use_file_schedule ? args->schedule : "static");
         fflush(stdout);
     }
 
     for (size_t i = 0; i < slice_count; i++) {
+        size_t agent_index = i % args->agents.len;
+        uint32_t target_worker_id = MR_TARGET_WORKER_AUTO;
+        if (use_file_schedule) {
+            schedule_entry entry = {0};
+            if (!schedule_lookup(&schedule, MR_TASK_MAP, i, &entry)) {
+                fprintf(stderr, "master: schedule missing map task %zu\n", i);
+                goto cleanup;
+            }
+            agent_index = entry.node_id;
+            target_worker_id = entry.worker_id;
+        }
         control_map_task task = {
             .job_id = MR_JOB_ID,
             .map_task_id = i,
             .reducer_count = (uint32_t)reducer_count,
+            .target_worker_id = target_worker_id,
             .data_len = slices[i].len,
         };
         byte_buf body = {0};
         byte_buf_append(&body, &task, sizeof(task));
         byte_buf_append(&body, slices[i].data, slices[i].len);
         byte_buf response = {0};
-        size_t agent_index = i % args->agents.len;
         int err = call_agent(&agents[agent_index], MR_TASK_MAP, i, 0,
                              (uint64_t)reducer_count, body.data, body.len,
                              &response);
@@ -1270,6 +1541,18 @@ static int run_master(const master_args *args)
     mr_partitions_init(&final_output, reducer_count);
     final_init = true;
     for (int r = 0; r < reducer_count; r++) {
+        size_t agent_index = (size_t)r % args->agents.len;
+        uint32_t target_worker_id = MR_TARGET_WORKER_AUTO;
+        if (use_file_schedule) {
+            schedule_entry entry = {0};
+            if (!schedule_lookup(&schedule, MR_TASK_REDUCE, (uint64_t)r,
+                                 &entry)) {
+                fprintf(stderr, "master: schedule missing reduce task %d\n", r);
+                goto cleanup;
+            }
+            agent_index = entry.node_id;
+            target_worker_id = entry.worker_id;
+        }
         location_vec reducer_locations = {0};
         for (size_t i = 0; i < locations.len; i++) {
             if (locations.items[i].reducer_id == (uint32_t)r) {
@@ -1280,6 +1563,7 @@ static int run_master(const master_args *args)
             .job_id = MR_JOB_ID,
             .reducer_id = (uint32_t)r,
             .reducer_count = (uint32_t)reducer_count,
+            .target_worker_id = target_worker_id,
             .location_count = reducer_locations.len,
         };
         byte_buf body = {0};
@@ -1289,7 +1573,6 @@ static int run_master(const master_args *args)
                             reducer_locations.len * sizeof(reducer_locations.items[0]));
         }
         byte_buf response = {0};
-        size_t agent_index = (size_t)r % args->agents.len;
         int err = call_agent(&agents[agent_index], MR_TASK_REDUCE,
                              slice_count + (uint64_t)r, (uint64_t)r,
                              (uint64_t)reducer_count, body.data, body.len,
@@ -1326,6 +1609,7 @@ cleanup:
         mr_partitions_destroy(&final_output);
     }
     location_vec_destroy(&locations);
+    schedule_table_destroy(&schedule);
     free(agents);
     free(slices);
     free(input);
@@ -1341,7 +1625,8 @@ static void usage(const char *argv0)
             "\n"
             "common: [--backend=file|devdax|ivshmem] [--payload-max=N]\n"
             "        [--queue-capacity=N] [--size=N] [--quiet]\n"
-            "master: [--map-chunk=N] [--reducers=N] [--connections=N]\n"
+            "master: [--map-chunk=N] [--reducers=N] [--schedule=static|file:PATH]\n"
+            "        [--connections=N]\n"
             "        [--queue-policy=shared_pair|per_connection]\n"
             "agent: [--store-dir=DIR] [--agent-count=N] [--global-worker-base=N]\n"
             "       [--shuffle-backend=file|devdax|ivshmem]\n"
@@ -1367,6 +1652,8 @@ static int parse_master_args(master_args *args, int argc, char **argv)
             args->input = value;
         } else if ((value = arg_value(argv[i], "--output=")) != NULL) {
             args->output = value;
+        } else if ((value = arg_value(argv[i], "--schedule=")) != NULL) {
+            args->schedule = value;
         } else if ((value = arg_value(argv[i], "--agent=")) != NULL) {
             str_list_push(&args->agents, value);
         } else if ((value = arg_value(argv[i], "--agents=")) != NULL) {

@@ -46,6 +46,7 @@ Common distributed options:
   --repo=DIR
   --backend=file|devdax|ivshmem
   --reducers=N
+  --schedule=static|file:PATH
   --payload-max=N
   --map-chunk=N
   --queue-capacity=N
@@ -83,6 +84,7 @@ workers=()
 backend=file
 shuffle_backend=file
 reducers=""
+schedule=static
 payload_max=1048576
 map_chunk=""
 queue_capacity=4096
@@ -115,6 +117,7 @@ while (($#)); do
     --backend=*) backend=${1#*=} ;;
     --shuffle-backend=*) shuffle_backend=${1#*=} ;;
     --reducers=*) reducers=${1#*=} ;;
+    --schedule=*) schedule=${1#*=} ;;
     --payload-max=*) payload_max=${1#*=} ;;
     --map-chunk=*) map_chunk=${1#*=} ;;
     --queue-capacity=*) queue_capacity=${1#*=} ;;
@@ -147,6 +150,13 @@ done
 [[ "$shuffle_connections" =~ ^[0-9]+$ && "$shuffle_connections" -gt 0 ]] || die "--shuffle-connections must be a positive integer"
 [[ "$input_bytes" =~ ^[0-9]+$ && "$input_bytes" -gt 0 ]] || die "--input-bytes must be a positive integer"
 [[ "$verify" == last || "$verify" == all || "$verify" == none ]] || die "--verify must be last, all, or none"
+if [[ "$schedule" != static && "$schedule" != file:* ]]; then
+  die "--schedule must be static or file:PATH"
+fi
+if [[ "$schedule" == file:* ]]; then
+  schedule_path=${schedule#file:}
+  [[ -n "$schedule_path" && -f "$schedule_path" ]] || die "schedule file not found: $schedule_path"
+fi
 mkdir -p "$output_dir"/logs
 
 mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' | LC_ALL=C sort)
@@ -330,6 +340,7 @@ run_local_once() {
     --payload-max="$payload_max" \
     --queue-capacity="$queue_capacity" \
     --size="$map_size" \
+    --schedule="$schedule" \
     --connections="$shuffle_connections" \
     --queue-policy="$queue_policy" \
     ${reducers:+--reducers="$reducers"} \
@@ -396,6 +407,8 @@ prepare_remote_host() {
 
 repo_on_master=${remote_repo:-$repo}
 remote_input="$remote_dir/input/combined-input.txt"
+remote_schedule="$remote_dir/input/schedule.csv"
+master_schedule_arg="$schedule"
 master_paths=()
 worker_hosts=()
 worker_paths=()
@@ -410,6 +423,10 @@ prepare_ssh_environment() {
 
   start=$(now_ms)
   prepare_remote_host "$master_host" "$repo_on_master"
+  if [[ "$schedule" == file:* ]]; then
+    remote_copy_to "${schedule#file:}" "$master_host" "$remote_schedule"
+    master_schedule_arg="file:$remote_schedule"
+  fi
 
   for spec in "${workers[@]}"; do
     parsed=$(parse_worker_spec "$spec")
@@ -448,7 +465,7 @@ run_ssh_once() {
   done
 
   start=$(now_ms)
-  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
+  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --schedule='$master_schedule_arg' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
   master_pid=$!
 
   local rc=0
@@ -587,7 +604,7 @@ run_ms_median=$(
 throughput_mib_s=$(awk -v bytes="$input_bytes" -v ms="$run_ms_avg" 'BEGIN { if (ms <= 0) print "0"; else printf "%.3f", bytes / 1048576 / (ms / 1000) }')
 agent_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
 worker_count=$((agent_count * workers_per_agent))
-details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy};verify=${verify}"
+details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};schedule=${schedule};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy};verify=${verify}"
 
 cat > "$output_dir/result.env" <<EOF
 impl_name=distributed
@@ -622,6 +639,7 @@ cat > "$output_dir/result.json" <<EOF
   "workers": $worker_count,
   "workers_per_agent": $workers_per_agent,
   "reducers": ${reducers:-$worker_count},
+  "schedule": "$schedule",
   "payload_max": $payload_max,
   "map_chunk": "${map_chunk:-auto}",
   "queue_capacity": $queue_capacity,
