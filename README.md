@@ -122,6 +122,68 @@ master 默认创建并初始化 file backend；agent 默认 attach。master 结�
   --queue-policy=shared_pair
 ```
 
+### file backend 参数
+
+`--backend=file` 时，`PATH` 是 HydraRPC 用来 `mmap` 的共享文件路径。master 负责创建并初始化该文件，agent 默认 attach，因此同一个 agent endpoint 在 master 侧和 agent 侧必须指向同一份共享文件。
+
+本机或同一文件系统内运行时，两端路径通常相同：
+
+```bash
+# master
+./build/mr_hydra master \
+  --backend=file \
+  --input=input.txt \
+  --output=wc.out \
+  --agents=/tmp/mr-agent0.raw,/tmp/mr-agent1.raw \
+  --size=67108864 \
+  --connections=2 \
+  --queue-policy=shared_pair
+
+# agent 0
+./build/mr_hydra agent \
+  --backend=file \
+  --path=/tmp/mr-agent0.raw \
+  --node-id=0 \
+  --agent-count=2 \
+  --workers=2 \
+  --store-dir=/tmp/mr-store0 \
+  --size=67108864 \
+  --shuffle-connections=2 \
+  --queue-policy=shared_pair
+
+# agent 1
+./build/mr_hydra agent \
+  --backend=file \
+  --path=/tmp/mr-agent1.raw \
+  --node-id=1 \
+  --agent-count=2 \
+  --workers=2 \
+  --global-worker-base=2 \
+  --store-dir=/tmp/mr-store1 \
+  --size=67108864 \
+  --shuffle-connections=2 \
+  --queue-policy=shared_pair
+```
+
+跨 VM 使用 `file` backend 时，`PATH` 不能是各 VM 私有的 `/tmp` 文件；它必须位于 master 和对应 agent 都能访问到的共享文件系统上，例如 NFS、virtio-fs、9p，或其他真正共享的文件映射。脚本里的 `--dist-worker=HOST,MASTER_ENDPOINT_PATH,AGENT_ENDPOINT_PATH` 用来描述两端看到同一 endpoint 文件时可能不同的挂载路径：
+
+```bash
+scripts/mr-bench.sh \
+  --impl=distributed \
+  --dist-mode=ssh \
+  --dist-master-host=127.0.0.1:2401 \
+  --dist-worker=127.0.0.1:2401,/mnt/mr/agent0.raw,/mnt/mr/agent0.raw \
+  --dist-worker=127.0.0.1:2402,/mnt/mr/agent1.raw,/mnt/mr/agent1.raw \
+  --dist-backend=file \
+  --dist-size=67108864 \
+  --dist-workers-per-agent=2 \
+  --dist-shuffle-connections=2 \
+  --dist-queue-policy=shared_pair \
+  --dist-reducers=4
+```
+
+如果 master VM 中挂载路径和 agent VM 中挂载路径不同，就分别填写第二、第三列，例如 `--dist-worker=vm2,/mnt/master/agent1.raw,/mnt/agent/agent1.raw`。`--dist-size` 必须与 master/agent 传入的 `--size` 一致；file backend 会按这个大小创建/截断共享文件。
+
 常用参数：
 
 - `--backend=file|devdax|ivshmem`：HydraRPC 后端。
@@ -130,6 +192,7 @@ master 默认创建并初始化 file backend；agent 默认 attach。master 结�
 - `--path=PATH`：agent 使用的 node-level endpoint 后端路径。
 - `--workers=N`：agent fork 的本地 worker 子进程数量。
 - `--agent-count=N`：全局 agent 数量，用于静态本地 worker 调度。
+- `--schedule=static|file:PATH`：master 调度策略，默认 `static`；`file:PATH` 从调度文件读取 map/reduce task 到 `node_id,worker_id` 的绑定。
 - `--connections=N`：master 打开 agent endpoint 时使用的 HydraRPC 多连接数量，应与 agent 的 `--shuffle-connections` 一致。
 - `--shuffle-connections=N`：agent endpoint 的 HydraRPC 多连接数量。
 - `--queue-policy=shared_pair|per_connection`：endpoint queue policy，默认 `shared_pair`。
@@ -137,10 +200,36 @@ master 默认创建并初始化 file backend；agent 默认 attach。master 结�
 - `--payload-max=N`：单条 HydraRPC payload 上限，默认 `1048576`。
 - `--map-chunk=N`：map 输入分片大小，默认约为 `payload-max / 4`。
 - `--queue-capacity=N`：HydraRPC 队列容量，默认 `4096`。
-- `--size=N`：HydraRPC 后端映射大小；devdax 场景应与设备映射大小一致，例如 `2097152000`。
+- `--size=N`：HydraRPC 后端映射大小；file backend 会按该大小创建/截断共享文件，devdax 场景应与设备映射大小一致，例如 `2097152000`。
 - `--create`：agent 侧也创建/初始化后端，主要用于调试；正常多机运行由 master 创建。
 
 通信轮询固定使用 HydraRPC 的 busy poll 等待路径，即 `hydrarpc-poll`。
+
+## 调度文件
+
+默认 `static` 调度仍使用公式：
+
+- map task：`task_id % agent_count` 选择 agent，`task_id / agent_count % workers_per_agent` 选择本地 worker。
+- reduce task：`reducer_id % agent_count` 选择 agent，`reducer_id / agent_count % workers_per_agent` 选择本地 worker。
+
+如果传 `--schedule=file:PATH`，master 会从 CSV 文件读取完整绑定。格式是：
+
+```csv
+kind,id,node_id,worker_id
+map,0,0,0
+map,1,1,0
+reduce,0,0,0
+reduce,1,1,0
+```
+
+说明：
+
+- `kind` 支持 `map`/`m` 和 `reduce`/`r`。
+- `id` 对 map 表示 map task id，对 reduce 表示 reducer partition id。
+- `node_id` 是 agent 的 `--node-id`，同时对应 master `--agents` 中的索引。
+- `worker_id` 是该 agent 内部的 local worker id，范围是 `0..workers-1`。
+- 文件支持表头、空行和 `#` 注释。
+- `file:PATH` 策略要求每个 map task 和每个 reducer 都有且只有一条绑定；缺失、重复、node 越界会直接失败。worker 越界会由目标 agent 在执行时拒绝。
 
 ## Benchmark 脚本
 
@@ -156,6 +245,7 @@ scripts/mr-bench.sh \
   --dist-backend=devdax \
   --dist-size=2097152000 \
   --dist-workers-per-agent=1 \
+  --dist-schedule=static \
   --dist-shuffle-connections=1 \
   --dist-queue-policy=shared_pair \
   --dist-reducers=4 \
@@ -182,6 +272,7 @@ VM1_AGENT_PATH=/dev/dax0.0 \
 VM2_AGENT_MASTER_PATH=/dev/dax0.0 \
 VM2_AGENT_PATH=/dev/dax0.0 \
 SIZE=2097152000 \
+SCHEDULE=static \
 WORKERS_PER_AGENT=1 \
 SHUFFLE_CONNECTIONS=1 \
 QUEUE_POLICY=shared_pair \
