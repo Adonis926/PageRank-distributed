@@ -30,6 +30,8 @@
 #define MR_SERVICE_CONTROL 1U
 #define MR_PATH_MAX 256U
 #define MR_JOB_ID 1ULL
+#define MR_AGENT_OPEN_RETRY_COUNT 10000U
+#define MR_AGENT_OPEN_RETRY_US 1000U
 
 #define MR_LOCAL_SLOT_EMPTY 0U
 #define MR_LOCAL_SLOT_READY 1U
@@ -1059,7 +1061,13 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         .queue_policy = args->shuffle_queue_policy,
         .create = args->create,
     };
-    err = mr_hydra_open_ex(&ctx, &config);
+    for (uint32_t attempt = 0; attempt <= MR_AGENT_OPEN_RETRY_COUNT; attempt++) {
+        err = mr_hydra_open_ex(&ctx, &config);
+        if (err == 0 || args->create) {
+            break;
+        }
+        usleep(MR_AGENT_OPEN_RETRY_US);
+    }
     if (err != 0) {
         fprintf(stderr, "agent: open control backend failed: %s\n",
                 hydra_strerror(err));

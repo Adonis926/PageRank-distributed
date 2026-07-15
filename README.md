@@ -160,7 +160,8 @@ scripts/mr-bench.sh \
   --dist-queue-policy=shared_pair \
   --dist-reducers=4 \
   --dist-payload-max=4194304 \
-  --dist-map-chunk=524288
+  --dist-map-chunk=524288 \
+  --verify=last
 ```
 
 `--dist-worker` 当前表示一个 node agent：`HOST,MASTER_ENDPOINT_PATH,AGENT_ENDPOINT_PATH`。逗号分隔格式便于保留不同 VM 中设备名不一致时的路径覆盖。两 VM 场景建议传两个 `--dist-worker`，分别启动 VM1 和 VM2 的 node agent；worker 身份通过 task metadata、`worker_id` 和 HydraRPC `connection_id` 区分。
@@ -184,10 +185,13 @@ SIZE=2097152000 \
 WORKERS_PER_AGENT=1 \
 SHUFFLE_CONNECTIONS=1 \
 QUEUE_POLICY=shared_pair \
+VERIFY=last \
 scripts/example.sh
 ```
 
 脚本不会启动虚拟机；QEMU、devdax/ivshmem 后端和 SSH 端口转发需要提前准备好。SSH 只用于远端 build、启动 master/agent、复制输入和结果；HydraRPC 的共享内存后端才是被测通信路径。远端 configure/build 输出会写入结果目录中的 `runs/distributed/logs/prepare_<host>.log`，每次运行结束都会生成结果目录和同名 `.tar.gz` 压缩包。
+
+默认 benchmark 口径是完整 MapReduce job 的 elapsed wall time，并用输入字节数计算吞吐率。计时不包含 build、输入发现、结果 sort/diff 校验、JSON/summary 生成和结果打包；job 输出写文件包含在计时内。warmup 只运行并记录到 `warmups.csv`，不参与统计也不校验；repeat 每轮只记录 `run_ms` 和退出码。正确性校验在计时循环之后执行，`--verify=last` 默认只校验最后一轮 repeat，`--verify=all` 校验所有 repeat，`--verify=none` 跳过校验。breakdown/profiling 应作为单独诊断模式，不混入默认 benchmark。
 
 两 VM 场景建议先使用如下基线：
 

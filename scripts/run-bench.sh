@@ -53,6 +53,7 @@ Common distributed options:
   --workers-per-agent=N
   --shuffle-connections=N
   --queue-policy=shared_pair|per_connection
+  --verify=last|all|none
   --repeat=N
   --warmup=N
 
@@ -88,6 +89,7 @@ queue_capacity=4096
 map_size=67108864
 shuffle_connections=1
 queue_policy=shared_pair
+verify=last
 ssh_user=""
 ssh_key=""
 remote_dir="/tmp/mr-bench"
@@ -119,6 +121,7 @@ while (($#)); do
     --size=*) map_size=${1#*=} ;;
     --shuffle-connections=*) shuffle_connections=${1#*=} ;;
     --queue-policy=*) queue_policy=${1#*=} ;;
+    --verify=*) verify=${1#*=} ;;
     --ssh-user=*) ssh_user=${1#*=} ;;
     --ssh-key=*) ssh_key=${1#*=} ;;
     --remote-dir=*) remote_dir=${1#*=} ;;
@@ -134,6 +137,16 @@ done
 [[ -n "$expected" && -f "$expected" ]] || die "--expected is required"
 [[ -n "$output_dir" ]] || die "--output-dir is required"
 [[ "$mode" == local || "$mode" == ssh ]] || die "invalid --mode=$mode"
+[[ "$repeat" =~ ^[0-9]+$ && "$repeat" -gt 0 ]] || die "--repeat must be a positive integer"
+[[ "$warmup" =~ ^[0-9]+$ ]] || die "--warmup must be a non-negative integer"
+[[ "$local_workers" =~ ^[0-9]+$ && "$local_workers" -gt 0 ]] || die "--local-workers must be a positive integer"
+[[ "$workers_per_agent" =~ ^[0-9]+$ && "$workers_per_agent" -gt 0 ]] || die "--workers-per-agent must be a positive integer"
+[[ "$payload_max" =~ ^[0-9]+$ && "$payload_max" -gt 0 ]] || die "--payload-max must be a positive integer"
+[[ "$queue_capacity" =~ ^[0-9]+$ && "$queue_capacity" -gt 0 ]] || die "--queue-capacity must be a positive integer"
+[[ "$map_size" =~ ^[0-9]+$ && "$map_size" -gt 0 ]] || die "--size must be a positive integer"
+[[ "$shuffle_connections" =~ ^[0-9]+$ && "$shuffle_connections" -gt 0 ]] || die "--shuffle-connections must be a positive integer"
+[[ "$input_bytes" =~ ^[0-9]+$ && "$input_bytes" -gt 0 ]] || die "--input-bytes must be a positive integer"
+[[ "$verify" == last || "$verify" == all || "$verify" == none ]] || die "--verify must be last, all, or none"
 mkdir -p "$output_dir"/logs
 
 mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' | LC_ALL=C sort)
@@ -285,25 +298,8 @@ run_local_once() {
   local run_id="${phase}-${index}-$$"
   local agent_paths
   agent_paths=$(make_agent_paths_local "$run_id")
-
-  start=$(now_ms)
-  "$repo/build/mr_hydra" master \
-    --backend="$backend" \
-    --input="$combined_input" \
-    --output="$master_output" \
-    --agents="$agent_paths" \
-    --payload-max="$payload_max" \
-    --queue-capacity="$queue_capacity" \
-    --size="$map_size" \
-    --connections="$shuffle_connections" \
-    --queue-policy="$queue_policy" \
-    ${reducers:+--reducers="$reducers"} \
-    ${map_chunk:+--map-chunk="$map_chunk"} \
-    --quiet > "$output_dir/logs/${phase}_${index}_master.log" 2>&1 &
-  master_pid=$!
-
-  sleep 0.2
   IFS=, read -r -a path_array <<< "$agent_paths"
+
   agent_pids=()
   local i
   for ((i = 0; i < ${#path_array[@]}; i++)); do
@@ -325,13 +321,29 @@ run_local_once() {
     agent_pids+=("$!")
   done
 
+  start=$(now_ms)
+  "$repo/build/mr_hydra" master \
+    --backend="$backend" \
+    --input="$combined_input" \
+    --output="$master_output" \
+    --agents="$agent_paths" \
+    --payload-max="$payload_max" \
+    --queue-capacity="$queue_capacity" \
+    --size="$map_size" \
+    --connections="$shuffle_connections" \
+    --queue-policy="$queue_policy" \
+    ${reducers:+--reducers="$reducers"} \
+    ${map_chunk:+--map-chunk="$map_chunk"} \
+    --quiet > "$output_dir/logs/${phase}_${index}_master.log" 2>&1 &
+  master_pid=$!
+
   local rc=0
   wait "$master_pid" || rc=$?
+  end=$(now_ms)
   for pid in "${agent_pids[@]}"; do
     wait "$pid" || rc=$?
   done
   rm -f "${path_array[@]}"
-  end=$(now_ms)
   echo "$((end - start)):$rc"
 }
 
@@ -428,11 +440,6 @@ run_ssh_once() {
 
   remote_copy_to "$combined_input" "$master_host" "$remote_input"
 
-  start=$(now_ms)
-  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
-  master_pid=$!
-
-  sleep 0.5
   worker_pids=()
   local i
   for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
@@ -440,12 +447,16 @@ run_ssh_once() {
     worker_pids+=("$!")
   done
 
+  start=$(now_ms)
+  remote_cmd "$master_host" "'$repo_on_master/build/mr_hydra' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
+  master_pid=$!
+
   local rc=0
   wait "$master_pid" || rc=$?
+  end=$(now_ms)
   for pid in "${worker_pids[@]}"; do
     wait "$pid" || rc=$?
   done
-  end=$(now_ms)
 
   copy_remote_log "$master_host" \
     "$remote_dir/logs/${phase}_${index}_master.log" \
@@ -484,64 +495,99 @@ if [[ "$mode" == local && "$build_ms" == 0 ]]; then
   build_ms=$((build_end - build_start))
 fi
 
-total_runs=$((warmup + repeat))
 run_csv="$output_dir/runs.csv"
-printf 'phase,index,run_ms,correct\n' > "$run_csv"
+warmup_csv="$output_dir/warmups.csv"
+printf 'index,run_ms,exit_status\n' > "$run_csv"
+printf 'index,run_ms,exit_status\n' > "$warmup_csv"
 
 run_values=()
 status=ok
-correctness=ok
+correctness=skipped
 
-for ((i = 0; i < total_runs; i++)); do
-  if ((i < warmup)); then
-    phase=warmup
-    logical_index=$i
-  else
-    phase=repeat
-    logical_index=$((i - warmup))
-  fi
-
-  raw="$output_dir/${phase}_${logical_index}.out"
-  norm="$output_dir/${phase}_${logical_index}.norm"
+for ((i = 0; i < warmup; i++)); do
+  raw="$output_dir/warmup_${i}.out"
   if [[ "$mode" == local ]]; then
-    result=$(run_local_once "$phase" "$logical_index" "$raw")
+    result=$(run_local_once warmup "$i" "$raw")
   else
-    result=$(run_ssh_once "$phase" "$logical_index" "$raw")
+    result=$(run_ssh_once warmup "$i" "$raw")
   fi
   run_ms=${result%%:*}
   rc=${result#*:}
 
   if [[ "$rc" != 0 ]]; then
     status=failed
-    correctness=failed
-  fi
-
-  if [[ -f "$raw" ]] && normalize_wordcount "$raw" "$norm" &&
-     diff -u "$expected" "$norm" > "$output_dir/logs/${phase}_${logical_index}.diff"; then
-    correct=yes
+    exit_status=$rc
   else
-    correct=no
-    status=failed
-    correctness=failed
-    if [[ ! -f "$raw" ]]; then
-      printf 'output file not produced: %s\n' "$raw" \
-        > "$output_dir/logs/${phase}_${logical_index}.diff"
-    fi
+    exit_status=0
   fi
-
-  printf '%s,%s,%s,%s\n' "$phase" "$logical_index" "$run_ms" "$correct" >> "$run_csv"
-  [[ "$phase" == repeat ]] && run_values+=("$run_ms")
+  printf '%s,%s,%s\n' "$i" "$run_ms" "$exit_status" >> "$warmup_csv"
 done
 
-read -r run_ms_avg run_ms_min run_ms_max < <(
+for ((i = 0; i < repeat; i++)); do
+  raw="$output_dir/repeat_${i}.out"
+  if [[ "$mode" == local ]]; then
+    result=$(run_local_once repeat "$i" "$raw")
+  else
+    result=$(run_ssh_once repeat "$i" "$raw")
+  fi
+  run_ms=${result%%:*}
+  rc=${result#*:}
+
+  if [[ "$rc" != 0 ]]; then
+    status=failed
+    exit_status=$rc
+  else
+    exit_status=0
+  fi
+  printf '%s,%s,%s\n' "$i" "$run_ms" "$exit_status" >> "$run_csv"
+  run_values+=("$run_ms")
+done
+
+if [[ "$verify" != none ]]; then
+  correctness=ok
+  verify_indices=()
+  if [[ "$verify" == all ]]; then
+    for ((i = 0; i < repeat; i++)); do
+      verify_indices+=("$i")
+    done
+  else
+    verify_indices=("$((repeat - 1))")
+  fi
+
+  for i in "${verify_indices[@]}"; do
+    raw="$output_dir/repeat_${i}.out"
+    norm="$output_dir/repeat_${i}.norm"
+    if [[ ! -f "$raw" ]]; then
+      status=failed
+      correctness=failed
+      printf 'output file not produced: %s\n' "$raw" \
+        > "$output_dir/logs/repeat_${i}.diff"
+      continue
+    fi
+
+    normalize_wordcount "$raw" "$norm"
+    if ! diff -u "$expected" "$norm" > "$output_dir/logs/repeat_${i}.diff"; then
+      status=failed
+      correctness=failed
+    fi
+  done
+fi
+
+read -r run_ms_avg run_ms_min run_ms_max run_ms_stddev < <(
   printf '%s\n' "${run_values[@]}" |
-    awk 'NR == 1 {min = max = sum = $1} NR > 1 {if ($1 < min) min = $1; if ($1 > max) max = $1; sum += $1} END {if (NR == 0) print "0 0 0"; else printf "%.3f %d %d\n", sum / NR, min, max}'
+    awk 'NR == 1 {min = max = $1} {values[NR] = $1; if ($1 < min) min = $1; if ($1 > max) max = $1; sum += $1} END {if (NR == 0) print "0 0 0 0"; else {mean = sum / NR; for (i = 1; i <= NR; i++) {d = values[i] - mean; ss += d * d} printf "%.3f %d %d %.3f\n", mean, min, max, sqrt(ss / NR)}}'
+)
+
+run_ms_median=$(
+  printf '%s\n' "${run_values[@]}" |
+    LC_ALL=C sort -n |
+    awk '{values[NR] = $1} END {if (NR == 0) print "0"; else if (NR % 2 == 1) printf "%.3f", values[(NR + 1) / 2]; else printf "%.3f", (values[NR / 2] + values[NR / 2 + 1]) / 2}'
 )
 
 throughput_mib_s=$(awk -v bytes="$input_bytes" -v ms="$run_ms_avg" 'BEGIN { if (ms <= 0) print "0"; else printf "%.3f", bytes / 1048576 / (ms / 1000) }')
 agent_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
 worker_count=$((agent_count * workers_per_agent))
-details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy}"
+details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy};verify=${verify}"
 
 cat > "$output_dir/result.env" <<EOF
 impl_name=distributed
@@ -551,6 +597,8 @@ build_ms=$build_ms
 run_ms_avg=$run_ms_avg
 run_ms_min=$run_ms_min
 run_ms_max=$run_ms_max
+run_ms_median=$run_ms_median
+run_ms_stddev=$run_ms_stddev
 throughput_mib_s=$throughput_mib_s
 input_bytes=$input_bytes
 details='$details'
@@ -565,6 +613,8 @@ cat > "$output_dir/result.json" <<EOF
   "run_ms_avg": $run_ms_avg,
   "run_ms_min": $run_ms_min,
   "run_ms_max": $run_ms_max,
+  "run_ms_median": $run_ms_median,
+  "run_ms_stddev": $run_ms_stddev,
   "throughput_mib_s": $throughput_mib_s,
   "mode": "$mode",
   "backend": "$backend",
@@ -578,6 +628,9 @@ cat > "$output_dir/result.json" <<EOF
   "size": $map_size,
   "shuffle_connections": $shuffle_connections,
   "queue_policy": "$queue_policy",
+  "verify": "$verify",
+  "warmup": $warmup,
+  "repeat": $repeat,
   "input_bytes": $input_bytes
 }
 EOF
