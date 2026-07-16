@@ -1305,6 +1305,40 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 const char *text = "agent task failed\n";
                 byte_buf_append(&response, text, strlen(text));
             }
+            mr_task_result_v1 task_result = {
+                .magic = MR_TASK_RESULT_MAGIC,
+                .size = sizeof(task_result),
+                .version = MR_TASK_RESULT_VERSION,
+                .kind = completed.header.kind,
+                .status = (uint32_t)(collect_err == 0 ? 0 : collect_err),
+                .node_id = (uint32_t)args->node_id,
+                .worker_id = porter_result.worker_id,
+                .task_id = completed.header.task_id,
+                .worker_pid = porter_result.worker_pid,
+                .dispatch_ns = porter_result.dispatch_ns,
+                .fork_ns = porter_result.fork_ns,
+                .wakeup_ns = porter_result.wakeup_ns,
+                .restore_ioctl_ns = porter_result.restore_ioctl_ns,
+                .template_validate_ns =
+                    porter_result.template_validate_ns,
+                .task_ns = porter_result.task_ns,
+                .reap_ns = porter_result.reap_ns,
+                .refill_ns = porter_result.refill_ns,
+                .porter_total_ns = porter_result.total_ns,
+                .restore_id = porter_result.restore.restore_id,
+                .restore_path_mask = porter_result.restore.path_mask,
+                .kernel_total_ns = porter_result.restore.kernel_total_ns,
+                .shared_leaf_pages =
+                    porter_result.restore.shared_leaf_pages,
+                .fallback_pages = porter_result.restore.fallback_pages,
+                .local_copy_pages = porter_result.restore.local_copy_pages,
+                .leaf_copy_pages = porter_result.restore.leaf_copy_pages,
+            };
+            byte_buf measured = {0};
+            byte_buf_append(&measured, &task_result, sizeof(task_result));
+            byte_buf_append(&measured, response.data, response.len);
+            byte_buf_clear(&response);
+            response = measured;
             byte_buf wire = make_wire(
                 collect_err == 0 ? (mr_task_kind)completed.header.kind
                                  : MR_TASK_ERROR,
@@ -1347,10 +1381,68 @@ static int open_agent_endpoint(mr_endpoint *ep, const master_args *args,
     return mr_hydra_open_ex(&ep->ctx, &config);
 }
 
+static int unwrap_task_result(byte_buf *response, mr_task_result_v1 *result)
+{
+    if (response->len < sizeof(*result)) {
+        return EPROTO;
+    }
+    memcpy(result, response->data, sizeof(*result));
+    if (result->magic != MR_TASK_RESULT_MAGIC ||
+        result->size != sizeof(*result) ||
+        result->version != MR_TASK_RESULT_VERSION) {
+        return EPROTO;
+    }
+    for (size_t i = 0; i < sizeof(result->reserved) /
+                               sizeof(result->reserved[0]);
+         i++) {
+        if (result->reserved[i] != 0) {
+            return EPROTO;
+        }
+    }
+    size_t business_len = response->len - sizeof(*result);
+    if (business_len > 0) {
+        memmove(response->data, response->data + sizeof(*result),
+                business_len);
+    }
+    response->len = business_len;
+    if (response->data != NULL) {
+        response->data[business_len] = '\0';
+    }
+    return result->status == 0 ? 0 : EREMOTEIO;
+}
+
+static void report_task_result(const mr_task_result_v1 *result,
+                               uint64_t master_roundtrip_ns)
+{
+    fprintf(stderr,
+            "task_result_v1 task=%" PRIu64 " kind=%u node=%u worker=%u"
+            " pid=%" PRId64 " status=%u roundtrip_ns=%" PRIu64
+            " porter_total_ns=%" PRIu64 " dispatch_ns=%" PRIu64
+            " fork_ns=%" PRIu64 " wakeup_ns=%" PRIu64
+            " restore_ioctl_ns=%" PRIu64
+            " template_validate_ns=%" PRIu64 " task_ns=%" PRIu64
+            " reap_ns=%" PRIu64 " refill_ns=%" PRIu64
+            " restore_id=%" PRIu64 " path_mask=%" PRIu64
+            " kernel_total_ns=%" PRIu64 " shared_leaf_pages=%" PRIu64
+            " fallback_pages=%" PRIu64 " local_copy_pages=%" PRIu64
+            " leaf_copy_pages=%" PRIu64 "\n",
+            result->task_id, result->kind, result->node_id,
+            result->worker_id, result->worker_pid, result->status,
+            master_roundtrip_ns, result->porter_total_ns,
+            result->dispatch_ns, result->fork_ns, result->wakeup_ns,
+            result->restore_ioctl_ns, result->template_validate_ns,
+            result->task_ns, result->reap_ns, result->refill_ns,
+            result->restore_id, result->restore_path_mask,
+            result->kernel_total_ns, result->shared_leaf_pages,
+            result->fallback_pages, result->local_copy_pages,
+            result->leaf_copy_pages);
+}
+
 static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
                       uint64_t partition_id, uint64_t partition_count,
                       const void *body, size_t body_len, byte_buf *response)
 {
+    uint64_t begin_ns = hydra_now_ns();
     int err = send_hydra_request(agent->ctx, kind, task_id, partition_id,
                                  partition_count, body, body_len);
     if (err != 0) {
@@ -1363,6 +1455,14 @@ static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
     }
     if (hdr.kind != kind || hdr.task_id != task_id) {
         return EPROTO;
+    }
+    if (kind == MR_TASK_MAP || kind == MR_TASK_REDUCE) {
+        mr_task_result_v1 result = {0};
+        err = unwrap_task_result(response, &result);
+        if (err != 0 || result.kind != kind || result.task_id != task_id) {
+            return err != 0 ? err : EPROTO;
+        }
+        report_task_result(&result, hydra_now_ns() - begin_ns);
     }
     return 0;
 }
@@ -1490,6 +1590,7 @@ static int run_master(const master_args *args)
             if (batch > args->workers_per_agent) {
                 batch = (size_t)args->workers_per_agent;
             }
+            uint64_t *sent_at = mr_xcalloc(batch, sizeof(*sent_at));
             for (size_t j = 0; j < batch; j++) {
                 size_t i = base + j;
                 control_map_task task = {
@@ -1502,11 +1603,13 @@ static int run_master(const master_args *args)
                 byte_buf body = {0};
                 byte_buf_append(&body, &task, sizeof(task));
                 byte_buf_append(&body, slices[i].data, slices[i].len);
+                sent_at[j] = hydra_now_ns();
                 int err = send_hydra_request(
                     agents[0].ctx, MR_TASK_MAP, i, 0,
                     (uint64_t)reducer_count, body.data, body.len);
                 byte_buf_clear(&body);
                 if (err != 0) {
+                    free(sent_at);
                     goto cleanup;
                 }
             }
@@ -1520,13 +1623,29 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
+                    mr_task_result_v1 result = {0};
+                    err = unwrap_task_result(&response, &result);
+                    if (err == 0 &&
+                        (result.kind != MR_TASK_MAP ||
+                         result.task_id != hdr.task_id)) {
+                        err = EPROTO;
+                    }
+                    if (err == 0) {
+                        report_task_result(
+                            &result,
+                            hydra_now_ns() - sent_at[hdr.task_id - base]);
+                    }
+                }
+                if (err == 0) {
                     err = collect_map_locations(&response, &locations);
                 }
                 byte_buf_clear(&response);
                 if (err != 0) {
+                    free(sent_at);
                     goto cleanup;
                 }
             }
+            free(sent_at);
         }
     } else for (size_t i = 0; i < slice_count; i++) {
         size_t agent_index = i % args->agents.len;
@@ -1576,6 +1695,8 @@ static int run_master(const master_args *args)
             if ((uint64_t)batch > args->workers_per_agent) {
                 batch = (int)args->workers_per_agent;
             }
+            uint64_t *sent_at =
+                mr_xcalloc((size_t)batch, sizeof(*sent_at));
             for (int j = 0; j < batch; j++) {
                 int r = base + j;
                 location_vec reducer_locations = {0};
@@ -1599,6 +1720,7 @@ static int run_master(const master_args *args)
                         &body, reducer_locations.items,
                         reducer_locations.len * sizeof(reducer_locations.items[0]));
                 }
+                sent_at[j] = hydra_now_ns();
                 int err = send_hydra_request(
                     agents[1].ctx, MR_TASK_REDUCE,
                     slice_count + (uint64_t)r, (uint64_t)r,
@@ -1606,6 +1728,7 @@ static int run_master(const master_args *args)
                 byte_buf_clear(&body);
                 location_vec_destroy(&reducer_locations);
                 if (err != 0) {
+                    free(sent_at);
                     goto cleanup;
                 }
             }
@@ -1620,14 +1743,31 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
+                    mr_task_result_v1 result = {0};
+                    err = unwrap_task_result(&response, &result);
+                    if (err == 0 &&
+                        (result.kind != MR_TASK_REDUCE ||
+                         result.task_id != hdr.task_id)) {
+                        err = EPROTO;
+                    }
+                    if (err == 0) {
+                        report_task_result(
+                            &result,
+                            hydra_now_ns() -
+                                sent_at[hdr.partition_id - (uint64_t)base]);
+                    }
+                }
+                if (err == 0) {
                     err = collect_reduce_output(
                         &final_output, (uint32_t)hdr.partition_id, &response);
                 }
                 byte_buf_clear(&response);
                 if (err != 0) {
+                    free(sent_at);
                     goto cleanup;
                 }
             }
+            free(sent_at);
         }
     } else for (int r = 0; r < reducer_count; r++) {
         size_t agent_index = (size_t)r % args->agents.len;

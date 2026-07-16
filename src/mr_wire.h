@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 #define MR_OP 100U
+#define MR_TASK_RESULT_MAGIC 0x4d525431U
+#define MR_TASK_RESULT_VERSION 1U
 
 #define SHUFFLE_CHUNK_FIRST 0x1U
 #define SHUFFLE_CHUNK_LAST 0x2U
@@ -43,8 +45,39 @@ typedef struct ShuffleChunkHeader {
     uint32_t payload_bytes;
 } ShuffleChunkHeader;
 
+typedef struct mr_task_result_v1 {
+    uint32_t magic;
+    uint16_t size;
+    uint16_t version;
+    uint32_t kind;
+    uint32_t status;
+    uint32_t node_id;
+    uint32_t worker_id;
+    uint64_t task_id;
+    int64_t worker_pid;
+    uint64_t dispatch_ns;
+    uint64_t fork_ns;
+    uint64_t wakeup_ns;
+    uint64_t restore_ioctl_ns;
+    uint64_t template_validate_ns;
+    uint64_t task_ns;
+    uint64_t reap_ns;
+    uint64_t refill_ns;
+    uint64_t porter_total_ns;
+    uint64_t restore_id;
+    uint64_t restore_path_mask;
+    uint64_t kernel_total_ns;
+    uint64_t shared_leaf_pages;
+    uint64_t fallback_pages;
+    uint64_t local_copy_pages;
+    uint64_t leaf_copy_pages;
+    uint64_t reserved[4];
+} mr_task_result_v1;
+
 _Static_assert(sizeof(ShuffleChunkHeader) == 40,
                "ShuffleChunkHeader wire size must stay stable");
+_Static_assert(sizeof(mr_task_result_v1) == 200,
+               "mr_task_result_v1 wire size must stay stable");
 
 byte_buf mr_wire_make(mr_task_kind kind, uint64_t task_id,
                       uint64_t partition_id, uint64_t partition_count,

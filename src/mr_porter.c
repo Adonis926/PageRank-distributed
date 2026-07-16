@@ -36,8 +36,11 @@ typedef struct mr_porter_slot {
     uint64_t partition_count;
     uint64_t payload_len;
     uint64_t response_len;
+    uint64_t submit_ns;
+    uint64_t worker_begin_ns;
     uint64_t restore_ioctl_ns;
     uint64_t template_validate_ns;
+    uint64_t task_ns;
     mr_cxlfork_result restore;
 } mr_porter_slot;
 
@@ -192,6 +195,7 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
     mr_cxlfork_session *session = NULL;
     int err = 0;
 
+    slot->worker_begin_ns = nsec_now();
     memset(&slot->restore, 0, sizeof(slot->restore));
     slot->restore_ioctl_ns = 0;
     slot->template_validate_ns = 0;
@@ -215,10 +219,12 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
     if (err == 0 && slot->payload_len > config->slot_bytes) {
         err = EMSGSIZE;
     } else if (err == 0) {
+        uint64_t begin = nsec_now();
         err = config->task_fn(config->task_context, worker_id, slot->kind,
                               slot->task_id, slot->partition_id,
                               slot->partition_count, slot_payload(slot),
                               (size_t)slot->payload_len, &response);
+        slot->task_ns = nsec_now() - begin;
     }
     if (session != NULL) {
         int collect_err = mr_cxlfork_restore_collect(session, &slot->restore);
@@ -433,7 +439,11 @@ static void supervisor_main(mr_porter_config config, void *shared,
             reply.result.worker_pid = executed_pids[worker];
             reply.result.dispatch_ns = dispatch_ns[worker];
             reply.result.fork_ns = fork_ns[worker];
-            reply.result.task_ns = nsec_now() - begin_ns[worker];
+            reply.result.wakeup_ns =
+                slot->worker_begin_ns >= slot->submit_ns
+                    ? slot->worker_begin_ns - slot->submit_ns
+                    : 0;
+            reply.result.task_ns = slot->task_ns;
             reply.result.status = slot->status;
             reply.result.restore_ioctl_ns = slot->restore_ioctl_ns;
             reply.result.template_validate_ns = slot->template_validate_ns;
@@ -576,13 +586,17 @@ int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
     slot->partition_count = partition_count;
     slot->payload_len = payload_len;
     slot->response_len = 0;
+    slot->submit_ns = 0;
+    slot->worker_begin_ns = 0;
     slot->restore_ioctl_ns = 0;
     slot->template_validate_ns = 0;
+    slot->task_ns = 0;
     memset(&slot->restore, 0, sizeof(slot->restore));
     if (payload_len > 0) {
         memcpy(slot_payload(slot), payload, payload_len);
     }
     porter->busy[worker_id] = true;
+    slot->submit_ns = nsec_now();
     slot_publish(slot, MR_PORTER_SLOT_READY);
 
     mr_porter_command command = {

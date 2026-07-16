@@ -42,6 +42,13 @@ typedef struct ShuffleChunkHeader {
 
 `ShuffleChunkHeader` 用于 shuffle fetch response。HydraRPC payload 生命周期只覆盖单次 req/resp，因此 reducer 收到 chunk 后立即 append 到 spill file，不长期保存 payload 指针。
 
+map/reduce response 的业务 payload 前带固定 200-byte `mr_task_result_v1`
+envelope。它包含 magic、size、version、任务/worker/PID、porter 分项以及本次
+CXLfork restore 的 path、kernel time 和 page counters。master 严格校验后移除
+envelope，再把业务结果交给原来的 WordCount 解析，因此测量元数据不会改变应用
+输出。`task_ns` 只包围应用回调；restore、template validation、reap 和 refill
+单独计时，`porter_total_ns` 才是包含这些阶段的外层区间。
+
 调度默认是静态、可重复的：
 
 - map task：`task_id % agent_count` 选择 agent，`task_id / agent_count % workers_per_agent` 选择本地 worker。
@@ -220,6 +227,26 @@ scripts/mr-bench.sh \
 - `--create`：agent 侧也创建/初始化后端，主要用于调试；正常多机运行由 master 创建。
 
 通信轮询固定使用 HydraRPC 的 busy poll 等待路径，即 `hydrarpc-poll`。
+
+## 固定拓扑 benchmark runner
+
+`scripts/run-bench.sh` 支持把每个 agent 的固定角色和生命周期写进 worker spec：
+
+```text
+--worker=HOST,MASTER_PATH,AGENT_PATH,ROLE,LAUNCH,WORKERS
+```
+
+例如 `...,map,localfork,4` 与 `...,reduce,cxlfork,4`。CXLfork worker 还需传
+对应 role 的 template key、generation 和 checksum。runner 输出：
+
+- `runs.csv`、`warmups.csv`：端到端每轮耗时；
+- `tasks.csv`：逐任务、逐调用的原始 envelope 字段；
+- `task_summary.csv`：按 map/reduce 和字段汇总 mean/P50/P95/标准差；
+- `result.json`、`result.env`：正确性、吞吐和端到端 mean/P50/P95/标准差；
+- `logs/`：master/agent 原始日志和校验 diff。
+
+30 次样本不会输出 P99；如论文实验需要 P99，应单独把 repeat 提高到数百或约
+1,000 次。默认 `verify=all` 可让每个计时样本都先通过 WordCount 输出校验。
 
 ## 调度文件
 
