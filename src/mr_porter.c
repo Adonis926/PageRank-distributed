@@ -3,6 +3,7 @@
 #include "mr_porter.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -64,6 +65,7 @@ struct mr_porter {
     size_t shared_len;
     uint64_t slot_bytes;
     uint32_t workers;
+    bool *busy;
 };
 
 static uint64_t nsec_now(void)
@@ -107,6 +109,21 @@ static int read_full(int fd, void *buffer, size_t size)
     return 0;
 }
 
+static int read_packet_nowait(int fd, void *buffer, size_t size)
+{
+    ssize_t n;
+    do {
+        n = recv(fd, buffer, size, MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        return errno;
+    }
+    if ((size_t)n != size) {
+        return EPROTO;
+    }
+    return 0;
+}
+
 static size_t slot_stride(uint64_t slot_bytes)
 {
     return sizeof(mr_porter_slot) + (size_t)slot_bytes * 2U;
@@ -133,14 +150,6 @@ static void slot_publish(mr_porter_slot *slot, uint32_t state)
 {
     __sync_synchronize();
     slot->state = state;
-    __sync_synchronize();
-}
-
-static void slot_wait_for(const volatile uint32_t *state, uint32_t wanted)
-{
-    while (*state != wanted) {
-        sched_yield();
-    }
     __sync_synchronize();
 }
 
@@ -297,6 +306,11 @@ static void supervisor_main(mr_porter_config config, void *shared,
                             int control_fd)
 {
     pid_t *pids = calloc(config.workers, sizeof(*pids));
+    pid_t *executed_pids = calloc(config.workers, sizeof(*executed_pids));
+    uint64_t *begin_ns = calloc(config.workers, sizeof(*begin_ns));
+    uint64_t *dispatch_ns = calloc(config.workers, sizeof(*dispatch_ns));
+    uint64_t *fork_ns = calloc(config.workers, sizeof(*fork_ns));
+    bool *inflight = calloc(config.workers, sizeof(*inflight));
     mr_porter_reply reply = {
         .size = sizeof(reply),
         .version = MR_PORTER_PROTOCOL_VERSION,
@@ -305,7 +319,9 @@ static void supervisor_main(mr_porter_config config, void *shared,
     void *template_mapping = NULL;
     int err = 0;
 
-    if (pids == NULL) {
+    if (pids == NULL || executed_pids == NULL || begin_ns == NULL ||
+        dispatch_ns == NULL ||
+        fork_ns == NULL || inflight == NULL) {
         err = ENOMEM;
     } else if (config.mode != MR_LAUNCH_CXLFORK) {
         err = mr_template_map_local(&config.template, &template_mapping);
@@ -334,79 +350,120 @@ static void supervisor_main(mr_porter_config config, void *shared,
     reply.result.status = (uint32_t)err;
     if (write_full(control_fd, &reply, sizeof(reply)) != 0 || err != 0) {
         mr_template_unmap(template_mapping, config.template.bytes);
+        free(inflight);
+        free(fork_ns);
+        free(dispatch_ns);
+        free(begin_ns);
+        free(executed_pids);
         free(pids);
         close(control_fd);
         _exit(err == 0 ? 121 : 1);
     }
 
-    for (;;) {
+    bool stopping = false;
+    while (!stopping) {
+        bool progress = false;
         mr_porter_command command;
-        if (read_full(control_fd, &command, sizeof(command)) != 0) {
-            break;
-        }
-        if (command.size != sizeof(command) ||
-            command.version != MR_PORTER_PROTOCOL_VERSION) {
-            break;
-        }
-        if (command.op == MR_PORTER_OP_STOP) {
-            reply.op = MR_PORTER_OP_STOP;
-            memset(&reply.result, 0, sizeof(reply.result));
-            (void)write_full(control_fd, &reply, sizeof(reply));
-            break;
-        }
-        if (command.op != MR_PORTER_OP_DISPATCH ||
-            command.worker_id >= config.workers) {
-            break;
-        }
-
-        mr_porter_slot *slot =
-            slot_at(shared, config.slot_bytes, command.worker_id);
-        uint64_t begin = nsec_now();
-        uint64_t phase;
-        pid_t executed_pid = pids[command.worker_id];
-        memset(&reply.result, 0, sizeof(reply.result));
-        reply.op = MR_PORTER_OP_DISPATCH;
-        reply.result.worker_id = command.worker_id;
-        reply.result.task_id = command.task_id;
-        reply.result.dispatch_ns = begin - command.dispatch_ns;
-
-        if (config.mode == MR_LAUNCH_LOCALFORK) {
-            phase = nsec_now();
-            executed_pid = spawn_worker(&config, command.worker_id, slot,
-                                        false, control_fd);
-            reply.result.fork_ns = nsec_now() - phase;
-            if (executed_pid < 0) {
-                reply.result.status = (uint32_t)errno;
+        int command_err =
+            read_packet_nowait(control_fd, &command, sizeof(command));
+        if (command_err == 0) {
+            progress = true;
+            if (command.size != sizeof(command) ||
+                command.version != MR_PORTER_PROTOCOL_VERSION) {
+                break;
             }
+            if (command.op == MR_PORTER_OP_STOP) {
+                bool any_inflight = false;
+                for (uint32_t i = 0; i < config.workers; i++) {
+                    any_inflight |= inflight[i];
+                }
+                if (any_inflight) {
+                    break;
+                }
+                reply.op = MR_PORTER_OP_STOP;
+                memset(&reply.result, 0, sizeof(reply.result));
+                (void)write_full(control_fd, &reply, sizeof(reply));
+                stopping = true;
+                continue;
+            }
+            if (command.op != MR_PORTER_OP_DISPATCH ||
+                command.worker_id >= config.workers ||
+                inflight[command.worker_id]) {
+                break;
+            }
+
+            uint32_t worker = command.worker_id;
+            mr_porter_slot *slot =
+                slot_at(shared, config.slot_bytes, worker);
+            begin_ns[worker] = nsec_now();
+            dispatch_ns[worker] = begin_ns[worker] - command.dispatch_ns;
+            fork_ns[worker] = 0;
+            executed_pids[worker] = pids[worker];
+            inflight[worker] = true;
+            if (config.mode == MR_LAUNCH_LOCALFORK) {
+                uint64_t phase = nsec_now();
+                executed_pids[worker] =
+                    spawn_worker(&config, worker, slot, false, control_fd);
+                fork_ns[worker] = nsec_now() - phase;
+                if (executed_pids[worker] < 0) {
+                    slot->status = (uint32_t)errno;
+                    slot_publish(slot, MR_PORTER_SLOT_DONE);
+                }
+            }
+        } else if (command_err != EAGAIN && command_err != EWOULDBLOCK) {
+            break;
         }
-        if (reply.result.status == 0) {
-            reply.result.worker_pid = executed_pid;
-            phase = nsec_now();
-            slot_wait_for(&slot->state, MR_PORTER_SLOT_DONE);
-            reply.result.task_ns = nsec_now() - phase;
+
+        for (uint32_t worker = 0; worker < config.workers; worker++) {
+            if (!inflight[worker]) {
+                continue;
+            }
+            mr_porter_slot *slot =
+                slot_at(shared, config.slot_bytes, worker);
+            if (slot->state != MR_PORTER_SLOT_DONE) {
+                continue;
+            }
+            __sync_synchronize();
+            progress = true;
+            uint64_t phase;
+            memset(&reply.result, 0, sizeof(reply.result));
+            reply.op = MR_PORTER_OP_DISPATCH;
+            reply.result.worker_id = worker;
+            reply.result.task_id = slot->task_id;
+            reply.result.worker_pid = executed_pids[worker];
+            reply.result.dispatch_ns = dispatch_ns[worker];
+            reply.result.fork_ns = fork_ns[worker];
+            reply.result.task_ns = nsec_now() - begin_ns[worker];
             reply.result.status = slot->status;
             reply.result.restore_ioctl_ns = slot->restore_ioctl_ns;
             reply.result.template_validate_ns = slot->template_validate_ns;
             reply.result.restore = slot->restore;
-        }
-        if (config.mode != MR_LAUNCH_PERSISTENT && executed_pid > 0) {
-            phase = nsec_now();
-            (void)waitpid(executed_pid, NULL, 0);
-            reply.result.reap_ns = nsec_now() - phase;
-        }
-        if (config.mode == MR_LAUNCH_LOCAL_PREFORK ||
-            config.mode == MR_LAUNCH_CXLFORK) {
-            phase = nsec_now();
-            pids[command.worker_id] = spawn_worker(
-                &config, command.worker_id, slot, false, control_fd);
-            if (pids[command.worker_id] < 0 && reply.result.status == 0) {
-                reply.result.status = (uint32_t)errno;
+
+            if (config.mode != MR_LAUNCH_PERSISTENT &&
+                executed_pids[worker] > 0) {
+                phase = nsec_now();
+                (void)waitpid(executed_pids[worker], NULL, 0);
+                reply.result.reap_ns = nsec_now() - phase;
             }
-            reply.result.refill_ns = nsec_now() - phase;
+            if (config.mode == MR_LAUNCH_LOCAL_PREFORK ||
+                config.mode == MR_LAUNCH_CXLFORK) {
+                phase = nsec_now();
+                pids[worker] = spawn_worker(&config, worker, slot, false,
+                                            control_fd);
+                if (pids[worker] < 0 && reply.result.status == 0) {
+                    reply.result.status = (uint32_t)errno;
+                }
+                reply.result.refill_ns = nsec_now() - phase;
+            }
+            reply.result.total_ns = nsec_now() - begin_ns[worker];
+            inflight[worker] = false;
+            if (write_full(control_fd, &reply, sizeof(reply)) != 0) {
+                stopping = true;
+                break;
+            }
         }
-        reply.result.total_ns = nsec_now() - begin;
-        if (write_full(control_fd, &reply, sizeof(reply)) != 0) {
-            break;
+        if (!progress) {
+            sched_yield();
         }
     }
 
@@ -414,6 +471,11 @@ static void supervisor_main(mr_porter_config config, void *shared,
         stop_workers(pids, &config, shared);
     }
     mr_template_unmap(template_mapping, config.template.bytes);
+    free(inflight);
+    free(fork_ns);
+    free(dispatch_ns);
+    free(begin_ns);
+    free(executed_pids);
     free(pids);
     close(control_fd);
     _exit(0);
@@ -436,17 +498,24 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
     porter->control_fd = -1;
     porter->workers = config->workers;
     porter->slot_bytes = config->slot_bytes;
+    porter->busy = calloc(config->workers, sizeof(*porter->busy));
+    if (porter->busy == NULL) {
+        free(porter);
+        return ENOMEM;
+    }
     porter->shared_len = slot_stride(config->slot_bytes) * config->workers;
     porter->shared = mmap(NULL, porter->shared_len, PROT_READ | PROT_WRITE,
                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (porter->shared == MAP_FAILED) {
         int err = errno;
+        free(porter->busy);
         free(porter);
         return err;
     }
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
         int err = errno;
         munmap(porter->shared, porter->shared_len);
+        free(porter->busy);
         free(porter);
         return err;
     }
@@ -456,6 +525,7 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
         close(sockets[0]);
         close(sockets[1]);
         munmap(porter->shared, porter->shared_len);
+        free(porter->busy);
         free(porter);
         return err;
     }
@@ -478,6 +548,7 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
         close(porter->control_fd);
         (void)waitpid(porter->supervisor_pid, NULL, 0);
         munmap(porter->shared, porter->shared_len);
+        free(porter->busy);
         free(porter);
         return err;
     }
@@ -485,18 +556,17 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
     return 0;
 }
 
-int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
-                   uint64_t task_id, uint64_t partition_id,
-                   uint64_t partition_count, const void *payload,
-                   size_t payload_len, byte_buf *response,
-                   mr_porter_result *result)
+int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
+                     uint64_t task_id, uint64_t partition_id,
+                     uint64_t partition_count, const void *payload,
+                     size_t payload_len)
 {
     if (porter == NULL || worker_id >= porter->workers ||
         payload_len > porter->slot_bytes) {
         return EINVAL;
     }
     mr_porter_slot *slot = slot_at(porter->shared, porter->slot_bytes, worker_id);
-    if (slot->state != MR_PORTER_SLOT_EMPTY) {
+    if (porter->busy[worker_id] || slot->state != MR_PORTER_SLOT_EMPTY) {
         return EBUSY;
     }
     slot->status = 0;
@@ -512,6 +582,7 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
     if (payload_len > 0) {
         memcpy(slot_payload(slot), payload, payload_len);
     }
+    porter->busy[worker_id] = true;
     slot_publish(slot, MR_PORTER_SLOT_READY);
 
     mr_porter_command command = {
@@ -523,21 +594,43 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
         .dispatch_ns = nsec_now(),
     };
     int err = write_full(porter->control_fd, &command, sizeof(command));
-    mr_porter_reply reply;
-    if (err == 0) {
-        err = read_full(porter->control_fd, &reply, sizeof(reply));
+    if (err != 0) {
+        slot_publish(slot, MR_PORTER_SLOT_EMPTY);
+        porter->busy[worker_id] = false;
     }
+    return err;
+}
+
+int mr_porter_collect(mr_porter *porter, uint32_t *worker_id,
+                      byte_buf *response, mr_porter_result *result)
+{
+    if (porter == NULL) {
+        return EINVAL;
+    }
+    mr_porter_reply reply;
+    int err = read_packet_nowait(porter->control_fd, &reply, sizeof(reply));
     if (err == 0 && (reply.size != sizeof(reply) ||
                      reply.version != MR_PORTER_PROTOCOL_VERSION ||
                      reply.op != MR_PORTER_OP_DISPATCH ||
-                     reply.result.task_id != task_id ||
-                     reply.result.worker_id != worker_id)) {
+                     reply.result.worker_id >= porter->workers)) {
         err = EPROTO;
+    }
+    if (err != 0) {
+        return err;
+    }
+    uint32_t completed_worker = reply.result.worker_id;
+    mr_porter_slot *slot =
+        slot_at(porter->shared, porter->slot_bytes, completed_worker);
+    if (!porter->busy[completed_worker] ||
+        slot->state != MR_PORTER_SLOT_DONE ||
+        slot->task_id != reply.result.task_id) {
+        return EPROTO;
     }
     if (err == 0 && slot->response_len > porter->slot_bytes) {
         err = EMSGSIZE;
     }
-    if (err == 0 && slot->status == 0 && slot->response_len > 0) {
+    if (err == 0 && slot->status == 0 && slot->response_len > 0 &&
+        response != NULL) {
         byte_buf_append(response, slot_response(slot, porter->slot_bytes),
                         (size_t)slot->response_len);
     }
@@ -545,11 +638,41 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
         err = reply.result.status != 0 ? (int)reply.result.status
                                        : (int)slot->status;
     }
-    if (result != NULL && err != EPROTO) {
+    if (worker_id != NULL) {
+        *worker_id = completed_worker;
+    }
+    if (result != NULL) {
         *result = reply.result;
     }
     slot_publish(slot, MR_PORTER_SLOT_EMPTY);
+    porter->busy[completed_worker] = false;
     return err;
+}
+
+int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
+                   uint64_t task_id, uint64_t partition_id,
+                   uint64_t partition_count, const void *payload,
+                   size_t payload_len, byte_buf *response,
+                   mr_porter_result *result)
+{
+    int err = mr_porter_submit(porter, worker_id, kind, task_id,
+                               partition_id, partition_count, payload,
+                               payload_len);
+    if (err != 0) {
+        return err;
+    }
+    for (;;) {
+        uint32_t completed_worker = UINT32_MAX;
+        err = mr_porter_collect(porter, &completed_worker, response, result);
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            sched_yield();
+            continue;
+        }
+        if (completed_worker != worker_id) {
+            return EPROTO;
+        }
+        return err;
+    }
 }
 
 void mr_porter_stop(mr_porter *porter)
@@ -568,5 +691,6 @@ void mr_porter_stop(mr_porter *porter)
     close(porter->control_fd);
     (void)waitpid(porter->supervisor_pid, NULL, 0);
     munmap(porter->shared, porter->shared_len);
+    free(porter->busy);
     free(porter);
 }

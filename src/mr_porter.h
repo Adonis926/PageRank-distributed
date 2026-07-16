@@ -54,6 +54,12 @@ typedef struct mr_porter mr_porter;
 const char *mr_launch_mode_name(mr_launch_mode mode);
 int mr_launch_mode_parse(const char *text, mr_launch_mode *mode);
 int mr_porter_start(const mr_porter_config *config, mr_porter **out);
+int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
+                     uint64_t task_id, uint64_t partition_id,
+                     uint64_t partition_count, const void *payload,
+                     size_t payload_len);
+int mr_porter_collect(mr_porter *porter, uint32_t *worker_id,
+                      byte_buf *response, mr_porter_result *result);
 int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
                    uint64_t task_id, uint64_t partition_id,
                    uint64_t partition_count, const void *payload,

@@ -769,8 +769,7 @@ static int shuffle_fetch_remote(const worker_child_args *args,
         .queue_capacity = args->queue_capacity,
         .payload_max = args->payload_max,
         .connections = args->shuffle_connections,
-        .connection_id = (args->worker_id + loc->worker_id + loc->reducer_id) %
-                         args->shuffle_connections,
+        .connection_id = args->worker_id % args->shuffle_connections,
         .node_id = 0,
         .peer_node_id = loc->node_id + 1,
         .service_id = MR_SERVICE_CONTROL,
@@ -1022,16 +1021,12 @@ static int porter_execute_task(void *context, uint32_t worker_id,
     return EINVAL;
 }
 
-static int agent_handle_request(mr_porter *porter, size_t worker_count,
+static int agent_submit_request(mr_porter *porter, size_t worker_count,
                                 mr_worker_role role, uint64_t agent_count,
-                                uint64_t payload_max,
                                 const mr_wire_header *hdr, const char *body,
-                                size_t body_len, byte_buf *response,
-                                mr_porter_result *porter_result)
+                                size_t body_len, uint32_t *worker_out)
 {
-    if (hdr->kind == MR_TASK_SHUFFLE_FETCH) {
-        return handle_shuffle_fetch(hdr, body, body_len, payload_max, response);
-    }
+    uint32_t worker_index;
     if (hdr->kind == MR_TASK_MAP) {
         if (role == MR_ROLE_REDUCE) {
             return EOPNOTSUPP;
@@ -1041,21 +1036,16 @@ static int agent_handle_request(mr_porter *porter, size_t worker_count,
         }
         control_map_task task = {0};
         memcpy(&task, body, sizeof(task));
-        size_t worker_index = 0;
         if (task.target_worker_id == MR_TARGET_WORKER_AUTO) {
-            worker_index = (size_t)((hdr->task_id / agent_count) % worker_count);
+            worker_index =
+                (uint32_t)((hdr->task_id / agent_count) % worker_count);
         } else {
-            worker_index = (size_t)task.target_worker_id;
+            worker_index = task.target_worker_id;
         }
         if (worker_index >= worker_count) {
             return EINVAL;
         }
-        return mr_porter_call(porter, (uint32_t)worker_index, MR_TASK_MAP,
-                              hdr->task_id, hdr->partition_id,
-                              hdr->partition_count, body, body_len, response,
-                              porter_result);
-    }
-    if (hdr->kind == MR_TASK_REDUCE) {
+    } else if (hdr->kind == MR_TASK_REDUCE) {
         if (role == MR_ROLE_MAP) {
             return EOPNOTSUPP;
         }
@@ -1064,25 +1054,25 @@ static int agent_handle_request(mr_porter *porter, size_t worker_count,
         }
         control_reduce_task task = {0};
         memcpy(&task, body, sizeof(task));
-        size_t worker_index = 0;
         if (task.target_worker_id == MR_TARGET_WORKER_AUTO) {
             worker_index =
-                (size_t)((hdr->partition_id / agent_count) % worker_count);
+                (uint32_t)((hdr->partition_id / agent_count) % worker_count);
         } else {
-            worker_index = (size_t)task.target_worker_id;
+            worker_index = task.target_worker_id;
         }
         if (worker_index >= worker_count) {
             return EINVAL;
         }
-        return mr_porter_call(porter, (uint32_t)worker_index, MR_TASK_REDUCE,
-                              hdr->task_id, hdr->partition_id,
-                              hdr->partition_count, body, body_len, response,
-                              porter_result);
+    } else {
+        return EINVAL;
     }
-    if (hdr->kind == MR_TASK_SHUTDOWN) {
-        return 0;
+    int err = mr_porter_submit(porter, worker_index, hdr->kind, hdr->task_id,
+                               hdr->partition_id, hdr->partition_count, body,
+                               body_len);
+    if (err == 0 && worker_out != NULL) {
+        *worker_out = worker_index;
     }
-    return EINVAL;
+    return err;
 }
 
 static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
@@ -1185,70 +1175,153 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         fflush(stdout);
     }
 
-    bool stop = false;
-    while (!stop) {
+    typedef struct agent_pending {
+        bool active;
+        hydra_msg request;
+        mr_wire_header header;
+    } agent_pending;
+    agent_pending *pending =
+        mr_xcalloc((size_t)args->workers, sizeof(*pending));
+    size_t active_count = 0;
+    bool stop_requested = false;
+    while (!stop_requested || active_count != 0) {
+        bool progress = false;
         uint64_t offset = 0;
         const hydra_msg *msg = NULL;
         const uint8_t *payload = NULL;
-        err = mr_hydra_recv_request_poll(ctx, &offset, &msg, &payload);
-        if (err != 0) {
-            continue;
-        }
-        mr_wire_header hdr = {0};
-        const char *body = NULL;
-        size_t body_len = 0;
-        byte_buf response = {0};
-        mr_porter_result porter_result = {0};
-        uint32_t status = 0;
-        err = mr_wire_parse(payload, msg->len, &hdr, &body, &body_len);
+        err = hydra_recv_request(ctx, &offset, &msg, &payload);
         if (err == 0) {
-            err = agent_handle_request(porter, (size_t)args->workers,
-                                       args->role, args->agent_count,
-                                       args->payload_max, &hdr, body, body_len,
-                                       &response, &porter_result);
+            progress = true;
+            hydra_msg request = *msg;
+            mr_wire_header hdr = {0};
+            const char *body = NULL;
+            size_t body_len = 0;
+            byte_buf response = {0};
+            uint32_t status = 0;
+            int request_err =
+                mr_wire_parse(payload, msg->len, &hdr, &body, &body_len);
+            bool deferred = false;
+
+            if (request_err == 0 &&
+                (hdr.kind == MR_TASK_MAP || hdr.kind == MR_TASK_REDUCE)) {
+                uint32_t worker = UINT32_MAX;
+                request_err = agent_submit_request(
+                    porter, (size_t)args->workers, args->role,
+                    args->agent_count, &hdr, body, body_len, &worker);
+                if (request_err == 0) {
+                    if (pending[worker].active) {
+                        request_err = EBUSY;
+                    } else {
+                        pending[worker].active = true;
+                        pending[worker].request = request;
+                        pending[worker].header = hdr;
+                        active_count++;
+                        deferred = true;
+                    }
+                }
+            } else if (request_err == 0 &&
+                       hdr.kind == MR_TASK_SHUFFLE_FETCH) {
+                request_err = handle_shuffle_fetch(
+                    &hdr, body, body_len, args->payload_max, &response);
+            } else if (request_err == 0 && hdr.kind == MR_TASK_SHUTDOWN) {
+                stop_requested = true;
+            } else if (request_err == 0) {
+                request_err = EINVAL;
+            }
+
+            (void)hydra_release_message(ctx, offset);
+            if (!deferred) {
+                if (request_err != 0) {
+                    status = 1;
+                    byte_buf_clear(&response);
+                    const char *text = "agent task failed\n";
+                    byte_buf_append(&response, text, strlen(text));
+                }
+                byte_buf wire = make_wire(
+                    request_err == 0 ? (mr_task_kind)hdr.kind : MR_TASK_ERROR,
+                    hdr.task_id, hdr.partition_id, hdr.partition_count,
+                    response.data, response.len);
+                (void)mr_hydra_send_response_poll(ctx, &request, status,
+                                                  &wire);
+                byte_buf_clear(&wire);
+                byte_buf_clear(&response);
+            }
+        } else if (err != EAGAIN) {
+            fprintf(stderr, "agent: receive request failed: %s\n",
+                    hydra_strerror(err));
+            break;
         }
-        if (!args->quiet &&
-            (hdr.kind == MR_TASK_MAP || hdr.kind == MR_TASK_REDUCE)) {
-            printf("porter_task_v1 task=%" PRIu64 " kind=%u node=%" PRIu64
-                   " worker=%u pid=%" PRId64 " launch=%s status=%u"
-                   " total_ns=%" PRIu64 " fork_ns=%" PRIu64
-                   " restore_ioctl_ns=%" PRIu64 " task_ns=%" PRIu64
-                   " refill_ns=%" PRIu64 " restore_id=%" PRIu64
-                   " path_mask=%" PRIu64 " kernel_total_ns=%" PRIu64
-                   " shared_leaf_pages=%" PRIu64 " fallback_pages=%" PRIu64
-                   " local_copy_pages=%" PRIu64 "\n",
-                   hdr.task_id, hdr.kind, args->node_id,
-                   porter_result.worker_id, porter_result.worker_pid,
-                   mr_launch_mode_name(args->launch_mode),
-                   porter_result.status, porter_result.total_ns,
-                   porter_result.fork_ns, porter_result.restore_ioctl_ns,
-                   porter_result.task_ns, porter_result.refill_ns,
-                   porter_result.restore.restore_id,
-                   porter_result.restore.path_mask,
-                   porter_result.restore.kernel_total_ns,
-                   porter_result.restore.shared_leaf_pages,
-                   porter_result.restore.fallback_pages,
-                   porter_result.restore.local_copy_pages);
-            fflush(stdout);
-        }
-        if (err != 0) {
-            status = 1;
+
+        for (;;) {
+            uint32_t worker = UINT32_MAX;
+            byte_buf response = {0};
+            mr_porter_result porter_result = {0};
+            int collect_err =
+                mr_porter_collect(porter, &worker, &response, &porter_result);
+            if (collect_err == EAGAIN || collect_err == EWOULDBLOCK) {
+                byte_buf_clear(&response);
+                break;
+            }
+            progress = true;
+            if (worker >= args->workers || !pending[worker].active) {
+                byte_buf_clear(&response);
+                fprintf(stderr, "agent: unmatched porter completion\n");
+                stop_requested = true;
+                break;
+            }
+            agent_pending completed = pending[worker];
+            pending[worker].active = false;
+            active_count--;
+
+            if (!args->quiet) {
+                printf("porter_task_v1 task=%" PRIu64 " kind=%u node=%" PRIu64
+                       " worker=%u pid=%" PRId64 " launch=%s status=%u"
+                       " total_ns=%" PRIu64 " fork_ns=%" PRIu64
+                       " restore_ioctl_ns=%" PRIu64 " task_ns=%" PRIu64
+                       " refill_ns=%" PRIu64 " restore_id=%" PRIu64
+                       " path_mask=%" PRIu64 " kernel_total_ns=%" PRIu64
+                       " shared_leaf_pages=%" PRIu64
+                       " fallback_pages=%" PRIu64
+                       " local_copy_pages=%" PRIu64 "\n",
+                       completed.header.task_id, completed.header.kind,
+                       args->node_id, porter_result.worker_id,
+                       porter_result.worker_pid,
+                       mr_launch_mode_name(args->launch_mode),
+                       porter_result.status, porter_result.total_ns,
+                       porter_result.fork_ns,
+                       porter_result.restore_ioctl_ns,
+                       porter_result.task_ns, porter_result.refill_ns,
+                       porter_result.restore.restore_id,
+                       porter_result.restore.path_mask,
+                       porter_result.restore.kernel_total_ns,
+                       porter_result.restore.shared_leaf_pages,
+                       porter_result.restore.fallback_pages,
+                       porter_result.restore.local_copy_pages);
+                fflush(stdout);
+            }
+            uint32_t status = collect_err == 0 ? 0 : 1;
+            if (collect_err != 0) {
+                byte_buf_clear(&response);
+                const char *text = "agent task failed\n";
+                byte_buf_append(&response, text, strlen(text));
+            }
+            byte_buf wire = make_wire(
+                collect_err == 0 ? (mr_task_kind)completed.header.kind
+                                 : MR_TASK_ERROR,
+                completed.header.task_id, completed.header.partition_id,
+                completed.header.partition_count, response.data,
+                response.len);
+            (void)mr_hydra_send_response_poll(ctx, &completed.request, status,
+                                              &wire);
+            byte_buf_clear(&wire);
             byte_buf_clear(&response);
-            const char *text = "agent task failed\n";
-            byte_buf_append(&response, text, strlen(text));
         }
-        byte_buf wire = make_wire(err == 0 ? (mr_task_kind)hdr.kind : MR_TASK_ERROR,
-                                  hdr.task_id, hdr.partition_id, hdr.partition_count,
-                                  response.data, response.len);
-        (void)mr_hydra_send_response_poll(ctx, msg, status, &wire);
-        byte_buf_clear(&wire);
-        byte_buf_clear(&response);
-        (void)hydra_release_message(ctx, offset);
-        if (hdr.kind == MR_TASK_SHUTDOWN) {
-            stop = true;
+        if (!progress) {
+            hydra_cpu_relax();
         }
     }
 
+    free(pending);
     hydra_close(ctx);
     mr_porter_stop(porter);
     return 0;
@@ -1292,6 +1365,37 @@ static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
         return EPROTO;
     }
     return 0;
+}
+
+static int collect_map_locations(const byte_buf *response,
+                                 location_vec *locations)
+{
+    if (response->len < sizeof(control_locations_header)) {
+        return EPROTO;
+    }
+    control_locations_header header = {0};
+    memcpy(&header, response->data, sizeof(header));
+    size_t need = sizeof(header) +
+                  (size_t)header.count * sizeof(IntermediateLocation);
+    if (need > response->len) {
+        return EPROTO;
+    }
+    const IntermediateLocation *locs =
+        (const IntermediateLocation *)(response->data + sizeof(header));
+    for (size_t j = 0; j < (size_t)header.count; j++) {
+        location_vec_push(locations, &locs[j]);
+    }
+    return 0;
+}
+
+static int collect_reduce_output(mr_partitions *output, uint32_t reducer_id,
+                                 const byte_buf *response)
+{
+    if (reducer_id >= (uint32_t)output->count) {
+        return EPROTO;
+    }
+    return mr_partitions_parse(output, response->data ? response->data : "",
+                               response->len, false, (int)reducer_id);
 }
 
 static int run_master(const master_args *args)
@@ -1379,13 +1483,55 @@ static int run_master(const master_args *args)
         fflush(stdout);
     }
 
-    for (size_t i = 0; i < slice_count; i++) {
+    if (use_role_static) {
+        for (size_t base = 0; base < slice_count;
+             base += (size_t)args->workers_per_agent) {
+            size_t batch = slice_count - base;
+            if (batch > args->workers_per_agent) {
+                batch = (size_t)args->workers_per_agent;
+            }
+            for (size_t j = 0; j < batch; j++) {
+                size_t i = base + j;
+                control_map_task task = {
+                    .job_id = MR_JOB_ID,
+                    .map_task_id = i,
+                    .reducer_count = (uint32_t)reducer_count,
+                    .target_worker_id = (uint32_t)j,
+                    .data_len = slices[i].len,
+                };
+                byte_buf body = {0};
+                byte_buf_append(&body, &task, sizeof(task));
+                byte_buf_append(&body, slices[i].data, slices[i].len);
+                int err = send_hydra_request(
+                    agents[0].ctx, MR_TASK_MAP, i, 0,
+                    (uint64_t)reducer_count, body.data, body.len);
+                byte_buf_clear(&body);
+                if (err != 0) {
+                    goto cleanup;
+                }
+            }
+            for (size_t j = 0; j < batch; j++) {
+                mr_wire_header hdr = {0};
+                byte_buf response = {0};
+                int err = recv_hydra_response(agents[0].ctx, &hdr, &response);
+                if (err == 0 &&
+                    (hdr.kind != MR_TASK_MAP || hdr.task_id < base ||
+                     hdr.task_id >= base + batch)) {
+                    err = EPROTO;
+                }
+                if (err == 0) {
+                    err = collect_map_locations(&response, &locations);
+                }
+                byte_buf_clear(&response);
+                if (err != 0) {
+                    goto cleanup;
+                }
+            }
+        }
+    } else for (size_t i = 0; i < slice_count; i++) {
         size_t agent_index = i % args->agents.len;
         uint32_t target_worker_id = MR_TARGET_WORKER_AUTO;
-        if (use_role_static) {
-            agent_index = 0;
-            target_worker_id = (uint32_t)(i % args->workers_per_agent);
-        } else if (use_file_schedule) {
+        if (use_file_schedule) {
             schedule_entry entry = {0};
             if (!schedule_lookup(&schedule, MR_TASK_MAP, i, &entry)) {
                 fprintf(stderr, "master: schedule missing map task %zu\n", i);
@@ -1413,36 +1559,80 @@ static int run_master(const master_args *args)
             byte_buf_clear(&response);
             goto cleanup;
         }
-        if (response.len < sizeof(control_locations_header)) {
+        err = collect_map_locations(&response, &locations);
+        if (err != 0) {
             byte_buf_clear(&response);
             goto cleanup;
-        }
-        control_locations_header header = {0};
-        memcpy(&header, response.data, sizeof(header));
-        size_t need = sizeof(header) +
-                      (size_t)header.count * sizeof(IntermediateLocation);
-        if (need > response.len) {
-            byte_buf_clear(&response);
-            goto cleanup;
-        }
-        const IntermediateLocation *locs =
-            (const IntermediateLocation *)(response.data + sizeof(header));
-        for (size_t j = 0; j < (size_t)header.count; j++) {
-            location_vec_push(&locations, &locs[j]);
         }
         byte_buf_clear(&response);
     }
 
     mr_partitions_init(&final_output, reducer_count);
     final_init = true;
-    for (int r = 0; r < reducer_count; r++) {
+    if (use_role_static) {
+        for (int base = 0; base < reducer_count;
+             base += (int)args->workers_per_agent) {
+            int batch = reducer_count - base;
+            if ((uint64_t)batch > args->workers_per_agent) {
+                batch = (int)args->workers_per_agent;
+            }
+            for (int j = 0; j < batch; j++) {
+                int r = base + j;
+                location_vec reducer_locations = {0};
+                for (size_t i = 0; i < locations.len; i++) {
+                    if (locations.items[i].reducer_id == (uint32_t)r) {
+                        location_vec_push(&reducer_locations,
+                                          &locations.items[i]);
+                    }
+                }
+                control_reduce_task task = {
+                    .job_id = MR_JOB_ID,
+                    .reducer_id = (uint32_t)r,
+                    .reducer_count = (uint32_t)reducer_count,
+                    .target_worker_id = (uint32_t)j,
+                    .location_count = reducer_locations.len,
+                };
+                byte_buf body = {0};
+                byte_buf_append(&body, &task, sizeof(task));
+                if (reducer_locations.len > 0) {
+                    byte_buf_append(
+                        &body, reducer_locations.items,
+                        reducer_locations.len * sizeof(reducer_locations.items[0]));
+                }
+                int err = send_hydra_request(
+                    agents[1].ctx, MR_TASK_REDUCE,
+                    slice_count + (uint64_t)r, (uint64_t)r,
+                    (uint64_t)reducer_count, body.data, body.len);
+                byte_buf_clear(&body);
+                location_vec_destroy(&reducer_locations);
+                if (err != 0) {
+                    goto cleanup;
+                }
+            }
+            for (int j = 0; j < batch; j++) {
+                mr_wire_header hdr = {0};
+                byte_buf response = {0};
+                int err = recv_hydra_response(agents[1].ctx, &hdr, &response);
+                if (err == 0 &&
+                    (hdr.kind != MR_TASK_REDUCE ||
+                     hdr.partition_id < (uint64_t)base ||
+                     hdr.partition_id >= (uint64_t)(base + batch))) {
+                    err = EPROTO;
+                }
+                if (err == 0) {
+                    err = collect_reduce_output(
+                        &final_output, (uint32_t)hdr.partition_id, &response);
+                }
+                byte_buf_clear(&response);
+                if (err != 0) {
+                    goto cleanup;
+                }
+            }
+        }
+    } else for (int r = 0; r < reducer_count; r++) {
         size_t agent_index = (size_t)r % args->agents.len;
         uint32_t target_worker_id = MR_TARGET_WORKER_AUTO;
-        if (use_role_static) {
-            agent_index = 1;
-            target_worker_id =
-                (uint32_t)((uint64_t)r % args->workers_per_agent);
-        } else if (use_file_schedule) {
+        if (use_file_schedule) {
             schedule_entry entry = {0};
             if (!schedule_lookup(&schedule, MR_TASK_REDUCE, (uint64_t)r,
                                  &entry)) {
@@ -1482,8 +1672,7 @@ static int run_master(const master_args *args)
             byte_buf_clear(&response);
             goto cleanup;
         }
-        err = mr_partitions_parse(&final_output, response.data ? response.data : "",
-                                  response.len, false, r);
+        err = collect_reduce_output(&final_output, (uint32_t)r, &response);
         byte_buf_clear(&response);
         if (err != 0) {
             goto cleanup;
@@ -1717,6 +1906,13 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
         (args->template_key == 0 || args->template_generation == 0 ||
          args->template_page_checksum == 0)) {
         fprintf(stderr, "cxlfork launch requires template key, generation and checksum\n");
+        return 2;
+    }
+    if (args->role != MR_ROLE_MAP && args->workers > 1 &&
+        args->shuffle_queue_policy == MR_QUEUE_SHARED_PAIR &&
+        args->shuffle_connections < args->workers) {
+        fprintf(stderr,
+                "concurrent reducers require shuffle-connections >= workers\n");
         return 2;
     }
     if (args->global_worker_base == 0) {

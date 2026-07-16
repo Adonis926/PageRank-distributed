@@ -53,6 +53,13 @@ typedef struct ShuffleChunkHeader {
 worker id 范围。agent 侧用 `--role=map|reduce` 做第二层校验，错误角色的任务
 会明确失败。
 
+`role-static` 还提供固定宽度的并发窗口。master 每批最多向一个 agent 的
+`workers-per-agent` 个 worker 各派发一个任务，再按 response 中的 task/partition
+id 回收乱序完成结果；agent 的 porter 采用异步 submit/collect，单个 supervisor
+同时观察全部 worker slot，因此不会把多个 ghost 重新串行化。并发 Reducer
+必须配置 `--shuffle-connections >= --workers`，每个 reducer worker 固定绑定一个
+response connection；配置不足会在 agent 启动时明确失败。
+
 ## 构建
 
 ```bash
@@ -202,6 +209,8 @@ scripts/mr-bench.sh \
 - `--workers-per-agent=N`：master 在 `role-static` 模式中使用的固定 worker 数，必须和两个 agent 的 `--workers` 一致。
 - `--connections=N`：master 打开 agent endpoint 时使用的 HydraRPC 多连接数量，应与 agent 的 `--shuffle-connections` 一致。
 - `--shuffle-connections=N`：agent endpoint 的 HydraRPC 多连接数量。
+- 固定并发 Reducer 使用 `shared_pair` 时，`--shuffle-connections` 至少等于该 agent
+  的 `--workers`；master 的 `--connections` 使用同一数值。
 - `--queue-policy=shared_pair|per_connection`：endpoint queue policy，默认 `shared_pair`。
 - `--reducers=N`：reducer partition 数量，默认等于 agent 数量。
 - `--payload-max=N`：单条 HydraRPC payload 上限，默认 `1048576`。
