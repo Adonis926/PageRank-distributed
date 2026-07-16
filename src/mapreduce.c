@@ -123,6 +123,7 @@ typedef struct master_args {
     uint64_t map_chunk;
     uint64_t reducers;
     uint64_t connections;
+    uint64_t workers_per_agent;
     mr_queue_policy queue_policy;
     bool quiet;
 } master_args;
@@ -1312,6 +1313,7 @@ static int run_master(const master_args *args)
     location_vec locations = {0};
     schedule_table schedule = {0};
     bool use_file_schedule = false;
+    bool use_role_static = false;
     mr_partitions final_output = {0};
     bool final_init = false;
     int rc = 1;
@@ -1339,12 +1341,20 @@ static int run_master(const master_args *args)
     size_t slice_count = 0;
     slices = make_slices(input, input_len, chunk_size, &slice_count);
 
-    if (args->schedule != NULL && strcmp(args->schedule, "static") != 0) {
+    if (args->schedule != NULL && strcmp(args->schedule, "role-static") == 0) {
+        if (args->agents.len != 2 || args->workers_per_agent == 0) {
+            fprintf(stderr,
+                    "master: role-static requires exactly two agents and workers-per-agent\n");
+            goto cleanup;
+        }
+        use_role_static = true;
+    } else if (args->schedule != NULL && strcmp(args->schedule, "static") != 0) {
         const char *prefix = "file:";
         size_t prefix_len = strlen(prefix);
         if (strncmp(args->schedule, prefix, prefix_len) != 0 ||
             args->schedule[prefix_len] == '\0') {
-            fprintf(stderr, "master: --schedule must be static or file:PATH\n");
+            fprintf(stderr,
+                    "master: --schedule must be static, role-static or file:PATH\n");
             goto cleanup;
         }
         const char *schedule_path = args->schedule + prefix_len;
@@ -1365,14 +1375,17 @@ static int run_master(const master_args *args)
     if (!args->quiet) {
         printf("master: agents=%zu reducers=%d map_tasks=%zu schedule=%s\n",
                args->agents.len, reducer_count, slice_count,
-               use_file_schedule ? args->schedule : "static");
+               use_file_schedule || use_role_static ? args->schedule : "static");
         fflush(stdout);
     }
 
     for (size_t i = 0; i < slice_count; i++) {
         size_t agent_index = i % args->agents.len;
         uint32_t target_worker_id = MR_TARGET_WORKER_AUTO;
-        if (use_file_schedule) {
+        if (use_role_static) {
+            agent_index = 0;
+            target_worker_id = (uint32_t)(i % args->workers_per_agent);
+        } else if (use_file_schedule) {
             schedule_entry entry = {0};
             if (!schedule_lookup(&schedule, MR_TASK_MAP, i, &entry)) {
                 fprintf(stderr, "master: schedule missing map task %zu\n", i);
@@ -1425,7 +1438,11 @@ static int run_master(const master_args *args)
     for (int r = 0; r < reducer_count; r++) {
         size_t agent_index = (size_t)r % args->agents.len;
         uint32_t target_worker_id = MR_TARGET_WORKER_AUTO;
-        if (use_file_schedule) {
+        if (use_role_static) {
+            agent_index = 1;
+            target_worker_id =
+                (uint32_t)((uint64_t)r % args->workers_per_agent);
+        } else if (use_file_schedule) {
             schedule_entry entry = {0};
             if (!schedule_lookup(&schedule, MR_TASK_REDUCE, (uint64_t)r,
                                  &entry)) {
@@ -1511,7 +1528,9 @@ static void usage(const char *argv0)
             "\n"
             "common: [--backend=file|devdax|ivshmem] [--payload-max=N]\n"
             "        [--queue-capacity=N] [--size=N] [--quiet]\n"
-            "master: [--map-chunk=N] [--reducers=N] [--schedule=static|file:PATH]\n"
+            "master: [--map-chunk=N] [--reducers=N]\n"
+            "        [--schedule=static|role-static|file:PATH]\n"
+            "        [--workers-per-agent=N]\n"
             "        [--connections=N]\n"
             "        [--queue-policy=shared_pair|per_connection]\n"
             "agent: [--store-dir=DIR] [--agent-count=N] [--global-worker-base=N]\n"
@@ -1535,6 +1554,7 @@ static int parse_master_args(master_args *args, int argc, char **argv)
     args->queue_capacity = MR_DEFAULT_QUEUE_CAPACITY;
     args->payload_max = MR_DEFAULT_PAYLOAD_MAX;
     args->connections = MR_DEFAULT_SHUFFLE_CONNECTIONS;
+    args->workers_per_agent = MR_DEFAULT_WORKERS_PER_AGENT;
     args->queue_policy = MR_QUEUE_SHARED_PAIR;
 
     for (int i = 2; i < argc; i++) {
@@ -1563,6 +1583,9 @@ static int parse_master_args(master_args *args, int argc, char **argv)
             args->reducers = mr_parse_u64(value, "reducers");
         } else if ((value = arg_value(argv[i], "--connections=")) != NULL) {
             args->connections = mr_parse_u64(value, "connections");
+        } else if ((value = arg_value(argv[i], "--workers-per-agent=")) != NULL) {
+            args->workers_per_agent =
+                mr_parse_u64(value, "workers-per-agent");
         } else if ((value = arg_value(argv[i], "--queue-policy=")) != NULL) {
             args->queue_policy = mr_queue_policy_parse(value);
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -1572,7 +1595,8 @@ static int parse_master_args(master_args *args, int argc, char **argv)
             return 2;
         }
     }
-    if (args->connections == 0) {
+    if (args->connections == 0 || args->workers_per_agent == 0 ||
+        args->workers_per_agent > UINT32_MAX) {
         return 2;
     }
     return 0;

@@ -47,6 +47,12 @@ typedef struct ShuffleChunkHeader {
 - map task：`task_id % agent_count` 选择 agent，`task_id / agent_count % workers_per_agent` 选择本地 worker。
 - reduce task：`reducer_id % agent_count` 选择 agent，`reducer_id / agent_count % workers_per_agent` 选择本地 worker。
 
+为固定的两 VM Mapper/Reducer 实验提供 `--schedule=role-static`：该模式要求
+恰好两个 agent，并将全部 map task 固定发往 agent 0、全部 reduce task 固定
+发往 agent 1；`--workers-per-agent=N` 决定 master 在每个 agent 内使用的固定
+worker id 范围。agent 侧用 `--role=map|reduce` 做第二层校验，错误角色的任务
+会明确失败。
+
 ## 构建
 
 ```bash
@@ -192,7 +198,8 @@ scripts/mr-bench.sh \
 - `--path=PATH`：agent 使用的 node-level endpoint 后端路径。
 - `--workers=N`：agent fork 的本地 worker 子进程数量。
 - `--agent-count=N`：全局 agent 数量，用于静态本地 worker 调度。
-- `--schedule=static|file:PATH`：master 调度策略，默认 `static`；`file:PATH` 从调度文件读取 map/reduce task 到 `node_id,worker_id` 的绑定。
+- `--schedule=static|role-static|file:PATH`：master 调度策略，默认 `static`；`role-static` 固定 agent 0 为 Mapper、agent 1 为 Reducer；`file:PATH` 从调度文件读取 map/reduce task 到 `node_id,worker_id` 的绑定。
+- `--workers-per-agent=N`：master 在 `role-static` 模式中使用的固定 worker 数，必须和两个 agent 的 `--workers` 一致。
 - `--connections=N`：master 打开 agent endpoint 时使用的 HydraRPC 多连接数量，应与 agent 的 `--shuffle-connections` 一致。
 - `--shuffle-connections=N`：agent endpoint 的 HydraRPC 多连接数量。
 - `--queue-policy=shared_pair|per_connection`：endpoint queue policy，默认 `shared_pair`。
