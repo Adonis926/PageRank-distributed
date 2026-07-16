@@ -2,6 +2,7 @@
 
 #include "mapreduce.h"
 
+#include "mr_cxlfork.h"
 #include "mr_hydra_transport.h"
 #include "mr_kv.h"
 #include "mr_util.h"
@@ -1622,6 +1623,10 @@ static void usage(const char *argv0)
             "usage:\n"
             "  %s master --input=FILE --output=FILE --agent=PATH [--agent=PATH...]\n"
             "  %s agent --path=PATH --node-id=N [--workers=N]\n"
+            "  %s cxlfork-caps\n"
+            "  %s template --role=map|reduce --key=N [--base=N] [--bytes=N] [--seed=N]\n"
+            "  %s cxlfork-inspect KEY\n"
+            "  %s cxlfork-release KEY GENERATION\n"
             "\n"
             "common: [--backend=file|devdax|ivshmem] [--payload-max=N]\n"
             "        [--queue-capacity=N] [--size=N] [--quiet]\n"
@@ -1632,7 +1637,7 @@ static void usage(const char *argv0)
             "       [--shuffle-backend=file|devdax|ivshmem]\n"
             "       [--shuffle-connections=N]\n"
             "       [--queue-policy=shared_pair|per_connection] [--create]\n",
-            argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int parse_master_args(master_args *args, int argc, char **argv)
@@ -1779,6 +1784,22 @@ int MR_Run(int argc, char *argv[], Mapper map, Reducer reduce,
         }
         return run_agent(&args, map, reduce,
                          partition ? partition : MR_DefaultHashPartition);
+    }
+
+    if (strcmp(argv[1], "cxlfork-caps") == 0) {
+        return mr_cxlfork_caps_main(argc, argv);
+    }
+
+    if (strcmp(argv[1], "template") == 0) {
+        return mr_cxlfork_template_main(argc, argv);
+    }
+
+    if (strcmp(argv[1], "cxlfork-inspect") == 0) {
+        return mr_cxlfork_inspect_main(argc, argv);
+    }
+
+    if (strcmp(argv[1], "cxlfork-release") == 0) {
+        return mr_cxlfork_release_main(argc, argv);
     }
 
     usage(argv[0]);
