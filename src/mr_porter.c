@@ -35,6 +35,9 @@ typedef struct mr_porter_slot {
     uint64_t partition_count;
     uint64_t payload_len;
     uint64_t response_len;
+    uint64_t restore_ioctl_ns;
+    uint64_t template_validate_ns;
+    mr_cxlfork_result restore;
 } mr_porter_slot;
 
 typedef struct mr_porter_command {
@@ -177,15 +180,43 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
                            mr_porter_slot *slot)
 {
     byte_buf response = {0};
-    int err;
+    mr_cxlfork_session *session = NULL;
+    int err = 0;
 
-    if (slot->payload_len > config->slot_bytes) {
+    memset(&slot->restore, 0, sizeof(slot->restore));
+    slot->restore_ioctl_ns = 0;
+    slot->template_validate_ns = 0;
+    if (config->mode == MR_LAUNCH_CXLFORK) {
+        uint64_t begin = nsec_now();
+        err = mr_cxlfork_restore_begin(&config->restore, &session,
+                                       &slot->restore);
+        slot->restore_ioctl_ns = nsec_now() - begin;
+        if (err == 0) {
+            begin = nsec_now();
+            err = mr_template_validate(
+                (void *)(uintptr_t)config->restore.template.base,
+                &config->restore.template, NULL);
+            slot->template_validate_ns = nsec_now() - begin;
+            if (config->restore_hold_ms != 0) {
+                usleep((useconds_t)config->restore_hold_ms * 1000U);
+            }
+        }
+    }
+
+    if (err == 0 && slot->payload_len > config->slot_bytes) {
         err = EMSGSIZE;
-    } else {
+    } else if (err == 0) {
         err = config->task_fn(config->task_context, worker_id, slot->kind,
                               slot->task_id, slot->partition_id,
                               slot->partition_count, slot_payload(slot),
                               (size_t)slot->payload_len, &response);
+    }
+    if (session != NULL) {
+        int collect_err = mr_cxlfork_restore_collect(session, &slot->restore);
+        if (err == 0 && collect_err != 0) {
+            err = collect_err;
+        }
+        mr_cxlfork_restore_end(session);
     }
     if (err == 0 && response.len > config->slot_bytes) {
         err = EMSGSIZE;
@@ -204,7 +235,8 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
                         mr_porter_slot *slot, bool persistent, int control_fd)
 {
     close(control_fd);
-    if (mr_template_validate((void *)(uintptr_t)config->template.base,
+    if (config->mode != MR_LAUNCH_CXLFORK &&
+        mr_template_validate((void *)(uintptr_t)config->template.base,
                              &config->template, NULL) != 0) {
         _exit(120);
     }
@@ -275,9 +307,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
 
     if (pids == NULL) {
         err = ENOMEM;
-    } else if (config.mode == MR_LAUNCH_CXLFORK) {
-        err = EOPNOTSUPP;
-    } else {
+    } else if (config.mode != MR_LAUNCH_CXLFORK) {
         err = mr_template_map_local(&config.template, &template_mapping);
         if (err == 0) {
             err = mr_template_validate(template_mapping, &config.template,
@@ -285,7 +315,8 @@ static void supervisor_main(mr_porter_config config, void *shared,
         }
     }
     if (err == 0 && (config.mode == MR_LAUNCH_PERSISTENT ||
-                     config.mode == MR_LAUNCH_LOCAL_PREFORK)) {
+                     config.mode == MR_LAUNCH_LOCAL_PREFORK ||
+                     config.mode == MR_LAUNCH_CXLFORK)) {
         for (uint32_t i = 0; i < config.workers; i++) {
             pids[i] = spawn_worker(&config, i,
                                    slot_at(shared, config.slot_bytes, i),
@@ -354,13 +385,17 @@ static void supervisor_main(mr_porter_config config, void *shared,
             slot_wait_for(&slot->state, MR_PORTER_SLOT_DONE);
             reply.result.task_ns = nsec_now() - phase;
             reply.result.status = slot->status;
+            reply.result.restore_ioctl_ns = slot->restore_ioctl_ns;
+            reply.result.template_validate_ns = slot->template_validate_ns;
+            reply.result.restore = slot->restore;
         }
         if (config.mode != MR_LAUNCH_PERSISTENT && executed_pid > 0) {
             phase = nsec_now();
             (void)waitpid(executed_pid, NULL, 0);
             reply.result.reap_ns = nsec_now() - phase;
         }
-        if (config.mode == MR_LAUNCH_LOCAL_PREFORK) {
+        if (config.mode == MR_LAUNCH_LOCAL_PREFORK ||
+            config.mode == MR_LAUNCH_CXLFORK) {
             phase = nsec_now();
             pids[command.worker_id] = spawn_worker(
                 &config, command.worker_id, slot, false, control_fd);
@@ -387,7 +422,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
 int mr_porter_start(const mr_porter_config *config, mr_porter **out)
 {
     int sockets[2];
-    mr_porter_reply reply;
+    mr_porter_reply reply = {0};
     mr_porter *porter;
 
     if (config == NULL || out == NULL || config->workers == 0 ||
@@ -471,6 +506,9 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
     slot->partition_count = partition_count;
     slot->payload_len = payload_len;
     slot->response_len = 0;
+    slot->restore_ioctl_ns = 0;
+    slot->template_validate_ns = 0;
+    memset(&slot->restore, 0, sizeof(slot->restore));
     if (payload_len > 0) {
         memcpy(slot_payload(slot), payload, payload_len);
     }

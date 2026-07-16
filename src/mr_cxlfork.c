@@ -28,6 +28,15 @@ _Static_assert(sizeof(struct cxlfork_call_stats_v2) == 272,
                "unexpected cxlfork_call_stats_v2 ABI size");
 _Static_assert(sizeof(struct cxlfork_query_caps_v2) == 128,
                "unexpected cxlfork_query_caps_v2 ABI size");
+
+struct mr_cxlfork_session {
+    int fd;
+    uint64_t key;
+    uint64_t generation;
+    uint64_t restore_id;
+    uint32_t region_count;
+    struct cxlfork_region regions[CXLFORK_MAX_REGIONS];
+};
 #endif
 
 #define MR_TEMPLATE_ALIGNMENT (2ULL * 1024ULL * 1024ULL)
@@ -61,6 +70,38 @@ int mr_role_parse(const char *text, mr_worker_role *role)
         return 0;
     }
     return EINVAL;
+}
+
+const char *mr_cxlfork_policy_name(mr_cxlfork_policy policy)
+{
+    switch (policy) {
+    case MR_CXLFORK_POLICY_READONLY:
+        return "readonly";
+    case MR_CXLFORK_POLICY_MOW:
+        return "mow";
+    case MR_CXLFORK_POLICY_MOA:
+        return "moa";
+    case MR_CXLFORK_POLICY_HYBRID:
+        return "hybrid";
+    default:
+        return "unknown";
+    }
+}
+
+int mr_cxlfork_policy_parse(const char *text, mr_cxlfork_policy *policy)
+{
+    if (strcmp(text, "readonly") == 0) {
+        *policy = MR_CXLFORK_POLICY_READONLY;
+    } else if (strcmp(text, "mow") == 0) {
+        *policy = MR_CXLFORK_POLICY_MOW;
+    } else if (strcmp(text, "moa") == 0) {
+        *policy = MR_CXLFORK_POLICY_MOA;
+    } else if (strcmp(text, "hybrid") == 0) {
+        *policy = MR_CXLFORK_POLICY_HYBRID;
+    } else {
+        return EINVAL;
+    }
+    return 0;
 }
 
 static uint64_t template_checksum_bytes(const unsigned char *data, size_t len)
@@ -268,7 +309,197 @@ static int publish_template(const mr_template_options *opts)
     close(fd);
     return 0;
 }
+
+static uint64_t restore_policy_flags(mr_cxlfork_policy policy)
+{
+    switch (policy) {
+    case MR_CXLFORK_POLICY_READONLY:
+        return CXLFORK_F_MAP_READONLY;
+    case MR_CXLFORK_POLICY_MOW:
+        return CXLFORK_F_MIGRATE_ON_WRITE;
+    case MR_CXLFORK_POLICY_MOA:
+        return CXLFORK_F_MIGRATE_ON_ACCESS;
+    case MR_CXLFORK_POLICY_HYBRID:
+        return CXLFORK_F_HYBRID_TIERING;
+    default:
+        return UINT64_MAX;
+    }
+}
+
+static void copy_restore_stats(mr_cxlfork_result *result,
+                               const struct cxlfork_restore_stats_v2 *stats)
+{
+    result->supported_mask = stats->supported_mask;
+    result->valid_mask = stats->valid_mask;
+    result->path_mask = stats->path_mask;
+    result->kernel_total_ns = stats->total_ns;
+    result->lock_wait_ns = stats->lock_wait_ns;
+    result->lifecycle_ns = stats->lifecycle_ns;
+    result->validation_ns = stats->validation_ns;
+    result->vma_create_ns = stats->vma_create_ns;
+    result->upper_pt_alloc_ns = stats->upper_pt_alloc_ns;
+    result->shared_leaf_attach_ns = stats->shared_leaf_attach_ns;
+    result->fallback_reconstruct_ns = stats->fallback_reconstruct_ns;
+    result->dirty_prefault_ns = stats->dirty_prefault_ns;
+    result->global_restore_ns = stats->global_restore_ns;
+    result->rollback_ns = stats->rollback_ns;
+    result->kernel_other_ns = stats->other_ns;
+    result->faults = stats->faults;
+    result->fault_dispatch_ns = stats->fault_dispatch_ns;
+    result->leaf_materialize_ns = stats->leaf_materialize_ns;
+    result->data_cow_ns = stats->data_cow_ns;
+    result->cxl_to_local_copy_ns = stats->cxl_to_local_copy_ns;
+    result->shared_leaf_pages = stats->shared_leaf_pages;
+    result->fallback_pages = stats->fallback_pages;
+    result->local_copy_pages = stats->local_copy_pages;
+    result->leaf_copy_pages = stats->leaf_copy_pages;
+    result->dirty_prefault_pages = stats->dirty_prefault_pages;
+    result->validated_ptes = stats->validated_ptes;
+}
 #endif
+
+int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
+                             mr_cxlfork_session **session_out,
+                             mr_cxlfork_result *result)
+{
+#if MR_ENABLE_CXLFORK
+    struct cxlfork_query_caps_v2 caps;
+    struct cxlfork_resume_v2 resume;
+    mr_cxlfork_session *session;
+    uint64_t flags;
+    int err;
+
+    if (options == NULL || session_out == NULL || result == NULL ||
+        options->template.key == 0 || options->generation == 0 ||
+        options->template.role == MR_ROLE_BOTH) {
+        return EINVAL;
+    }
+    flags = restore_policy_flags(options->policy);
+    if (flags == UINT64_MAX) {
+        return EINVAL;
+    }
+    session = calloc(1, sizeof(*session));
+    if (session == NULL) {
+        return ENOMEM;
+    }
+    session->fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+    if (session->fd < 0) {
+        err = errno;
+        free(session);
+        return err;
+    }
+    err = query_caps_fd(session->fd, &caps);
+    if (err != 0 || !(caps.restore_policy_mask & flags)) {
+        if (err == 0) {
+            err = EOPNOTSUPP;
+        }
+        close(session->fd);
+        free(session);
+        return err;
+    }
+    if (options->policy == MR_CXLFORK_POLICY_MOW &&
+        !(caps.capabilities & CXLFORK_CAP_MOW_DATA_COW)) {
+        close(session->fd);
+        free(session);
+        return EOPNOTSUPP;
+    }
+    if (options->policy == MR_CXLFORK_POLICY_MOA &&
+        !(caps.capabilities & CXLFORK_CAP_MOA_DATA_COPY)) {
+        close(session->fd);
+        free(session);
+        return EOPNOTSUPP;
+    }
+    if (options->policy == MR_CXLFORK_POLICY_HYBRID &&
+        !(caps.capabilities & CXLFORK_CAP_A_BIT_HYBRID)) {
+        close(session->fd);
+        free(session);
+        return EOPNOTSUPP;
+    }
+
+    init_v2(&resume, sizeof(resume));
+    resume.key = options->template.key;
+    resume.generation = options->generation;
+    resume.flags = flags;
+    if (options->validate_full) {
+        resume.flags |= CXLFORK_F_VALIDATE_FULL;
+    }
+    resume.regions_ptr = (uintptr_t)session->regions;
+    resume.region_capacity = CXLFORK_MAX_REGIONS;
+    if (ioctl(session->fd, CXLFORK_RESUME_V2, &resume) != 0) {
+        err = errno;
+        close(session->fd);
+        free(session);
+        return err;
+    }
+    session->key = options->template.key;
+    session->generation = options->generation;
+    session->restore_id = resume.restore_id;
+    session->region_count = resume.region_count;
+    memset(result, 0, sizeof(*result));
+    result->restore_id = resume.restore_id;
+    result->total_pages = resume.total_pages;
+    result->page_checksum = resume.page_checksum;
+    copy_restore_stats(result, &resume.stats);
+    if (resume.generation != options->generation || resume.region_count == 0 ||
+        resume.page_checksum != options->page_checksum ||
+        resume.total_pages != options->template.bytes / 4096) {
+        mr_cxlfork_restore_end(session);
+        return EILSEQ;
+    }
+    *session_out = session;
+    return 0;
+#else
+    (void)options;
+    (void)session_out;
+    (void)result;
+    return EOPNOTSUPP;
+#endif
+}
+
+int mr_cxlfork_restore_collect(mr_cxlfork_session *session,
+                               mr_cxlfork_result *result)
+{
+#if MR_ENABLE_CXLFORK
+    struct cxlfork_call_stats_v2 call;
+    if (session == NULL || result == NULL) {
+        return EINVAL;
+    }
+    init_v2(&call, sizeof(call));
+    call.key = session->key;
+    call.generation = session->generation;
+    call.restore_id = session->restore_id;
+    if (ioctl(session->fd, CXLFORK_GET_CALL_STATS_V2, &call) != 0) {
+        return errno;
+    }
+    copy_restore_stats(result, &call.stats);
+    result->restore_id = session->restore_id;
+    return 0;
+#else
+    (void)session;
+    (void)result;
+    return EOPNOTSUPP;
+#endif
+}
+
+void mr_cxlfork_restore_end(mr_cxlfork_session *session)
+{
+#if MR_ENABLE_CXLFORK
+    if (session == NULL) {
+        return;
+    }
+    for (uint32_t i = session->region_count; i > 0; i--) {
+        const struct cxlfork_region *region = &session->regions[i - 1];
+        if (region->length != 0) {
+            (void)munmap((void *)(uintptr_t)region->start,
+                         (size_t)region->length);
+        }
+    }
+    close(session->fd);
+    free(session);
+#else
+    (void)session;
+#endif
+}
 
 int mr_cxlfork_caps_main(int argc, char **argv)
 {

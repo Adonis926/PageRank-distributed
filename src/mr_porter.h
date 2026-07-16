@@ -26,6 +26,8 @@ typedef struct mr_porter_config {
     uint32_t workers;
     uint64_t slot_bytes;
     mr_template_options template;
+    mr_cxlfork_restore_options restore;
+    uint32_t restore_hold_ms;
     mr_porter_task_fn task_fn;
     void *task_context;
 } mr_porter_config;
@@ -38,10 +40,13 @@ typedef struct mr_porter_result {
     uint64_t dispatch_ns;
     uint64_t fork_ns;
     uint64_t wakeup_ns;
+    uint64_t restore_ioctl_ns;
+    uint64_t template_validate_ns;
     uint64_t task_ns;
     uint64_t reap_ns;
     uint64_t refill_ns;
     uint64_t total_ns;
+    mr_cxlfork_result restore;
 } mr_porter_result;
 
 typedef struct mr_porter mr_porter;

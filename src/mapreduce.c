@@ -161,6 +161,11 @@ typedef struct agent_args {
     uint64_t template_bytes;
     uint64_t template_seed;
     uint64_t template_key;
+    uint64_t template_generation;
+    uint64_t template_page_checksum;
+    mr_cxlfork_policy cxlfork_policy;
+    uint64_t restore_hold_ms;
+    bool validate_full;
     bool create;
     bool quiet;
 } agent_args;
@@ -1020,7 +1025,8 @@ static int agent_handle_request(mr_porter *porter, size_t worker_count,
                                 mr_worker_role role, uint64_t agent_count,
                                 uint64_t payload_max,
                                 const mr_wire_header *hdr, const char *body,
-                                size_t body_len, byte_buf *response)
+                                size_t body_len, byte_buf *response,
+                                mr_porter_result *porter_result)
 {
     if (hdr->kind == MR_TASK_SHUFFLE_FETCH) {
         return handle_shuffle_fetch(hdr, body, body_len, payload_max, response);
@@ -1046,7 +1052,7 @@ static int agent_handle_request(mr_porter *porter, size_t worker_count,
         return mr_porter_call(porter, (uint32_t)worker_index, MR_TASK_MAP,
                               hdr->task_id, hdr->partition_id,
                               hdr->partition_count, body, body_len, response,
-                              NULL);
+                              porter_result);
     }
     if (hdr->kind == MR_TASK_REDUCE) {
         if (role == MR_ROLE_MAP) {
@@ -1070,7 +1076,7 @@ static int agent_handle_request(mr_porter *porter, size_t worker_count,
         return mr_porter_call(porter, (uint32_t)worker_index, MR_TASK_REDUCE,
                               hdr->task_id, hdr->partition_id,
                               hdr->partition_count, body, body_len, response,
-                              NULL);
+                              porter_result);
     }
     if (hdr->kind == MR_TASK_SHUTDOWN) {
         return 0;
@@ -1116,6 +1122,20 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             .bytes = args->template_bytes,
             .seed = args->template_seed,
         },
+        .restore = {
+            .template = {
+                .role = args->role,
+                .key = args->template_key,
+                .base = args->template_base,
+                .bytes = args->template_bytes,
+                .seed = args->template_seed,
+            },
+            .generation = args->template_generation,
+            .page_checksum = args->template_page_checksum,
+            .policy = args->cxlfork_policy,
+            .validate_full = args->validate_full,
+        },
+        .restore_hold_ms = (uint32_t)args->restore_hold_ms,
         .task_fn = porter_execute_task,
         .task_context = &worker_context,
     };
@@ -1177,13 +1197,38 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         const char *body = NULL;
         size_t body_len = 0;
         byte_buf response = {0};
+        mr_porter_result porter_result = {0};
         uint32_t status = 0;
         err = mr_wire_parse(payload, msg->len, &hdr, &body, &body_len);
         if (err == 0) {
             err = agent_handle_request(porter, (size_t)args->workers,
                                        args->role, args->agent_count,
                                        args->payload_max, &hdr, body, body_len,
-                                       &response);
+                                       &response, &porter_result);
+        }
+        if (!args->quiet &&
+            (hdr.kind == MR_TASK_MAP || hdr.kind == MR_TASK_REDUCE)) {
+            printf("porter_task_v1 task=%" PRIu64 " kind=%u node=%" PRIu64
+                   " worker=%u pid=%" PRId64 " launch=%s status=%u"
+                   " total_ns=%" PRIu64 " fork_ns=%" PRIu64
+                   " restore_ioctl_ns=%" PRIu64 " task_ns=%" PRIu64
+                   " refill_ns=%" PRIu64 " restore_id=%" PRIu64
+                   " path_mask=%" PRIu64 " kernel_total_ns=%" PRIu64
+                   " shared_leaf_pages=%" PRIu64 " fallback_pages=%" PRIu64
+                   " local_copy_pages=%" PRIu64 "\n",
+                   hdr.task_id, hdr.kind, args->node_id,
+                   porter_result.worker_id, porter_result.worker_pid,
+                   mr_launch_mode_name(args->launch_mode),
+                   porter_result.status, porter_result.total_ns,
+                   porter_result.fork_ns, porter_result.restore_ioctl_ns,
+                   porter_result.task_ns, porter_result.refill_ns,
+                   porter_result.restore.restore_id,
+                   porter_result.restore.path_mask,
+                   porter_result.restore.kernel_total_ns,
+                   porter_result.restore.shared_leaf_pages,
+                   porter_result.restore.fallback_pages,
+                   porter_result.restore.local_copy_pages);
+            fflush(stdout);
         }
         if (err != 0) {
             status = 1;
@@ -1473,6 +1518,10 @@ static void usage(const char *argv0)
             "       [--role=map|reduce|both]\n"
             "       [--launch=persistent|localfork|local-prefork|cxlfork]\n"
             "       [--template-base=N] [--template-bytes=N] [--template-seed=N]\n"
+            "       [--template-key=N] [--template-generation=N]\n"
+            "       [--template-page-checksum=N] [--cxlfork-policy=mow|moa|hybrid|readonly]\n"
+            "       [--validation=fast|full]\n"
+            "       [--restore-hold-ms=N] (test only, max 10000)\n"
             "       [--shuffle-backend=file|devdax|ivshmem]\n"
             "       [--shuffle-connections=N]\n"
             "       [--queue-policy=shared_pair|per_connection] [--create]\n",
@@ -1546,6 +1595,7 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
     args->template_base = MR_TEMPLATE_BASE_DEFAULT;
     args->template_bytes = MR_TEMPLATE_BYTES_DEFAULT;
     args->template_seed = MR_TEMPLATE_SEED_DEFAULT;
+    args->cxlfork_policy = MR_CXLFORK_POLICY_MOW;
     args->store_dir = "/tmp/mr-store";
 
     for (int i = 2; i < argc; i++) {
@@ -1584,6 +1634,31 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
             args->template_seed = mr_parse_u64(value, "template-seed");
         } else if ((value = arg_value(argv[i], "--template-key=")) != NULL) {
             args->template_key = mr_parse_u64(value, "template-key");
+        } else if ((value = arg_value(argv[i], "--template-generation=")) != NULL) {
+            args->template_generation = mr_parse_u64(value, "template-generation");
+        } else if ((value = arg_value(argv[i], "--template-page-checksum=")) != NULL) {
+            args->template_page_checksum =
+                mr_parse_u64(value, "template-page-checksum");
+        } else if ((value = arg_value(argv[i], "--cxlfork-policy=")) != NULL) {
+            if (mr_cxlfork_policy_parse(value, &args->cxlfork_policy) != 0) {
+                fprintf(stderr, "invalid CXLfork policy: %s\n", value);
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--validation=")) != NULL) {
+            if (strcmp(value, "fast") == 0) {
+                args->validate_full = false;
+            } else if (strcmp(value, "full") == 0) {
+                args->validate_full = true;
+            } else {
+                fprintf(stderr, "validation must be fast or full\n");
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--restore-hold-ms=")) != NULL) {
+            args->restore_hold_ms = mr_parse_u64(value, "restore-hold-ms");
+            if (args->restore_hold_ms > 10000) {
+                fprintf(stderr, "restore-hold-ms must be <= 10000\n");
+                return 2;
+            }
         } else if ((value = arg_value(argv[i], "--payload-max=")) != NULL) {
             args->payload_max = mr_parse_u64(value, "payload-max");
         } else if ((value = arg_value(argv[i], "--queue-capacity=")) != NULL) {
@@ -1612,6 +1687,12 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
     }
     if (args->launch_mode == MR_LAUNCH_CXLFORK && args->role == MR_ROLE_BOTH) {
         fprintf(stderr, "cxlfork launch requires a single map or reduce role\n");
+        return 2;
+    }
+    if (args->launch_mode == MR_LAUNCH_CXLFORK &&
+        (args->template_key == 0 || args->template_generation == 0 ||
+         args->template_page_checksum == 0)) {
+        fprintf(stderr, "cxlfork launch requires template key, generation and checksum\n");
         return 2;
     }
     if (args->global_worker_base == 0) {
