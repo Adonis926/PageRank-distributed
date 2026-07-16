@@ -63,6 +63,107 @@ int mr_role_parse(const char *text, mr_worker_role *role)
     return EINVAL;
 }
 
+static uint64_t template_checksum_bytes(const unsigned char *data, size_t len)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t template_next_pattern(uint64_t *state)
+{
+    uint64_t value = *state;
+
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    return value;
+}
+
+int mr_template_map_local(const mr_template_options *opts, void **mapping_out)
+{
+    unsigned char *mapping;
+    uint64_t state;
+
+    if (opts == NULL || mapping_out == NULL || opts->role < MR_ROLE_MAP ||
+        opts->role > MR_ROLE_BOTH || opts->bytes < sizeof(mr_template_header) ||
+        opts->base % MR_TEMPLATE_ALIGNMENT != 0 ||
+        opts->bytes % MR_TEMPLATE_ALIGNMENT != 0) {
+        return EINVAL;
+    }
+    mapping = mmap((void *)(uintptr_t)opts->base, (size_t)opts->bytes,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (mapping == MAP_FAILED) {
+        return errno;
+    }
+    if (madvise(mapping, (size_t)opts->bytes, MADV_NOHUGEPAGE) != 0) {
+        int err = errno;
+        munmap(mapping, (size_t)opts->bytes);
+        return err;
+    }
+
+    state = opts->seed ^ ((uint64_t)opts->role << 56);
+    for (size_t offset = sizeof(mr_template_header); offset < opts->bytes;) {
+        uint64_t value = template_next_pattern(&state);
+        size_t chunk = opts->bytes - offset;
+        if (chunk > sizeof(value)) {
+            chunk = sizeof(value);
+        }
+        memcpy(mapping + offset, &value, chunk);
+        offset += chunk;
+    }
+
+    mr_template_header *header = (mr_template_header *)mapping;
+    memset(header, 0, sizeof(*header));
+    header->magic = MR_TEMPLATE_MAGIC;
+    header->version = MR_TEMPLATE_VERSION;
+    header->role = (uint32_t)opts->role;
+    header->base = opts->base;
+    header->bytes = opts->bytes;
+    header->seed = opts->seed;
+    header->payload_checksum = template_checksum_bytes(
+        mapping + sizeof(*header), opts->bytes - sizeof(*header));
+    header->config_fingerprint = opts->key ^ opts->base ^ opts->bytes ^
+                                 opts->seed ^ (uint64_t)opts->role;
+    *mapping_out = mapping;
+    return 0;
+}
+
+int mr_template_validate(const void *mapping, const mr_template_options *opts,
+                         uint64_t *payload_checksum)
+{
+    if (mapping == NULL || opts == NULL) {
+        return EINVAL;
+    }
+    const mr_template_header *header = mapping;
+    if (header->magic != MR_TEMPLATE_MAGIC ||
+        header->version != MR_TEMPLATE_VERSION ||
+        header->role != (uint32_t)opts->role || header->base != opts->base ||
+        header->bytes != opts->bytes || header->seed != opts->seed ||
+        header->config_fingerprint !=
+            (opts->key ^ opts->base ^ opts->bytes ^ opts->seed ^
+             (uint64_t)opts->role)) {
+        return EILSEQ;
+    }
+    if (payload_checksum != NULL) {
+        *payload_checksum = header->payload_checksum;
+    }
+    return 0;
+}
+
+void mr_template_unmap(void *mapping, uint64_t bytes)
+{
+    if (mapping != NULL && mapping != MAP_FAILED && bytes != 0) {
+        (void)munmap(mapping, (size_t)bytes);
+    }
+}
+
 #if MR_ENABLE_CXLFORK
 static void init_v2(void *ptr, size_t size)
 {
@@ -90,58 +191,6 @@ static int query_caps_fd(int fd, struct cxlfork_query_caps_v2 *caps)
     if (caps->page_size != 4096 || caps->shared_leaf_alignment != MR_TEMPLATE_ALIGNMENT) {
         return EOPNOTSUPP;
     }
-    return 0;
-}
-
-static uint64_t checksum_bytes(const unsigned char *data, size_t len)
-{
-    uint64_t hash = UINT64_C(1469598103934665603);
-
-    for (size_t i = 0; i < len; i++) {
-        hash ^= data[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static uint64_t next_pattern(uint64_t *state)
-{
-    uint64_t value = *state;
-
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    *state = value;
-    return value;
-}
-
-static int fill_template(void *mapping, const mr_template_options *opts)
-{
-    unsigned char *bytes = mapping;
-    uint64_t state = opts->seed ^ ((uint64_t)opts->role << 56);
-
-    for (size_t offset = sizeof(mr_template_header); offset < opts->bytes;) {
-        uint64_t value = next_pattern(&state);
-        size_t chunk = opts->bytes - offset;
-        if (chunk > sizeof(value)) {
-            chunk = sizeof(value);
-        }
-        memcpy(bytes + offset, &value, chunk);
-        offset += chunk;
-    }
-
-    mr_template_header *header = mapping;
-    memset(header, 0, sizeof(*header));
-    header->magic = MR_TEMPLATE_MAGIC;
-    header->version = MR_TEMPLATE_VERSION;
-    header->role = (uint32_t)opts->role;
-    header->base = opts->base;
-    header->bytes = opts->bytes;
-    header->seed = opts->seed;
-    header->payload_checksum =
-        checksum_bytes(bytes + sizeof(*header), opts->bytes - sizeof(*header));
-    header->config_fingerprint = opts->key ^ opts->base ^ opts->bytes ^
-                                 opts->seed ^ (uint64_t)opts->role;
     return 0;
 }
 
@@ -178,20 +227,12 @@ static int publish_template(const mr_template_options *opts)
         return E2BIG;
     }
 
-    mapping = mmap(wanted, (size_t)opts->bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (mapping == MAP_FAILED) {
-        err = errno;
+    (void)wanted;
+    err = mr_template_map_local(opts, &mapping);
+    if (err != 0) {
         close(fd);
         return err;
     }
-    if (madvise(mapping, (size_t)opts->bytes, MADV_NOHUGEPAGE) != 0) {
-        err = errno;
-        munmap(mapping, (size_t)opts->bytes);
-        close(fd);
-        return err;
-    }
-    fill_template(mapping, opts);
 
     memset(regions, 0, sizeof(regions));
     init_v2(&prepare, sizeof(prepare));

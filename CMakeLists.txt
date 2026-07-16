@@ -23,6 +23,7 @@ add_executable(mr_hydra
   src/mr_cxlfork.c
   src/mr_hydra_transport.c
   src/mr_kv.c
+  src/mr_porter.c
   src/mr_util.c
   src/mr_wire.c
   src/wordcount.c

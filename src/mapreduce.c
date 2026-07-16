@@ -5,6 +5,7 @@
 #include "mr_cxlfork.h"
 #include "mr_hydra_transport.h"
 #include "mr_kv.h"
+#include "mr_porter.h"
 #include "mr_util.h"
 #include "mr_wire.h"
 
@@ -34,11 +35,6 @@
 #define MR_AGENT_OPEN_RETRY_COUNT 10000U
 #define MR_AGENT_OPEN_RETRY_US 1000U
 #define MR_TARGET_WORKER_AUTO UINT32_MAX
-
-#define MR_LOCAL_SLOT_EMPTY 0U
-#define MR_LOCAL_SLOT_READY 1U
-#define MR_LOCAL_SLOT_DONE 2U
-#define MR_LOCAL_SLOT_STOP 3U
 
 typedef enum emit_mode {
     EMIT_NONE,
@@ -159,25 +155,17 @@ typedef struct agent_args {
     uint64_t payload_max;
     uint64_t shuffle_connections;
     mr_queue_policy shuffle_queue_policy;
+    mr_worker_role role;
+    mr_launch_mode launch_mode;
+    uint64_t template_base;
+    uint64_t template_bytes;
+    uint64_t template_seed;
+    uint64_t template_key;
     bool create;
     bool quiet;
 } agent_args;
 
-typedef struct local_worker_slot {
-    volatile uint32_t state;
-    uint32_t status;
-    uint32_t kind;
-    uint32_t reserved;
-    uint64_t task_id;
-    uint64_t partition_id;
-    uint64_t partition_count;
-    uint64_t payload_len;
-    uint64_t response_len;
-} local_worker_slot;
-
 typedef struct worker_child_args {
-    local_worker_slot *slot;
-    uint64_t slot_bytes;
     Mapper map;
     Reducer reduce;
     Partitioner partitioner;
@@ -187,17 +175,13 @@ typedef struct worker_child_args {
     uint32_t node_id;
     uint32_t worker_id;
     uint32_t global_worker_id;
+    uint32_t global_worker_base;
     uint64_t map_size;
     uint64_t queue_capacity;
     uint64_t payload_max;
     uint64_t shuffle_connections;
     mr_queue_policy shuffle_queue_policy;
 } worker_child_args;
-
-typedef struct local_worker {
-    pid_t pid;
-    local_worker_slot *slot;
-} local_worker;
 
 static emit_context current_emit;
 static mr_partitions *current_reduce_input;
@@ -472,42 +456,6 @@ static int mkdir_p(const char *path)
         return errno;
     }
     return 0;
-}
-
-static size_t local_slot_stride(uint64_t slot_bytes)
-{
-    return sizeof(local_worker_slot) + (size_t)slot_bytes * 2U;
-}
-
-static local_worker_slot *local_slot_at(void *base, uint64_t slot_bytes,
-                                        size_t index)
-{
-    return (local_worker_slot *)((char *)base +
-                                 index * local_slot_stride(slot_bytes));
-}
-
-static char *local_slot_payload(local_worker_slot *slot)
-{
-    return (char *)slot + sizeof(*slot);
-}
-
-static char *local_slot_response(local_worker_slot *slot, uint64_t slot_bytes)
-{
-    return local_slot_payload(slot) + slot_bytes;
-}
-
-static void local_slot_publish(local_worker_slot *slot, uint32_t state)
-{
-    __sync_synchronize();
-    slot->state = state;
-    __sync_synchronize();
-}
-
-static void local_slot_wait_while(const volatile uint32_t *state, uint32_t value)
-{
-    while (*state == value) {
-        hydra_cpu_relax();
-    }
 }
 
 static char *read_file(const char *path, size_t *out_len)
@@ -1020,198 +968,57 @@ static int handle_shuffle_fetch(const mr_wire_header *hdr, const char *body,
     return 0;
 }
 
-static int local_send_task(local_worker_slot *slot, uint64_t slot_bytes,
-                           mr_task_kind kind, uint64_t task_id,
-                           uint64_t partition_id, uint64_t partition_count,
-                           const void *payload, size_t payload_len,
-                           byte_buf *response)
+static int porter_execute_task(void *context, uint32_t worker_id,
+                               uint32_t kind, uint64_t task_id,
+                               uint64_t partition_id,
+                               uint64_t partition_count, const void *payload,
+                               size_t payload_len, byte_buf *out)
 {
-    if (payload_len > slot_bytes) {
-        return EMSGSIZE;
-    }
-    local_slot_wait_while(&slot->state, MR_LOCAL_SLOT_READY);
-    if (slot->state != MR_LOCAL_SLOT_EMPTY) {
-        return EBUSY;
-    }
+    (void)task_id;
+    (void)partition_id;
+    (void)partition_count;
+    worker_child_args args = *(const worker_child_args *)context;
+    args.worker_id = worker_id;
+    args.global_worker_id = args.global_worker_base + worker_id;
+    (void)mkdir_p(args.store_dir);
 
-    slot->status = 0;
-    slot->kind = (uint32_t)kind;
-    slot->task_id = task_id;
-    slot->partition_id = partition_id;
-    slot->partition_count = partition_count;
-    slot->payload_len = payload_len;
-    slot->response_len = 0;
-    if (payload_len > 0) {
-        memcpy(local_slot_payload(slot), payload, payload_len);
-    }
-    local_slot_publish(slot, MR_LOCAL_SLOT_READY);
-
-    while (slot->state != MR_LOCAL_SLOT_DONE) {
-        hydra_cpu_relax();
-    }
-    __sync_synchronize();
-
-    int err = (int)slot->status;
-    if (err == 0 && slot->response_len > 0) {
-        if (slot->response_len > slot_bytes) {
-            err = EMSGSIZE;
-        } else {
-            byte_buf_append(response, local_slot_response(slot, slot_bytes),
-                            (size_t)slot->response_len);
+    if (kind == MR_TASK_MAP) {
+        if (payload_len < sizeof(control_map_task)) {
+            return EINVAL;
         }
+        control_map_task task = {0};
+        memcpy(&task, payload, sizeof(task));
+        const char *data = (const char *)payload + sizeof(task);
+        if (sizeof(task) + task.data_len > payload_len) {
+            return EINVAL;
+        }
+        return worker_do_map(&args, args.map, args.partitioner, data,
+                             (size_t)task.data_len, task.job_id,
+                             task.map_task_id, (int)task.reducer_count, out);
     }
-    local_slot_publish(slot, MR_LOCAL_SLOT_EMPTY);
-    return err;
+    if (kind == MR_TASK_REDUCE) {
+        if (payload_len < sizeof(control_reduce_task)) {
+            return EINVAL;
+        }
+        control_reduce_task task = {0};
+        memcpy(&task, payload, sizeof(task));
+        size_t loc_bytes =
+            (size_t)task.location_count * sizeof(IntermediateLocation);
+        if (sizeof(task) + loc_bytes > payload_len) {
+            return EINVAL;
+        }
+        const IntermediateLocation *locs =
+            (const IntermediateLocation *)((const char *)payload + sizeof(task));
+        return worker_do_reduce(&args, args.reduce, task.reducer_id,
+                                task.reducer_count, locs,
+                                (size_t)task.location_count, out);
+    }
+    return EINVAL;
 }
 
-static void worker_child_loop(worker_child_args *args)
-{
-    (void)mkdir_p(args->store_dir);
-
-    for (;;) {
-        while (args->slot->state == MR_LOCAL_SLOT_EMPTY) {
-            hydra_cpu_relax();
-        }
-        if (args->slot->state == MR_LOCAL_SLOT_STOP) {
-            break;
-        }
-        if (args->slot->state != MR_LOCAL_SLOT_READY) {
-            hydra_cpu_relax();
-            continue;
-        }
-        __sync_synchronize();
-
-        uint32_t kind = args->slot->kind;
-        uint64_t payload_len = args->slot->payload_len;
-        const char *payload = local_slot_payload(args->slot);
-
-        byte_buf out = {0};
-        int err = 0;
-        if (kind == MR_TASK_MAP) {
-            if (payload_len >= sizeof(control_map_task)) {
-                control_map_task task = {0};
-                memcpy(&task, payload, sizeof(task));
-                const char *data = payload + sizeof(task);
-                if (sizeof(task) + task.data_len <= payload_len) {
-                    err = worker_do_map(args, args->map, args->partitioner, data,
-                                        (size_t)task.data_len, task.job_id,
-                                        task.map_task_id, (int)task.reducer_count,
-                                        &out);
-                } else {
-                    err = EINVAL;
-                }
-            } else {
-                err = EINVAL;
-            }
-        } else if (kind == MR_TASK_REDUCE) {
-            if (payload_len >= sizeof(control_reduce_task)) {
-                control_reduce_task task = {0};
-                memcpy(&task, payload, sizeof(task));
-                size_t loc_bytes = (size_t)task.location_count *
-                                   sizeof(IntermediateLocation);
-                if (sizeof(task) + loc_bytes <= payload_len) {
-                    const IntermediateLocation *locs =
-                        (const IntermediateLocation *)(payload + sizeof(task));
-                    err = worker_do_reduce(args, args->reduce, task.reducer_id,
-                                           task.reducer_count, locs,
-                                           (size_t)task.location_count, &out);
-                } else {
-                    err = EINVAL;
-                }
-            } else {
-                err = EINVAL;
-            }
-        } else if (kind == MR_TASK_SHUTDOWN) {
-            args->slot->status = 0;
-            args->slot->response_len = 0;
-            local_slot_publish(args->slot, MR_LOCAL_SLOT_DONE);
-            byte_buf_clear(&out);
-            break;
-        } else {
-            err = EINVAL;
-        }
-
-        if (err == 0 && out.len > args->slot_bytes) {
-            err = EMSGSIZE;
-        }
-        args->slot->status = (uint32_t)err;
-        args->slot->response_len = err == 0 ? out.len : 0;
-        if (err == 0 && out.len > 0) {
-            memcpy(local_slot_response(args->slot, args->slot_bytes), out.data,
-                   out.len);
-        }
-        byte_buf_clear(&out);
-        local_slot_publish(args->slot, MR_LOCAL_SLOT_DONE);
-    }
-
-    free(args);
-    _exit(0);
-}
-
-static int spawn_workers(const agent_args *args, Mapper map, Reducer reduce,
-                         Partitioner partitioner, local_worker **out_workers,
-                         void **out_shared, size_t *out_shared_len)
-{
-    local_worker *workers = mr_xcalloc((size_t)args->workers, sizeof(workers[0]));
-    int err = mkdir_p(args->store_dir);
-    if (err != 0) {
-        free(workers);
-        return err;
-    }
-
-    uint64_t slot_bytes = args->payload_max;
-    size_t shared_len = local_slot_stride(slot_bytes) * (size_t)args->workers;
-    void *shared = mmap(NULL, shared_len, PROT_READ | PROT_WRITE,
-                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (shared == MAP_FAILED) {
-        free(workers);
-        return errno;
-    }
-
-    for (uint64_t i = 0; i < args->workers; i++) {
-        workers[i].slot = local_slot_at(shared, slot_bytes, (size_t)i);
-        pid_t pid = fork();
-        if (pid < 0) {
-            err = errno;
-            for (uint64_t j = 0; j < i; j++) {
-                local_slot_publish(workers[j].slot, MR_LOCAL_SLOT_STOP);
-                (void)waitpid(workers[j].pid, NULL, 0);
-            }
-            munmap(shared, shared_len);
-            free(workers);
-            return err;
-        }
-        if (pid == 0) {
-            worker_child_args *child = mr_xcalloc(1, sizeof(*child));
-            child->slot = workers[i].slot;
-            child->slot_bytes = slot_bytes;
-            child->map = map;
-            child->reduce = reduce;
-            child->partitioner = partitioner;
-            child->shuffle_backend = args->shuffle_backend;
-            snprintf(child->store_dir, sizeof(child->store_dir), "%s", args->store_dir);
-            snprintf(child->shuffle_path, sizeof(child->shuffle_path), "%s",
-                     args->path);
-            child->node_id = (uint32_t)args->node_id;
-            child->worker_id = (uint32_t)i;
-            child->global_worker_id = (uint32_t)(args->global_worker_base + i);
-            child->map_size = args->shuffle_map_size;
-            child->queue_capacity = args->queue_capacity;
-            child->payload_max = args->payload_max;
-            child->shuffle_connections = args->shuffle_connections;
-            child->shuffle_queue_policy = args->shuffle_queue_policy;
-            worker_child_loop(child);
-        }
-        workers[i].pid = pid;
-    }
-    *out_workers = workers;
-    *out_shared = shared;
-    *out_shared_len = shared_len;
-    return 0;
-}
-
-static int agent_handle_request(local_worker *workers, size_t worker_count,
-                                uint64_t agent_count, uint64_t payload_max,
+static int agent_handle_request(mr_porter *porter, size_t worker_count,
+                                mr_worker_role role, uint64_t agent_count,
+                                uint64_t payload_max,
                                 const mr_wire_header *hdr, const char *body,
                                 size_t body_len, byte_buf *response)
 {
@@ -1219,6 +1026,9 @@ static int agent_handle_request(local_worker *workers, size_t worker_count,
         return handle_shuffle_fetch(hdr, body, body_len, payload_max, response);
     }
     if (hdr->kind == MR_TASK_MAP) {
+        if (role == MR_ROLE_REDUCE) {
+            return EOPNOTSUPP;
+        }
         if (body_len < sizeof(control_map_task)) {
             return EINVAL;
         }
@@ -1233,12 +1043,15 @@ static int agent_handle_request(local_worker *workers, size_t worker_count,
         if (worker_index >= worker_count) {
             return EINVAL;
         }
-        return local_send_task(workers[worker_index].slot,
-                               (uint64_t)(payload_max), MR_TASK_MAP,
-                               hdr->task_id, hdr->partition_id,
-                               hdr->partition_count, body, body_len, response);
+        return mr_porter_call(porter, (uint32_t)worker_index, MR_TASK_MAP,
+                              hdr->task_id, hdr->partition_id,
+                              hdr->partition_count, body, body_len, response,
+                              NULL);
     }
     if (hdr->kind == MR_TASK_REDUCE) {
+        if (role == MR_ROLE_MAP) {
+            return EOPNOTSUPP;
+        }
         if (body_len < sizeof(control_reduce_task)) {
             return EINVAL;
         }
@@ -1254,15 +1067,12 @@ static int agent_handle_request(local_worker *workers, size_t worker_count,
         if (worker_index >= worker_count) {
             return EINVAL;
         }
-        return local_send_task(workers[worker_index].slot,
-                               (uint64_t)(payload_max), MR_TASK_REDUCE,
-                               hdr->task_id, hdr->partition_id,
-                               hdr->partition_count, body, body_len, response);
+        return mr_porter_call(porter, (uint32_t)worker_index, MR_TASK_REDUCE,
+                              hdr->task_id, hdr->partition_id,
+                              hdr->partition_count, body, body_len, response,
+                              NULL);
     }
     if (hdr->kind == MR_TASK_SHUTDOWN) {
-        for (size_t i = 0; i < worker_count; i++) {
-            local_slot_publish(workers[i].slot, MR_LOCAL_SLOT_STOP);
-        }
         return 0;
     }
     return EINVAL;
@@ -1271,13 +1081,48 @@ static int agent_handle_request(local_worker *workers, size_t worker_count,
 static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                      Partitioner partitioner)
 {
-    local_worker *workers = NULL;
-    void *shared = NULL;
-    size_t shared_len = 0;
-    int err = spawn_workers(args, map, reduce, partitioner, &workers,
-                            &shared, &shared_len);
+    int err = mkdir_p(args->store_dir);
     if (err != 0) {
-        fprintf(stderr, "agent: spawn workers failed: %s\n", strerror(err));
+        fprintf(stderr, "agent: create store failed: %s\n", strerror(err));
+        return 1;
+    }
+
+    worker_child_args worker_context = {
+        .map = map,
+        .reduce = reduce,
+        .partitioner = partitioner,
+        .shuffle_backend = args->shuffle_backend,
+        .node_id = (uint32_t)args->node_id,
+        .global_worker_base = (uint32_t)args->global_worker_base,
+        .map_size = args->shuffle_map_size,
+        .queue_capacity = args->queue_capacity,
+        .payload_max = args->payload_max,
+        .shuffle_connections = args->shuffle_connections,
+        .shuffle_queue_policy = args->shuffle_queue_policy,
+    };
+    snprintf(worker_context.store_dir, sizeof(worker_context.store_dir), "%s",
+             args->store_dir);
+    snprintf(worker_context.shuffle_path, sizeof(worker_context.shuffle_path),
+             "%s", args->path);
+
+    mr_porter_config porter_config = {
+        .mode = args->launch_mode,
+        .workers = (uint32_t)args->workers,
+        .slot_bytes = args->payload_max,
+        .template = {
+            .role = args->role,
+            .key = args->template_key,
+            .base = args->template_base,
+            .bytes = args->template_bytes,
+            .seed = args->template_seed,
+        },
+        .task_fn = porter_execute_task,
+        .task_context = &worker_context,
+    };
+    mr_porter *porter = NULL;
+    err = mr_porter_start(&porter_config, &porter);
+    if (err != 0) {
+        fprintf(stderr, "agent: start porter failed: %s\n", strerror(err));
         return 1;
     }
 
@@ -1306,20 +1151,16 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
     if (err != 0) {
         fprintf(stderr, "agent: open control backend failed: %s\n",
                 hydra_strerror(err));
-        for (uint64_t i = 0; i < args->workers; i++) {
-            local_slot_publish(workers[i].slot, MR_LOCAL_SLOT_STOP);
-            (void)waitpid(workers[i].pid, NULL, 0);
-        }
-        if (shared != NULL) {
-            munmap(shared, shared_len);
-        }
-        free(workers);
+        mr_porter_stop(porter);
         return 1;
     }
 
     if (!args->quiet) {
-        printf("agent[%" PRIu64 "]: workers=%" PRIu64 " endpoint=%s store=%s\n",
-               args->node_id, args->workers, args->path, args->store_dir);
+        printf("agent[%" PRIu64 "]: role=%s launch=%s workers=%" PRIu64
+               " endpoint=%s store=%s\n",
+               args->node_id, mr_role_name(args->role),
+               mr_launch_mode_name(args->launch_mode), args->workers,
+               args->path, args->store_dir);
         fflush(stdout);
     }
 
@@ -1339,9 +1180,10 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         uint32_t status = 0;
         err = mr_wire_parse(payload, msg->len, &hdr, &body, &body_len);
         if (err == 0) {
-            err = agent_handle_request(workers, (size_t)args->workers,
-                                       args->agent_count, args->payload_max, &hdr,
-                                       body, body_len, &response);
+            err = agent_handle_request(porter, (size_t)args->workers,
+                                       args->role, args->agent_count,
+                                       args->payload_max, &hdr, body, body_len,
+                                       &response);
         }
         if (err != 0) {
             status = 1;
@@ -1361,14 +1203,8 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         }
     }
 
-    for (uint64_t i = 0; i < args->workers; i++) {
-        (void)waitpid(workers[i].pid, NULL, 0);
-    }
-    if (shared != NULL) {
-        munmap(shared, shared_len);
-    }
-    free(workers);
     hydra_close(ctx);
+    mr_porter_stop(porter);
     return 0;
 }
 
@@ -1634,6 +1470,9 @@ static void usage(const char *argv0)
             "        [--connections=N]\n"
             "        [--queue-policy=shared_pair|per_connection]\n"
             "agent: [--store-dir=DIR] [--agent-count=N] [--global-worker-base=N]\n"
+            "       [--role=map|reduce|both]\n"
+            "       [--launch=persistent|localfork|local-prefork|cxlfork]\n"
+            "       [--template-base=N] [--template-bytes=N] [--template-seed=N]\n"
             "       [--shuffle-backend=file|devdax|ivshmem]\n"
             "       [--shuffle-connections=N]\n"
             "       [--queue-policy=shared_pair|per_connection] [--create]\n",
@@ -1702,6 +1541,11 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
     args->agent_count = 1;
     args->shuffle_connections = MR_DEFAULT_SHUFFLE_CONNECTIONS;
     args->shuffle_queue_policy = MR_QUEUE_SHARED_PAIR;
+    args->role = MR_ROLE_BOTH;
+    args->launch_mode = MR_LAUNCH_PERSISTENT;
+    args->template_base = MR_TEMPLATE_BASE_DEFAULT;
+    args->template_bytes = MR_TEMPLATE_BYTES_DEFAULT;
+    args->template_seed = MR_TEMPLATE_SEED_DEFAULT;
     args->store_dir = "/tmp/mr-store";
 
     for (int i = 2; i < argc; i++) {
@@ -1722,6 +1566,24 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
             args->global_worker_base = mr_parse_u64(value, "global-worker-base");
         } else if ((value = arg_value(argv[i], "--store-dir=")) != NULL) {
             args->store_dir = value;
+        } else if ((value = arg_value(argv[i], "--role=")) != NULL) {
+            if (mr_role_parse(value, &args->role) != 0) {
+                fprintf(stderr, "invalid role: %s\n", value);
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--launch=")) != NULL) {
+            if (mr_launch_mode_parse(value, &args->launch_mode) != 0) {
+                fprintf(stderr, "invalid launch mode: %s\n", value);
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--template-base=")) != NULL) {
+            args->template_base = mr_parse_u64(value, "template-base");
+        } else if ((value = arg_value(argv[i], "--template-bytes=")) != NULL) {
+            args->template_bytes = mr_parse_u64(value, "template-bytes");
+        } else if ((value = arg_value(argv[i], "--template-seed=")) != NULL) {
+            args->template_seed = mr_parse_u64(value, "template-seed");
+        } else if ((value = arg_value(argv[i], "--template-key=")) != NULL) {
+            args->template_key = mr_parse_u64(value, "template-key");
         } else if ((value = arg_value(argv[i], "--payload-max=")) != NULL) {
             args->payload_max = mr_parse_u64(value, "payload-max");
         } else if ((value = arg_value(argv[i], "--queue-capacity=")) != NULL) {
@@ -1745,7 +1607,11 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
         }
     }
     if (args->path == NULL || args->workers == 0 || args->agent_count == 0 ||
-        args->shuffle_connections == 0) {
+        args->shuffle_connections == 0 || args->workers > UINT32_MAX) {
+        return 2;
+    }
+    if (args->launch_mode == MR_LAUNCH_CXLFORK && args->role == MR_ROLE_BOTH) {
+        fprintf(stderr, "cxlfork launch requires a single map or reduce role\n");
         return 2;
     }
     if (args->global_worker_base == 0) {

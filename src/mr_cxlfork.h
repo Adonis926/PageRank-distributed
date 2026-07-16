@@ -38,6 +38,10 @@ typedef struct mr_template_options {
 
 const char *mr_role_name(mr_worker_role role);
 int mr_role_parse(const char *text, mr_worker_role *role);
+int mr_template_map_local(const mr_template_options *opts, void **mapping_out);
+int mr_template_validate(const void *mapping, const mr_template_options *opts,
+                         uint64_t *payload_checksum);
+void mr_template_unmap(void *mapping, uint64_t bytes);
 int mr_cxlfork_caps_main(int argc, char **argv);
 int mr_cxlfork_template_main(int argc, char **argv);
 int mr_cxlfork_inspect_main(int argc, char **argv);
