@@ -60,8 +60,8 @@ hash 参数和 WordCount value scale。Mapper、partitioner 和 Reducer 都必�
 
 这仍然不是任意 IP/SP/栈的透明进程恢复。代码页继续来自相同 `mr_hydra` binary，
 HydraRPC endpoint 继续由 node agent 持有；恢复的是应用执行所必需的、只读私有
-worker 初始化状态。因而跳过 `RESUME_V2` 或伪造成功已不能得到一个合法的 CXLfork
-任务。
+worker 初始化状态。因而跳过 `RESUME_V2`，或者只伪造成功而不提供内容一致的
+worker state，都不能得到一个合法的 CXLfork 任务。
 
 逐任务证据包括：
 
