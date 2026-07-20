@@ -63,6 +63,7 @@ publish() {
 
 run_case() {
   local name=$1 scale=$2 generation=$3 checksum=$4 expected=$5
+  local policy=${6:-mow}
   local out="$RESULT_ROOT/$name"
   local input_bytes
   input_bytes=$(find "$INPUT_DIR" -maxdepth 1 -type f -name '*.txt' -print0 |
@@ -87,7 +88,7 @@ run_case() {
     --reduce-template-key="$TEST_KEY" \
     --reduce-template-generation="$generation" \
     --reduce-template-checksum="$checksum" \
-    --cxlfork-policy=mow --validation=fast \
+    --cxlfork-policy="$policy" --validation=fast \
     --warmup=0 --repeat=1 --verify=all \
     > "$out/runner.stdout.log" 2> "$out/runner.stderr.log"
   local rc=$?
@@ -104,14 +105,27 @@ assert_success_evidence() {
     NR == 1 {next}
     $4 == 2 {
       count++
-      if ($8 != 0 || $20 != 5 || $22 != 1024 || $23 != 0 ||
-          $26 != expected || $27 == 0 || $28 == 0 || $29 != 1 ||
+      if ($8 != 0 || $26 != expected || $27 == 0 || $28 == 0 || $29 != 1 ||
           $30 != 15) {
         bad++
       }
     }
     END {exit !(count > 0 && bad == 0)}
   ' "$out/tasks.csv" || die "$name lacks complete template binding evidence"
+}
+
+assert_policy_path() {
+  local name=$1 expected_path=$2
+  local out="$RESULT_ROOT/$name"
+  awk -F, -v expected="$expected_path" '
+    NR == 1 {next}
+    $4 == 2 {
+      count++
+      if ($20 != expected || (expected == 5 && ($22 != 1024 || $23 != 0)))
+        bad++
+    }
+    END {exit !(count > 0 && bad == 0)}
+  ' "$out/tasks.csv" || die "$name did not use expected path=$expected_path"
 }
 
 assert_failure_evidence() {
@@ -161,6 +175,7 @@ normal_state_checksum=$(field "$normal_pub" state_checksum)
 [[ $(run_case normal 1 "$normal_generation" "$normal_page_checksum" "$EXPECTED") == 0 ]] ||
   die "normal state-bound CXLfork run failed"
 assert_success_evidence normal "$normal_state_checksum"
+assert_policy_path normal 5
 release_test_key
 
 awk '{printf "%s\t%d\n", $1, $2 * 2}' "$EXPECTED" > "$RESULT_ROOT/expected-scale2.txt"
@@ -172,6 +187,23 @@ scale_state_checksum=$(field "$scale_pub" state_checksum)
 [[ $(run_case scale2 2 "$scale_generation" "$scale_page_checksum" "$RESULT_ROOT/expected-scale2.txt") == 0 ]] ||
   die "scale2 state-bound CXLfork run failed"
 assert_success_evidence scale2 "$scale_state_checksum"
+assert_policy_path scale2 5
+release_test_key
+
+policy_pub=$(publish reduce 1)
+printf '%s\n' "$policy_pub" | tee "$RESULT_ROOT/publish-policy-matrix.log"
+policy_generation=$(field "$policy_pub" generation)
+policy_page_checksum=$(field "$policy_pub" page_checksum)
+policy_state_checksum=$(field "$policy_pub" state_checksum)
+for spec in readonly:5 moa:17 hybrid:33; do
+  policy=${spec%%:*}
+  expected_path=${spec#*:}
+  name="policy-$policy"
+  [[ $(run_case "$name" 1 "$policy_generation" "$policy_page_checksum" "$EXPECTED" "$policy") == 0 ]] ||
+    die "$policy state-bound CXLfork run failed"
+  assert_success_evidence "$name" "$policy_state_checksum"
+  assert_policy_path "$name" "$expected_path"
+done
 release_test_key
 
 corrupt_pub=$(publish reduce 1 corrupt)
@@ -216,6 +248,7 @@ cat > "$RESULT_ROOT/summary.env" <<EOF
 status=ok
 normal=ok
 scale2_semantic_dependency=ok
+readonly_moa_hybrid_binding=ok
 corrupt_state_rejected=ok
 wrong_role_rejected=ok
 stale_generation_rejected=ok

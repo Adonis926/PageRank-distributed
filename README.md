@@ -280,8 +280,8 @@ scripts/test-state-binding.sh
 ```
 
 它要求 91 环境的 VM0/VM1 已启动，默认使用专用测试 key 2002，依次验证正常
-scale=1、输出依赖 scale=2、损坏状态拒绝、错误角色拒绝、stale generation 拒绝、
-reader 回收和两台 VM dmesg。原始结果默认写入
+scale=1、输出依赖 scale=2、readonly/MoA/Hybrid 状态绑定、损坏状态拒绝、错误角色
+拒绝、stale generation 拒绝、reader 回收和两台 VM dmesg。原始结果默认写入
 `/home/xtl/cxlfork/mr-static-results/state-binding-acceptance`。若 key 2002 已由其他
 实验占用，应先改用 `TEST_KEY=N`，不要释放不属于本测试的对象。
 
