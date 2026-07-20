@@ -688,11 +688,24 @@ static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr, byte_buf *bo
         if (release_err != 0) {
             return release_err;
         }
-        if (err != 0 || status != 0 || hdr->kind == MR_TASK_ERROR) {
+        if (err != 0) {
+            return err;
+        }
+        if (status != 0 &&
+            (hdr->kind == MR_TASK_MAP || hdr->kind == MR_TASK_REDUCE) &&
+            body->len >= sizeof(mr_task_result_v2)) {
+            /*
+             * Porter failures still carry a versioned measurement envelope.
+             * Let the caller unwrap and report it instead of printing binary
+             * payload as a string or discarding failure-path evidence.
+             */
+            return 0;
+        }
+        if (status != 0 || hdr->kind == MR_TASK_ERROR) {
             if (body->len > 0) {
                 fprintf(stderr, "remote error: %.*s\n", (int)body->len, body->data);
             }
-            return err != 0 ? err : EPROTO;
+            return EPROTO;
         }
         return 0;
     }
@@ -1440,8 +1453,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             byte_buf_clear(&response);
             response = measured;
             byte_buf wire = make_wire(
-                collect_err == 0 ? (mr_task_kind)completed.header.kind
-                                 : MR_TASK_ERROR,
+                (mr_task_kind)completed.header.kind,
                 completed.header.task_id, completed.header.partition_id,
                 completed.header.partition_count, response.data,
                 response.len);
@@ -1567,10 +1579,14 @@ static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
     if (kind == MR_TASK_MAP || kind == MR_TASK_REDUCE) {
         mr_task_result_v2 result = {0};
         err = unwrap_task_result(response, &result);
-        if (err != 0 || result.kind != kind || result.task_id != task_id) {
+        if ((err != 0 && err != EREMOTEIO) || result.kind != kind ||
+            result.task_id != task_id) {
             return err != 0 ? err : EPROTO;
         }
         report_task_result(&result, hydra_now_ns() - begin_ns);
+        if (err != 0) {
+            return err;
+        }
     }
     return 0;
 }
@@ -1733,12 +1749,12 @@ static int run_master(const master_args *args)
                 if (err == 0) {
                     mr_task_result_v2 result = {0};
                     err = unwrap_task_result(&response, &result);
-                    if (err == 0 &&
+                    if ((err == 0 || err == EREMOTEIO) &&
                         (result.kind != MR_TASK_MAP ||
                          result.task_id != hdr.task_id)) {
                         err = EPROTO;
                     }
-                    if (err == 0) {
+                    if (err == 0 || err == EREMOTEIO) {
                         report_task_result(
                             &result,
                             hydra_now_ns() - sent_at[hdr.task_id - base]);
@@ -1853,12 +1869,12 @@ static int run_master(const master_args *args)
                 if (err == 0) {
                     mr_task_result_v2 result = {0};
                     err = unwrap_task_result(&response, &result);
-                    if (err == 0 &&
+                    if ((err == 0 || err == EREMOTEIO) &&
                         (result.kind != MR_TASK_REDUCE ||
                          result.task_id != hdr.task_id)) {
                         err = EPROTO;
                     }
-                    if (err == 0) {
+                    if (err == 0 || err == EREMOTEIO) {
                         report_task_result(
                             &result,
                             hydra_now_ns() -

@@ -42,12 +42,37 @@ typedef struct ShuffleChunkHeader {
 
 `ShuffleChunkHeader` 用于 shuffle fetch response。HydraRPC payload 生命周期只覆盖单次 req/resp，因此 reducer 收到 chunk 后立即 append 到 spill file，不长期保存 payload 指针。
 
-map/reduce response 的业务 payload 前带固定 200-byte `mr_task_result_v1`
+map/reduce response 的业务 payload 前带固定 232-byte `mr_task_result_v2`
 envelope。它包含 magic、size、version、任务/worker/PID、porter 分项以及本次
-CXLfork restore 的 path、kernel time 和 page counters。master 严格校验后移除
+CXLfork restore 的 path、kernel time、page counters 和 template-state binding
+证据。master 严格校验后移除
 envelope，再把业务结果交给原来的 WordCount 解析，因此测量元数据不会改变应用
 输出。`task_ns` 只包围应用回调；restore、template validation、reap 和 refill
 单独计时，`porter_total_ns` 才是包含这些阶段的外层区间。
+
+## 应用状态强绑定
+
+CXLfork template v2 不再只是随机 arena 加 header。它包含 versioned
+`MR_WorkerStateV1`：ASCII word-character 表、小写转换表、数字解析表、partition
+hash 参数和 WordCount value scale。Mapper、partitioner 和 Reducer 都必须通过
+`MR_GetWorkerState()` 取得并实际消费这些状态；没有成功 bind、角色不匹配、状态
+损坏或 callback 没有读取状态时，porter 会让任务明确失败。
+
+这仍然不是任意 IP/SP/栈的透明进程恢复。代码页继续来自相同 `mr_hydra` binary，
+HydraRPC endpoint 继续由 node agent 持有；恢复的是应用执行所必需的、只读私有
+worker 初始化状态。因而跳过 `RESUME_V2` 或伪造成功已不能得到一个合法的 CXLfork
+任务。
+
+逐任务证据包括：
+
+- `template_state_checksum`：实际 bind 的 worker-state checksum；
+- `template_access_checksum`、`template_access_count`：callback 的状态获取证据；
+- `template_state_pages`：状态覆盖页数；
+- `template_binding_flags=15`：validated、role-match、app-consumed、required 全部成立。
+
+`--template-value-scale=N` 是显式、可校验的状态配置。正常实验固定为 1；验收测试
+发布 scale=2 的合法 Reducer template，并验证 WordCount 输出确实整体翻倍，以证明
+业务输出依赖恢复状态。`template --test-corrupt-state` 只用于负向测试。
 
 调度默认是静态、可重复的：
 
@@ -247,6 +272,18 @@ scripts/mr-bench.sh \
 
 30 次样本不会输出 P99；如论文实验需要 P99，应单独把 repeat 提高到数百或约
 1,000 次。默认 `verify=all` 可让每个计时样本都先通过 WordCount 输出校验。
+
+应用状态强绑定的一键验收脚本是：
+
+```bash
+scripts/test-state-binding.sh
+```
+
+它要求 91 环境的 VM0/VM1 已启动，默认使用专用测试 key 2002，依次验证正常
+scale=1、输出依赖 scale=2、损坏状态拒绝、错误角色拒绝、stale generation 拒绝、
+reader 回收和两台 VM dmesg。原始结果默认写入
+`/home/xtl/cxlfork/mr-static-results/state-binding-acceptance`。若 key 2002 已由其他
+实验占用，应先改用 `TEST_KEY=N`，不要释放不属于本测试的对象。
 
 ## 调度文件
 
