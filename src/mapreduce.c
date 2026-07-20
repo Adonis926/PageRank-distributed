@@ -161,6 +161,7 @@ typedef struct agent_args {
     uint64_t template_base;
     uint64_t template_bytes;
     uint64_t template_seed;
+    uint32_t template_value_scale;
     uint64_t template_key;
     uint64_t template_generation;
     uint64_t template_page_checksum;
@@ -192,6 +193,10 @@ typedef struct worker_child_args {
 static emit_context current_emit;
 static mr_partitions *current_reduce_input;
 static int current_reduce_partition_number;
+static const MR_WorkerStateV1 *current_worker_state;
+static uint64_t current_worker_state_access_checksum;
+static uint64_t current_worker_state_access_count;
+static int current_worker_state_error;
 
 static const char *arg_value(const char *arg, const char *prefix)
 {
@@ -547,14 +552,76 @@ void MR_Emit(char *key, char *value)
     mr_partitions_emit(current_emit.partitions, partition_number, key, value);
 }
 
+const MR_WorkerStateV1 *MR_GetWorkerState(void)
+{
+    if (current_worker_state == NULL) {
+        MR_TaskFail(EPROTO);
+        return NULL;
+    }
+    current_worker_state_access_count++;
+    current_worker_state_access_checksum ^=
+        current_worker_state->checksum + UINT64_C(0x9e3779b97f4a7c15) +
+        (current_worker_state_access_count << 6) +
+        (current_worker_state_access_count >> 2);
+    return current_worker_state;
+}
+
+void MR_TaskFail(int error)
+{
+    if (current_worker_state_error == 0) {
+        current_worker_state_error = error != 0 ? error : EPROTO;
+    }
+}
+
+static void begin_worker_state(const MR_WorkerStateV1 *state,
+                               uint32_t kind)
+{
+    current_worker_state = state;
+    current_worker_state_access_checksum = 0;
+    current_worker_state_access_count = 0;
+    current_worker_state_error = 0;
+    uint32_t expected_role =
+        kind == MR_TASK_MAP ? MR_WORKER_ROLE_MAP : MR_WORKER_ROLE_REDUCE;
+    if (state == NULL ||
+        (state->role != MR_WORKER_ROLE_BOTH &&
+         state->role != expected_role)) {
+        MR_TaskFail(EACCES);
+    }
+}
+
+static int finish_worker_state(mr_template_binding_result *binding)
+{
+    int err = current_worker_state_error;
+    if (err == 0 && current_worker_state_access_count == 0) {
+        err = ENODATA;
+    }
+    if (binding != NULL) {
+        binding->access_checksum = current_worker_state_access_checksum;
+        binding->access_count = current_worker_state_access_count;
+        if (err == 0) {
+            binding->flags |= MR_TEMPLATE_BIND_APP_CONSUMED;
+        }
+    }
+    current_worker_state = NULL;
+    current_worker_state_access_checksum = 0;
+    current_worker_state_access_count = 0;
+    current_worker_state_error = 0;
+    return err;
+}
+
 unsigned long MR_DefaultHashPartition(char *key, int num_partitions)
 {
-    unsigned long hash = 5381;
+    const MR_WorkerStateV1 *state = MR_GetWorkerState();
+    if (state == NULL || num_partitions <= 0) {
+        MR_TaskFail(EINVAL);
+        return 0;
+    }
+    uint64_t hash = state->hash_initial;
     int c;
     while ((c = *key++) != '\0') {
-        hash = hash * 33 + (unsigned char)c;
+        hash = hash * state->hash_multiplier + (unsigned char)c;
     }
-    return hash % (unsigned long)num_partitions;
+    return (unsigned long)(hash % (uint64_t)num_partitions);
 }
 
 static char *reduce_get_next(char *key, int partition_number)
@@ -976,8 +1043,11 @@ static int handle_shuffle_fetch(const mr_wire_header *hdr, const char *body,
 static int porter_execute_task(void *context, uint32_t worker_id,
                                uint32_t kind, uint64_t task_id,
                                uint64_t partition_id,
-                               uint64_t partition_count, const void *payload,
-                               size_t payload_len, byte_buf *out)
+                               uint64_t partition_count,
+                               const MR_WorkerStateV1 *worker_state,
+                               mr_template_binding_result *binding,
+                               const void *payload, size_t payload_len,
+                               byte_buf *out)
 {
     (void)task_id;
     (void)partition_id;
@@ -986,39 +1056,50 @@ static int porter_execute_task(void *context, uint32_t worker_id,
     args.worker_id = worker_id;
     args.global_worker_id = args.global_worker_base + worker_id;
     (void)mkdir_p(args.store_dir);
+    begin_worker_state(worker_state, kind);
+    int err = 0;
 
     if (kind == MR_TASK_MAP) {
         if (payload_len < sizeof(control_map_task)) {
-            return EINVAL;
+            err = EINVAL;
+            goto out;
         }
         control_map_task task = {0};
         memcpy(&task, payload, sizeof(task));
         const char *data = (const char *)payload + sizeof(task);
         if (sizeof(task) + task.data_len > payload_len) {
-            return EINVAL;
+            err = EINVAL;
+            goto out;
         }
-        return worker_do_map(&args, args.map, args.partitioner, data,
-                             (size_t)task.data_len, task.job_id,
-                             task.map_task_id, (int)task.reducer_count, out);
-    }
-    if (kind == MR_TASK_REDUCE) {
+        err = worker_do_map(&args, args.map, args.partitioner, data,
+                            (size_t)task.data_len, task.job_id,
+                            task.map_task_id, (int)task.reducer_count, out);
+    } else if (kind == MR_TASK_REDUCE) {
         if (payload_len < sizeof(control_reduce_task)) {
-            return EINVAL;
+            err = EINVAL;
+            goto out;
         }
         control_reduce_task task = {0};
         memcpy(&task, payload, sizeof(task));
         size_t loc_bytes =
             (size_t)task.location_count * sizeof(IntermediateLocation);
         if (sizeof(task) + loc_bytes > payload_len) {
-            return EINVAL;
+            err = EINVAL;
+            goto out;
         }
         const IntermediateLocation *locs =
             (const IntermediateLocation *)((const char *)payload + sizeof(task));
-        return worker_do_reduce(&args, args.reduce, task.reducer_id,
-                                task.reducer_count, locs,
-                                (size_t)task.location_count, out);
+        err = worker_do_reduce(&args, args.reduce, task.reducer_id,
+                               task.reducer_count, locs,
+                               (size_t)task.location_count, out);
+    } else {
+        err = EINVAL;
     }
-    return EINVAL;
+out:
+    {
+        int state_err = finish_worker_state(binding);
+        return err != 0 ? err : state_err;
+    }
 }
 
 static int agent_submit_request(mr_porter *porter, size_t worker_count,
@@ -1112,6 +1193,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             .base = args->template_base,
             .bytes = args->template_bytes,
             .seed = args->template_seed,
+            .value_scale = args->template_value_scale,
         },
         .restore = {
             .template = {
@@ -1120,6 +1202,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 .base = args->template_base,
                 .bytes = args->template_bytes,
                 .seed = args->template_seed,
+                .value_scale = args->template_value_scale,
             },
             .generation = args->template_generation,
             .page_checksum = args->template_page_checksum,
@@ -1282,7 +1365,12 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                        " path_mask=%" PRIu64 " kernel_total_ns=%" PRIu64
                        " shared_leaf_pages=%" PRIu64
                        " fallback_pages=%" PRIu64
-                       " local_copy_pages=%" PRIu64 "\n",
+                       " local_copy_pages=%" PRIu64
+                       " template_state_checksum=%" PRIu64
+                       " template_access_checksum=%" PRIu64
+                       " template_access_count=%" PRIu64
+                       " template_state_pages=%" PRIu64
+                       " template_binding_flags=%" PRIu64 "\n",
                        completed.header.task_id, completed.header.kind,
                        args->node_id, porter_result.worker_id,
                        porter_result.worker_pid,
@@ -1296,7 +1384,12 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                        porter_result.restore.kernel_total_ns,
                        porter_result.restore.shared_leaf_pages,
                        porter_result.restore.fallback_pages,
-                       porter_result.restore.local_copy_pages);
+                       porter_result.restore.local_copy_pages,
+                       porter_result.binding.state_checksum,
+                       porter_result.binding.access_checksum,
+                       porter_result.binding.access_count,
+                       porter_result.binding.state_pages,
+                       porter_result.binding.flags);
                 fflush(stdout);
             }
             uint32_t status = collect_err == 0 ? 0 : 1;
@@ -1305,7 +1398,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 const char *text = "agent task failed\n";
                 byte_buf_append(&response, text, strlen(text));
             }
-            mr_task_result_v1 task_result = {
+            mr_task_result_v2 task_result = {
                 .magic = MR_TASK_RESULT_MAGIC,
                 .size = sizeof(task_result),
                 .version = MR_TASK_RESULT_VERSION,
@@ -1333,6 +1426,13 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 .fallback_pages = porter_result.restore.fallback_pages,
                 .local_copy_pages = porter_result.restore.local_copy_pages,
                 .leaf_copy_pages = porter_result.restore.leaf_copy_pages,
+                .template_state_checksum =
+                    porter_result.binding.state_checksum,
+                .template_access_checksum =
+                    porter_result.binding.access_checksum,
+                .template_access_count = porter_result.binding.access_count,
+                .template_state_pages = porter_result.binding.state_pages,
+                .template_binding_flags = porter_result.binding.flags,
             };
             byte_buf measured = {0};
             byte_buf_append(&measured, &task_result, sizeof(task_result));
@@ -1381,7 +1481,7 @@ static int open_agent_endpoint(mr_endpoint *ep, const master_args *args,
     return mr_hydra_open_ex(&ep->ctx, &config);
 }
 
-static int unwrap_task_result(byte_buf *response, mr_task_result_v1 *result)
+static int unwrap_task_result(byte_buf *response, mr_task_result_v2 *result)
 {
     if (response->len < sizeof(*result)) {
         return EPROTO;
@@ -1411,11 +1511,11 @@ static int unwrap_task_result(byte_buf *response, mr_task_result_v1 *result)
     return result->status == 0 ? 0 : EREMOTEIO;
 }
 
-static void report_task_result(const mr_task_result_v1 *result,
+static void report_task_result(const mr_task_result_v2 *result,
                                uint64_t master_roundtrip_ns)
 {
     fprintf(stderr,
-            "task_result_v1 task=%" PRIu64 " kind=%u node=%u worker=%u"
+            "task_result_v2 task=%" PRIu64 " kind=%u node=%u worker=%u"
             " pid=%" PRId64 " status=%u roundtrip_ns=%" PRIu64
             " porter_total_ns=%" PRIu64 " dispatch_ns=%" PRIu64
             " fork_ns=%" PRIu64 " wakeup_ns=%" PRIu64
@@ -1425,7 +1525,12 @@ static void report_task_result(const mr_task_result_v1 *result,
             " restore_id=%" PRIu64 " path_mask=%" PRIu64
             " kernel_total_ns=%" PRIu64 " shared_leaf_pages=%" PRIu64
             " fallback_pages=%" PRIu64 " local_copy_pages=%" PRIu64
-            " leaf_copy_pages=%" PRIu64 "\n",
+            " leaf_copy_pages=%" PRIu64
+            " template_state_checksum=%" PRIu64
+            " template_access_checksum=%" PRIu64
+            " template_access_count=%" PRIu64
+            " template_state_pages=%" PRIu64
+            " template_binding_flags=%" PRIu64 "\n",
             result->task_id, result->kind, result->node_id,
             result->worker_id, result->worker_pid, result->status,
             master_roundtrip_ns, result->porter_total_ns,
@@ -1435,7 +1540,10 @@ static void report_task_result(const mr_task_result_v1 *result,
             result->restore_id, result->restore_path_mask,
             result->kernel_total_ns, result->shared_leaf_pages,
             result->fallback_pages, result->local_copy_pages,
-            result->leaf_copy_pages);
+            result->leaf_copy_pages, result->template_state_checksum,
+            result->template_access_checksum,
+            result->template_access_count, result->template_state_pages,
+            result->template_binding_flags);
 }
 
 static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
@@ -1457,7 +1565,7 @@ static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
         return EPROTO;
     }
     if (kind == MR_TASK_MAP || kind == MR_TASK_REDUCE) {
-        mr_task_result_v1 result = {0};
+        mr_task_result_v2 result = {0};
         err = unwrap_task_result(response, &result);
         if (err != 0 || result.kind != kind || result.task_id != task_id) {
             return err != 0 ? err : EPROTO;
@@ -1623,7 +1731,7 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
-                    mr_task_result_v1 result = {0};
+                    mr_task_result_v2 result = {0};
                     err = unwrap_task_result(&response, &result);
                     if (err == 0 &&
                         (result.kind != MR_TASK_MAP ||
@@ -1743,7 +1851,7 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
-                    mr_task_result_v1 result = {0};
+                    mr_task_result_v2 result = {0};
                     err = unwrap_task_result(&response, &result);
                     if (err == 0 &&
                         (result.kind != MR_TASK_REDUCE ||
@@ -1852,6 +1960,7 @@ static void usage(const char *argv0)
             "  %s agent --path=PATH --node-id=N [--workers=N]\n"
             "  %s cxlfork-caps\n"
             "  %s template --role=map|reduce --key=N [--base=N] [--bytes=N] [--seed=N]\n"
+            "       [--value-scale=N] [--test-corrupt-state] (test only)\n"
             "  %s cxlfork-inspect KEY\n"
             "  %s cxlfork-release KEY GENERATION\n"
             "\n"
@@ -1866,6 +1975,7 @@ static void usage(const char *argv0)
             "       [--role=map|reduce|both]\n"
             "       [--launch=persistent|localfork|local-prefork|cxlfork]\n"
             "       [--template-base=N] [--template-bytes=N] [--template-seed=N]\n"
+            "       [--template-value-scale=N]\n"
             "       [--template-key=N] [--template-generation=N]\n"
             "       [--template-page-checksum=N] [--cxlfork-policy=mow|moa|hybrid|readonly]\n"
             "       [--validation=fast|full]\n"
@@ -1948,6 +2058,7 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
     args->template_base = MR_TEMPLATE_BASE_DEFAULT;
     args->template_bytes = MR_TEMPLATE_BYTES_DEFAULT;
     args->template_seed = MR_TEMPLATE_SEED_DEFAULT;
+    args->template_value_scale = MR_TEMPLATE_VALUE_SCALE_DEFAULT;
     args->cxlfork_policy = MR_CXLFORK_POLICY_MOW;
     args->store_dir = "/tmp/mr-store";
 
@@ -1985,6 +2096,13 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
             args->template_bytes = mr_parse_u64(value, "template-bytes");
         } else if ((value = arg_value(argv[i], "--template-seed=")) != NULL) {
             args->template_seed = mr_parse_u64(value, "template-seed");
+        } else if ((value = arg_value(argv[i], "--template-value-scale=")) != NULL) {
+            uint64_t scale = mr_parse_u64(value, "template-value-scale");
+            if (scale == 0 || scale > 1024) {
+                fprintf(stderr, "template-value-scale must be in [1, 1024]\n");
+                return 2;
+            }
+            args->template_value_scale = (uint32_t)scale;
         } else if ((value = arg_value(argv[i], "--template-key=")) != NULL) {
             args->template_key = mr_parse_u64(value, "template-key");
         } else if ((value = arg_value(argv[i], "--template-generation=")) != NULL) {

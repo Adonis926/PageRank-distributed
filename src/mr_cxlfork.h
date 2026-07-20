@@ -1,14 +1,23 @@
 #ifndef MR_CXLFORK_H
 #define MR_CXLFORK_H
 
+#include "mapreduce.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
-#define MR_TEMPLATE_MAGIC UINT64_C(0x4d52544d504c5631)
-#define MR_TEMPLATE_VERSION 1U
+#define MR_TEMPLATE_MAGIC UINT64_C(0x4d52544d504c5632)
+#define MR_TEMPLATE_VERSION 2U
 #define MR_TEMPLATE_BASE_DEFAULT UINT64_C(0x500000000000)
 #define MR_TEMPLATE_BYTES_DEFAULT (64ULL * 1024ULL * 1024ULL)
 #define MR_TEMPLATE_SEED_DEFAULT UINT64_C(0x43584c464f524b31)
+#define MR_TEMPLATE_VALUE_SCALE_DEFAULT 1U
+#define MR_TEMPLATE_STATE_OFFSET 128U
+
+#define MR_TEMPLATE_BIND_VALIDATED (1ULL << 0)
+#define MR_TEMPLATE_BIND_ROLE_MATCH (1ULL << 1)
+#define MR_TEMPLATE_BIND_APP_CONSUMED (1ULL << 2)
+#define MR_TEMPLATE_BIND_REQUIRED (1ULL << 3)
 
 typedef enum mr_worker_role {
     MR_ROLE_MAP = 1,
@@ -25,7 +34,11 @@ typedef struct mr_template_header {
     uint64_t seed;
     uint64_t payload_checksum;
     uint64_t config_fingerprint;
-    uint64_t reserved[8];
+    uint64_t state_offset;
+    uint64_t state_bytes;
+    uint64_t state_checksum;
+    uint64_t required_binding_flags;
+    uint64_t reserved[4];
 } mr_template_header;
 
 typedef struct mr_template_options {
@@ -34,7 +47,17 @@ typedef struct mr_template_options {
     uint64_t base;
     uint64_t bytes;
     uint64_t seed;
+    uint32_t value_scale;
+    uint32_t reserved;
 } mr_template_options;
+
+typedef struct mr_template_binding_result {
+    uint64_t state_checksum;
+    uint64_t access_checksum;
+    uint64_t access_count;
+    uint64_t state_pages;
+    uint64_t flags;
+} mr_template_binding_result;
 
 typedef enum mr_cxlfork_policy {
     MR_CXLFORK_POLICY_READONLY = 0,
@@ -92,6 +115,10 @@ int mr_cxlfork_policy_parse(const char *text, mr_cxlfork_policy *policy);
 int mr_template_map_local(const mr_template_options *opts, void **mapping_out);
 int mr_template_validate(const void *mapping, const mr_template_options *opts,
                          uint64_t *payload_checksum);
+int mr_template_bind(const void *mapping, const mr_template_options *opts,
+                     mr_worker_role expected_role,
+                     const MR_WorkerStateV1 **state_out,
+                     mr_template_binding_result *binding);
 void mr_template_unmap(void *mapping, uint64_t bytes);
 int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
                              mr_cxlfork_session **session,

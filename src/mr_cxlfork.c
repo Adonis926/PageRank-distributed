@@ -41,6 +41,13 @@ struct mr_cxlfork_session {
 
 #define MR_TEMPLATE_ALIGNMENT (2ULL * 1024ULL * 1024ULL)
 
+_Static_assert(sizeof(mr_template_header) == 120,
+               "mr template v2 header size must stay stable");
+_Static_assert(sizeof(MR_WorkerStateV1) == 856,
+               "MR worker state v1 size must stay stable");
+_Static_assert(MR_TEMPLATE_STATE_OFFSET >= sizeof(mr_template_header),
+               "worker state must not overlap the template header");
+
 const char *mr_role_name(mr_worker_role role)
 {
     switch (role) {
@@ -126,15 +133,68 @@ static uint64_t template_next_pattern(uint64_t *state)
     return value;
 }
 
+static uint64_t template_config_fingerprint(const mr_template_options *opts,
+                                            uint64_t state_checksum)
+{
+    return opts->key ^ opts->base ^ opts->bytes ^ opts->seed ^
+           (uint64_t)opts->role ^ ((uint64_t)opts->value_scale << 32) ^
+           state_checksum;
+}
+
+static void template_build_worker_state(const mr_template_options *opts,
+                                        MR_WorkerStateV1 *state)
+{
+    memset(state, 0, sizeof(*state));
+    state->magic = MR_WORKER_STATE_MAGIC;
+    state->version = MR_WORKER_STATE_VERSION;
+    state->size = sizeof(*state);
+    state->role = (uint32_t)opts->role;
+    state->flags = MR_WORKER_STATE_F_ASCII_ALNUM |
+                   MR_WORKER_STATE_F_UNDERSCORE |
+                   MR_WORKER_STATE_F_LOWERCASE;
+    state->hash_initial = 5381;
+    state->hash_multiplier = 33;
+    state->value_radix = 10;
+    state->value_scale = opts->value_scale;
+
+    for (size_t i = 0; i < 256; i++) {
+        state->lower[i] = (uint8_t)i;
+        state->digit[i] = -1;
+    }
+    for (unsigned int c = '0'; c <= '9'; c++) {
+        state->word_char[c] = 1;
+        state->digit[c] = (int8_t)(c - '0');
+    }
+    for (unsigned int c = 'A'; c <= 'Z'; c++) {
+        state->word_char[c] = 1;
+        state->lower[c] = (uint8_t)(c - 'A' + 'a');
+    }
+    for (unsigned int c = 'a'; c <= 'z'; c++) {
+        state->word_char[c] = 1;
+    }
+    state->word_char[(unsigned int)'_'] = 1;
+    state->checksum = 0;
+    state->checksum = template_checksum_bytes((const unsigned char *)state,
+                                              sizeof(*state));
+}
+
+static int template_options_valid(const mr_template_options *opts)
+{
+    return opts != NULL && opts->role >= MR_ROLE_MAP &&
+           opts->role <= MR_ROLE_BOTH && opts->reserved == 0 &&
+           opts->value_scale > 0 && opts->value_scale <= 1024 &&
+           opts->bytes >= MR_TEMPLATE_STATE_OFFSET +
+                              sizeof(MR_WorkerStateV1) &&
+           opts->base % MR_TEMPLATE_ALIGNMENT == 0 &&
+           opts->bytes % MR_TEMPLATE_ALIGNMENT == 0;
+}
+
 int mr_template_map_local(const mr_template_options *opts, void **mapping_out)
 {
     unsigned char *mapping;
     uint64_t state;
 
-    if (opts == NULL || mapping_out == NULL || opts->role < MR_ROLE_MAP ||
-        opts->role > MR_ROLE_BOTH || opts->bytes < sizeof(mr_template_header) ||
-        opts->base % MR_TEMPLATE_ALIGNMENT != 0 ||
-        opts->bytes % MR_TEMPLATE_ALIGNMENT != 0) {
+    if (!template_options_valid(opts) || mapping_out == NULL) {
         return EINVAL;
     }
     mapping = mmap((void *)(uintptr_t)opts->base, (size_t)opts->bytes,
@@ -160,6 +220,10 @@ int mr_template_map_local(const mr_template_options *opts, void **mapping_out)
         offset += chunk;
     }
 
+    MR_WorkerStateV1 *worker_state =
+        (MR_WorkerStateV1 *)(mapping + MR_TEMPLATE_STATE_OFFSET);
+    template_build_worker_state(opts, worker_state);
+
     mr_template_header *header = (mr_template_header *)mapping;
     memset(header, 0, sizeof(*header));
     header->magic = MR_TEMPLATE_MAGIC;
@@ -168,18 +232,30 @@ int mr_template_map_local(const mr_template_options *opts, void **mapping_out)
     header->base = opts->base;
     header->bytes = opts->bytes;
     header->seed = opts->seed;
+    header->state_offset = MR_TEMPLATE_STATE_OFFSET;
+    header->state_bytes = sizeof(*worker_state);
+    header->state_checksum = worker_state->checksum;
+    header->required_binding_flags = MR_TEMPLATE_BIND_VALIDATED |
+                                     MR_TEMPLATE_BIND_ROLE_MATCH |
+                                     MR_TEMPLATE_BIND_APP_CONSUMED |
+                                     MR_TEMPLATE_BIND_REQUIRED;
     header->payload_checksum = template_checksum_bytes(
         mapping + sizeof(*header), opts->bytes - sizeof(*header));
-    header->config_fingerprint = opts->key ^ opts->base ^ opts->bytes ^
-                                 opts->seed ^ (uint64_t)opts->role;
+    header->config_fingerprint =
+        template_config_fingerprint(opts, worker_state->checksum);
     *mapping_out = mapping;
     return 0;
 }
 
-int mr_template_validate(const void *mapping, const mr_template_options *opts,
-                         uint64_t *payload_checksum)
+int mr_template_bind(const void *mapping, const mr_template_options *opts,
+                     mr_worker_role expected_role,
+                     const MR_WorkerStateV1 **state_out,
+                     mr_template_binding_result *binding)
 {
-    if (mapping == NULL || opts == NULL) {
+    MR_WorkerStateV1 expected;
+
+    if (mapping == NULL || !template_options_valid(opts) ||
+        expected_role < MR_ROLE_MAP || expected_role > MR_ROLE_REDUCE) {
         return EINVAL;
     }
     const mr_template_header *header = mapping;
@@ -187,15 +263,63 @@ int mr_template_validate(const void *mapping, const mr_template_options *opts,
         header->version != MR_TEMPLATE_VERSION ||
         header->role != (uint32_t)opts->role || header->base != opts->base ||
         header->bytes != opts->bytes || header->seed != opts->seed ||
-        header->config_fingerprint !=
-            (opts->key ^ opts->base ^ opts->bytes ^ opts->seed ^
-             (uint64_t)opts->role)) {
+        header->state_offset != MR_TEMPLATE_STATE_OFFSET ||
+        header->state_bytes != sizeof(MR_WorkerStateV1) ||
+        header->state_offset + header->state_bytes > header->bytes ||
+        header->required_binding_flags !=
+            (MR_TEMPLATE_BIND_VALIDATED | MR_TEMPLATE_BIND_ROLE_MATCH |
+             MR_TEMPLATE_BIND_APP_CONSUMED | MR_TEMPLATE_BIND_REQUIRED)) {
         return EILSEQ;
     }
-    if (payload_checksum != NULL) {
-        *payload_checksum = header->payload_checksum;
+    for (size_t i = 0; i < sizeof(header->reserved) /
+                               sizeof(header->reserved[0]); i++) {
+        if (header->reserved[i] != 0) {
+            return EILSEQ;
+        }
+    }
+
+    const MR_WorkerStateV1 *state =
+        (const MR_WorkerStateV1 *)((const unsigned char *)mapping +
+                                   header->state_offset);
+    template_build_worker_state(opts, &expected);
+    if (memcmp(state, &expected, sizeof(expected)) != 0 ||
+        header->state_checksum != state->checksum ||
+        header->config_fingerprint !=
+            template_config_fingerprint(opts, state->checksum)) {
+        return EILSEQ;
+    }
+    if (state->role != MR_ROLE_BOTH && state->role != (uint32_t)expected_role) {
+        return EACCES;
+    }
+    if (state_out != NULL) {
+        *state_out = state;
+    }
+    if (binding != NULL) {
+        memset(binding, 0, sizeof(*binding));
+        binding->state_checksum = state->checksum;
+        binding->state_pages =
+            (header->state_offset + header->state_bytes - 1) / 4096 -
+            header->state_offset / 4096 + 1;
+        binding->flags = MR_TEMPLATE_BIND_VALIDATED |
+                         MR_TEMPLATE_BIND_ROLE_MATCH |
+                         MR_TEMPLATE_BIND_REQUIRED;
     }
     return 0;
+}
+
+int mr_template_validate(const void *mapping, const mr_template_options *opts,
+                         uint64_t *payload_checksum)
+{
+    int err = mr_template_bind(mapping, opts,
+                               opts != NULL && opts->role == MR_ROLE_REDUCE
+                                   ? MR_ROLE_REDUCE
+                                   : MR_ROLE_MAP,
+                               NULL, NULL);
+    if (err == 0 && payload_checksum != NULL) {
+        const mr_template_header *header = mapping;
+        *payload_checksum = header->payload_checksum;
+    }
+    return err;
 }
 
 void mr_template_unmap(void *mapping, uint64_t bytes)
@@ -235,7 +359,8 @@ static int query_caps_fd(int fd, struct cxlfork_query_caps_v2 *caps)
     return 0;
 }
 
-static int publish_template(const mr_template_options *opts)
+static int publish_template(const mr_template_options *opts,
+                            bool test_corrupt_state)
 {
     struct cxlfork_query_caps_v2 caps;
     struct cxlfork_prepare_v2 prepare;
@@ -248,9 +373,7 @@ static int publish_template(const mr_template_options *opts)
     if (opts->role != MR_ROLE_MAP && opts->role != MR_ROLE_REDUCE) {
         return EINVAL;
     }
-    if (opts->key == 0 || opts->bytes < sizeof(mr_template_header) ||
-        opts->base % MR_TEMPLATE_ALIGNMENT != 0 ||
-        opts->bytes % MR_TEMPLATE_ALIGNMENT != 0) {
+    if (opts->key == 0 || !template_options_valid(opts)) {
         return EINVAL;
     }
 
@@ -274,6 +397,17 @@ static int publish_template(const mr_template_options *opts)
         close(fd);
         return err;
     }
+    if (test_corrupt_state) {
+        MR_WorkerStateV1 *state =
+            (MR_WorkerStateV1 *)((unsigned char *)mapping +
+                                 MR_TEMPLATE_STATE_OFFSET);
+        state->lower[(unsigned int)'A'] ^= 1U;
+        if (mr_template_validate(mapping, opts, NULL) != EILSEQ) {
+            munmap(mapping, (size_t)opts->bytes);
+            close(fd);
+            return EPROTO;
+        }
+    }
 
     memset(regions, 0, sizeof(regions));
     init_v2(&prepare, sizeof(prepare));
@@ -290,15 +424,19 @@ static int publish_template(const mr_template_options *opts)
     }
 
     const mr_template_header *header = mapping;
-    printf("mr_template_v1 role=%s key=%" PRIu64
+    printf("mr_template_v2 role=%s key=%" PRIu64
            " generation=%" PRIu64 " slot=%" PRIu64
            " base=%" PRIu64 " bytes=%" PRIu64 " seed=%" PRIu64
+           " value_scale=%u state_bytes=%" PRIu64
+           " state_checksum=%" PRIu64 " state_valid=%s"
            " total_pages=%" PRIu64 " page_checksum=%" PRIu64
            " payload_checksum=%" PRIu64 " region_count=%u"
            " prepare_total_ns=%" PRIu64 " prepare_path_mask=%" PRIu64
            " prepare_valid_mask=%" PRIu64 " verify=ok\n",
            mr_role_name(opts->role), opts->key, (uint64_t)prepare.generation,
            (uint64_t)prepare.slot, opts->base, opts->bytes, opts->seed,
+           opts->value_scale, header->state_bytes, header->state_checksum,
+           test_corrupt_state ? "no(test)" : "yes",
            (uint64_t)prepare.total_pages, (uint64_t)prepare.page_checksum,
            header->payload_checksum, prepare.region_count,
            (uint64_t)prepare.stats.total_ns,
@@ -545,7 +683,9 @@ int mr_cxlfork_template_main(int argc, char **argv)
         .base = MR_TEMPLATE_BASE_DEFAULT,
         .bytes = MR_TEMPLATE_BYTES_DEFAULT,
         .seed = MR_TEMPLATE_SEED_DEFAULT,
+        .value_scale = MR_TEMPLATE_VALUE_SCALE_DEFAULT,
     };
+    bool test_corrupt_state = false;
 
     for (int i = 2; i < argc; i++) {
         const char *arg = argv[i];
@@ -564,6 +704,15 @@ int mr_cxlfork_template_main(int argc, char **argv)
             opts.bytes = mr_parse_u64(arg + 8, "bytes");
         } else if (strncmp(arg, "--seed=", 7) == 0) {
             opts.seed = mr_parse_u64(arg + 7, "seed");
+        } else if (strncmp(arg, "--value-scale=", 14) == 0) {
+            uint64_t scale = mr_parse_u64(arg + 14, "value-scale");
+            if (scale == 0 || scale > 1024) {
+                fprintf(stderr, "value-scale must be in [1, 1024]\n");
+                return 2;
+            }
+            opts.value_scale = (uint32_t)scale;
+        } else if (strcmp(arg, "--test-corrupt-state") == 0) {
+            test_corrupt_state = true;
         } else {
             fprintf(stderr, "unknown template arg: %s\n", arg);
             return 2;
@@ -573,7 +722,7 @@ int mr_cxlfork_template_main(int argc, char **argv)
         fprintf(stderr, "template requires --role=map|reduce and --key=N\n");
         return 2;
     }
-    int err = publish_template(&opts);
+    int err = publish_template(&opts, test_corrupt_state);
     if (err != 0) {
         errno = err;
         perror("mr template publish");

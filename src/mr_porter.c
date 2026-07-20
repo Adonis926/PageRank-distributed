@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mr_porter.h"
+#include "mr_wire.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -41,6 +42,7 @@ typedef struct mr_porter_slot {
     uint64_t restore_ioctl_ns;
     uint64_t template_validate_ns;
     uint64_t task_ns;
+    mr_template_binding_result binding;
     mr_cxlfork_result restore;
 } mr_porter_slot;
 
@@ -192,6 +194,8 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
                            mr_porter_slot *slot)
 {
     byte_buf response = {0};
+    const MR_WorkerStateV1 *worker_state = NULL;
+    const mr_template_options *template = &config->template;
     mr_cxlfork_session *session = NULL;
     int err = 0;
 
@@ -199,20 +203,34 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
     memset(&slot->restore, 0, sizeof(slot->restore));
     slot->restore_ioctl_ns = 0;
     slot->template_validate_ns = 0;
+    memset(&slot->binding, 0, sizeof(slot->binding));
     if (config->mode == MR_LAUNCH_CXLFORK) {
+        template = &config->restore.template;
         uint64_t begin = nsec_now();
         err = mr_cxlfork_restore_begin(&config->restore, &session,
                                        &slot->restore);
         slot->restore_ioctl_ns = nsec_now() - begin;
+    }
+    if (err == 0) {
+        mr_worker_role expected_role;
+        if (slot->kind == MR_TASK_MAP) {
+            expected_role = MR_ROLE_MAP;
+        } else if (slot->kind == MR_TASK_REDUCE) {
+            expected_role = MR_ROLE_REDUCE;
+        } else {
+            expected_role = 0;
+            err = EINVAL;
+        }
         if (err == 0) {
-            begin = nsec_now();
-            err = mr_template_validate(
-                (void *)(uintptr_t)config->restore.template.base,
-                &config->restore.template, NULL);
+            uint64_t begin = nsec_now();
+            err = mr_template_bind((void *)(uintptr_t)template->base,
+                                   template, expected_role, &worker_state,
+                                   &slot->binding);
             slot->template_validate_ns = nsec_now() - begin;
-            if (config->restore_hold_ms != 0) {
-                usleep((useconds_t)config->restore_hold_ms * 1000U);
-            }
+        }
+        if (err == 0 && config->mode == MR_LAUNCH_CXLFORK &&
+            config->restore_hold_ms != 0) {
+            usleep((useconds_t)config->restore_hold_ms * 1000U);
         }
     }
 
@@ -222,9 +240,19 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
         uint64_t begin = nsec_now();
         err = config->task_fn(config->task_context, worker_id, slot->kind,
                               slot->task_id, slot->partition_id,
-                              slot->partition_count, slot_payload(slot),
+                              slot->partition_count, worker_state,
+                              &slot->binding, slot_payload(slot),
                               (size_t)slot->payload_len, &response);
         slot->task_ns = nsec_now() - begin;
+        if (err == 0 &&
+            (slot->binding.flags &
+             (MR_TEMPLATE_BIND_VALIDATED | MR_TEMPLATE_BIND_ROLE_MATCH |
+              MR_TEMPLATE_BIND_APP_CONSUMED | MR_TEMPLATE_BIND_REQUIRED)) !=
+                (MR_TEMPLATE_BIND_VALIDATED | MR_TEMPLATE_BIND_ROLE_MATCH |
+                 MR_TEMPLATE_BIND_APP_CONSUMED |
+                 MR_TEMPLATE_BIND_REQUIRED)) {
+            err = ENODATA;
+        }
     }
     if (session != NULL) {
         int collect_err = mr_cxlfork_restore_collect(session, &slot->restore);
@@ -447,6 +475,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
             reply.result.status = slot->status;
             reply.result.restore_ioctl_ns = slot->restore_ioctl_ns;
             reply.result.template_validate_ns = slot->template_validate_ns;
+            reply.result.binding = slot->binding;
             reply.result.restore = slot->restore;
 
             if (config.mode != MR_LAUNCH_PERSISTENT &&
@@ -591,6 +620,7 @@ int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
     slot->restore_ioctl_ns = 0;
     slot->template_validate_ns = 0;
     slot->task_ns = 0;
+    memset(&slot->binding, 0, sizeof(slot->binding));
     memset(&slot->restore, 0, sizeof(slot->restore));
     if (payload_len > 0) {
         memcpy(slot_payload(slot), payload, payload_len);

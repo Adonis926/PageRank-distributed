@@ -18,6 +18,8 @@ typedef int (*mr_porter_task_fn)(void *context, uint32_t worker_id,
                                  uint32_t kind, uint64_t task_id,
                                  uint64_t partition_id,
                                  uint64_t partition_count,
+                                 const MR_WorkerStateV1 *worker_state,
+                                 mr_template_binding_result *binding,
                                  const void *payload, size_t payload_len,
                                  byte_buf *response);
 
@@ -46,6 +48,7 @@ typedef struct mr_porter_result {
     uint64_t reap_ns;
     uint64_t refill_ns;
     uint64_t total_ns;
+    mr_template_binding_result binding;
     mr_cxlfork_result restore;
 } mr_porter_result;
 

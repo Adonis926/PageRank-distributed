@@ -63,6 +63,7 @@ Common distributed options:
   --template-base=N
   --template-bytes=N
   --template-seed=N
+  --template-value-scale=N
   --map-template-key=N --map-template-generation=N --map-template-checksum=N
   --reduce-template-key=N --reduce-template-generation=N --reduce-template-checksum=N
   --cxlfork-policy=readonly|mow|moa|hybrid
@@ -113,6 +114,7 @@ use_sudo=0
 template_base=87960930222080
 template_bytes=67108864
 template_seed=4852712463353924401
+template_value_scale=1
 map_template_key=0
 map_template_generation=0
 map_template_checksum=0
@@ -159,6 +161,7 @@ while (($#)); do
     --template-base=*) template_base=${1#*=} ;;
     --template-bytes=*) template_bytes=${1#*=} ;;
     --template-seed=*) template_seed=${1#*=} ;;
+    --template-value-scale=*) template_value_scale=${1#*=} ;;
     --map-template-key=*) map_template_key=${1#*=} ;;
     --map-template-generation=*) map_template_generation=${1#*=} ;;
     --map-template-checksum=*) map_template_checksum=${1#*=} ;;
@@ -195,6 +198,7 @@ if [[ "$schedule" == file:* ]]; then
 fi
 [[ "$cxlfork_policy" == readonly || "$cxlfork_policy" == mow || "$cxlfork_policy" == moa || "$cxlfork_policy" == hybrid ]] || die "invalid --cxlfork-policy"
 [[ "$validation" == fast || "$validation" == full ]] || die "--validation must be fast or full"
+[[ "$template_value_scale" =~ ^[0-9]+$ && "$template_value_scale" -ge 1 && "$template_value_scale" -le 1024 ]] || die "--template-value-scale must be in [1, 1024]"
 mkdir -p "$output_dir"/logs
 
 mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' | LC_ALL=C sort)
@@ -363,6 +367,7 @@ run_local_once() {
       --agent-count="$local_workers" \
       --workers="$workers_per_agent" \
       --role="$role" \
+      --template-value-scale="$template_value_scale" \
       --global-worker-base="$((i * workers_per_agent))" \
       --store-dir="$output_dir/store/agent${i}_${phase}_${index}" \
       --shuffle-backend="$shuffle_backend" \
@@ -546,7 +551,7 @@ run_ssh_once() {
        [[ "$key" == 0 || "$generation" == 0 || "$checksum" == 0 ]]; then
       die "cxlfork worker $i requires role-specific template key/generation/checksum"
     fi
-    remote_cmd "${worker_hosts[$i]}" "${privilege}'$binary' agent --backend='$backend' --path='${worker_paths[$i]}' --node-id='$i' --agent-count='${#worker_hosts[@]}' --workers='$count' --global-worker-base='$global_base' --role='$role' --launch='$launch' --template-base='$template_base' --template-bytes='$template_bytes' --template-seed='$template_seed' --template-key='$key' --template-generation='$generation' --template-page-checksum='$checksum' --cxlfork-policy='$cxlfork_policy' --validation='$validation' --store-dir='$remote_dir/store/agent${i}_${phase}_${index}' --shuffle-backend='$shuffle_backend' --shuffle-connections='$shuffle_connections' --queue-policy='$queue_policy' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
+    remote_cmd "${worker_hosts[$i]}" "${privilege}'$binary' agent --backend='$backend' --path='${worker_paths[$i]}' --node-id='$i' --agent-count='${#worker_hosts[@]}' --workers='$count' --global-worker-base='$global_base' --role='$role' --launch='$launch' --template-base='$template_base' --template-bytes='$template_bytes' --template-seed='$template_seed' --template-value-scale='$template_value_scale' --template-key='$key' --template-generation='$generation' --template-page-checksum='$checksum' --cxlfork-policy='$cxlfork_policy' --validation='$validation' --store-dir='$remote_dir/store/agent${i}_${phase}_${index}' --shuffle-backend='$shuffle_backend' --shuffle-connections='$shuffle_connections' --queue-policy='$queue_policy' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
     worker_pids+=("$!")
     global_base=$((global_base + count))
   done
@@ -604,26 +609,29 @@ warmup_csv="$output_dir/warmups.csv"
 task_csv="$output_dir/tasks.csv"
 printf 'index,run_ms,exit_status\n' > "$run_csv"
 printf 'index,run_ms,exit_status\n' > "$warmup_csv"
-printf 'phase,run_index,task_id,kind,node,worker,pid,status,roundtrip_ns,porter_total_ns,dispatch_ns,fork_ns,wakeup_ns,restore_ioctl_ns,template_validate_ns,task_ns,reap_ns,refill_ns,restore_id,path_mask,kernel_total_ns,shared_leaf_pages,fallback_pages,local_copy_pages,leaf_copy_pages\n' > "$task_csv"
+printf 'phase,run_index,task_id,kind,node,worker,pid,status,roundtrip_ns,porter_total_ns,dispatch_ns,fork_ns,wakeup_ns,restore_ioctl_ns,template_validate_ns,task_ns,reap_ns,refill_ns,restore_id,path_mask,kernel_total_ns,shared_leaf_pages,fallback_pages,local_copy_pages,leaf_copy_pages,template_state_checksum,template_access_checksum,template_access_count,template_state_pages,template_binding_flags\n' > "$task_csv"
 
 append_task_metrics() {
   local phase=$1 index=$2 log=$3
   [[ -f "$log" ]] || return 0
   awk -v phase="$phase" -v run="$index" '
-    $1 == "task_result_v1" {
+    $1 == "task_result_v2" {
       delete v
       for (i = 2; i <= NF; i++) {
         split($i, kv, "=")
         v[kv[1]] = kv[2]
       }
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
         phase, run, v["task"], v["kind"], v["node"], v["worker"],
         v["pid"], v["status"], v["roundtrip_ns"], v["porter_total_ns"],
         v["dispatch_ns"], v["fork_ns"], v["wakeup_ns"],
         v["restore_ioctl_ns"], v["template_validate_ns"], v["task_ns"],
         v["reap_ns"], v["refill_ns"], v["restore_id"], v["path_mask"],
         v["kernel_total_ns"], v["shared_leaf_pages"], v["fallback_pages"],
-        v["local_copy_pages"], v["leaf_copy_pages"]
+        v["local_copy_pages"], v["leaf_copy_pages"],
+        v["template_state_checksum"], v["template_access_checksum"],
+        v["template_access_count"], v["template_state_pages"],
+        v["template_binding_flags"]
     }
   ' "$log" >> "$task_csv"
 }
@@ -731,7 +739,7 @@ run_ms_p95=$(
 throughput_mib_s=$(awk -v bytes="$input_bytes" -v ms="$run_ms_avg" 'BEGIN { if (ms <= 0) print "0"; else printf "%.3f", bytes / 1048576 / (ms / 1000) }')
 agent_count=$([[ "$mode" == local ]] && printf '%s' "$local_workers" || printf '%s' "${#workers[@]}")
 worker_count=$((agent_count * workers_per_agent))
-details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};schedule=${schedule};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy};verify=${verify}"
+details="mode=${mode};backend=${backend};agents=${agent_count};workers=${worker_count};workers_per_agent=${workers_per_agent};reducers=${reducers:-$worker_count};schedule=${schedule};payload_max=${payload_max};map_chunk=${map_chunk:-auto};queue_capacity=${queue_capacity};size=${map_size};shuffle_connections=${shuffle_connections};queue_policy=${queue_policy};template_value_scale=${template_value_scale};verify=${verify}"
 
 cat > "$output_dir/result.env" <<EOF
 impl_name=distributed
@@ -775,6 +783,7 @@ cat > "$output_dir/result.json" <<EOF
   "size": $map_size,
   "shuffle_connections": $shuffle_connections,
   "queue_policy": "$queue_policy",
+  "template_value_scale": $template_value_scale,
   "verify": "$verify",
   "warmup": $warmup,
   "repeat": $repeat,

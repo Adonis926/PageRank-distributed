@@ -8,7 +8,7 @@
 
 #define MR_OP 100U
 #define MR_TASK_RESULT_MAGIC 0x4d525431U
-#define MR_TASK_RESULT_VERSION 1U
+#define MR_TASK_RESULT_VERSION 2U
 
 #define SHUFFLE_CHUNK_FIRST 0x1U
 #define SHUFFLE_CHUNK_LAST 0x2U
@@ -45,7 +45,7 @@ typedef struct ShuffleChunkHeader {
     uint32_t payload_bytes;
 } ShuffleChunkHeader;
 
-typedef struct mr_task_result_v1 {
+typedef struct mr_task_result_v2 {
     uint32_t magic;
     uint16_t size;
     uint16_t version;
@@ -71,13 +71,18 @@ typedef struct mr_task_result_v1 {
     uint64_t fallback_pages;
     uint64_t local_copy_pages;
     uint64_t leaf_copy_pages;
-    uint64_t reserved[4];
-} mr_task_result_v1;
+    uint64_t template_state_checksum;
+    uint64_t template_access_checksum;
+    uint64_t template_access_count;
+    uint64_t template_state_pages;
+    uint64_t template_binding_flags;
+    uint64_t reserved[3];
+} mr_task_result_v2;
 
 _Static_assert(sizeof(ShuffleChunkHeader) == 40,
                "ShuffleChunkHeader wire size must stay stable");
-_Static_assert(sizeof(mr_task_result_v1) == 200,
-               "mr_task_result_v1 wire size must stay stable");
+_Static_assert(sizeof(mr_task_result_v2) == 232,
+               "mr_task_result_v2 wire size must stay stable");
 
 byte_buf mr_wire_make(mr_task_kind kind, uint64_t task_id,
                       uint64_t partition_id, uint64_t partition_count,
