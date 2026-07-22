@@ -377,6 +377,8 @@ fi
 for port in "$VM0_PORT" "$VM1_PORT"; do
   guest "$port" "sudo dmesg" > "$RESULT_ROOT/system/after-vm${port}.log" 2>&1
 done
+printf 'analysis_mr_commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)" \
+  >> "$RESULT_ROOT/metadata.txt"
 python3 "$ROOT/scripts/analyze-motivation.py" "$RESULT_ROOT"
 python3 "$ROOT/scripts/check-motivation-results.py" "$RESULT_ROOT"
 trap - EXIT INT TERM

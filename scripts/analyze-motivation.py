@@ -373,20 +373,26 @@ def main() -> int:
                       if metric in row and int(row[metric]) >= 0]
             if not values:
                 continue
+            mean = statistics.fmean(values)
+            stdev = statistics.stdev(values) if len(values) > 1 else 0.0
+            margin = 1.96 * stdev / math.sqrt(len(values))
             summaries.append({
                 "scenario": scenario,
                 "metric": metric,
                 "n": len(values),
-                "mean": statistics.fmean(values),
-                "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
+                "mean": mean,
+                "stdev": stdev,
+                "ci95_low": mean - margin,
+                "ci95_high": mean + margin,
                 "p50": percentile(values, 0.50),
                 "p95": percentile(values, 0.95),
                 "p99": percentile(values, 0.99) if len(values) >= 500 else "",
                 "min": min(values),
                 "max": max(values),
             })
-    summary_fields = ["scenario", "metric", "n", "mean", "stdev", "p50",
-                      "p95", "p99", "min", "max"]
+    summary_fields = ["scenario", "metric", "n", "mean", "stdev",
+                      "ci95_low", "ci95_high", "p50", "p95", "p99", "min",
+                      "max"]
     with (root / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=summary_fields)
         writer.writeheader()
@@ -407,12 +413,17 @@ def main() -> int:
                   int(job.get("status", 1)) == 0]
         if not values:
             continue
+        mean = statistics.fmean(values)
+        stdev = statistics.stdev(values) if len(values) > 1 else 0.0
+        margin = 1.96 * stdev / math.sqrt(len(values))
         job_summaries.append({
             "scenario": group,
             "metric": "job_total_ns",
             "n": len(values),
-            "mean": statistics.fmean(values),
-            "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
+            "mean": mean,
+            "stdev": stdev,
+            "ci95_low": mean - margin,
+            "ci95_high": mean + margin,
             "p50": percentile(values, 0.50),
             "p95": percentile(values, 0.95),
             "p99": percentile(values, 0.99) if len(values) >= 500 else "",
@@ -435,6 +446,7 @@ def main() -> int:
             "VM. Cross-OS cost uses durations and the master-observed round trip."
         ),
         "p99_rule": "P99 is emitted only when a scenario has at least 500 samples.",
+        "ci95_rule": "CI95 uses mean +/- 1.96 * sample_stdev / sqrt(n).",
     }
     (root / "validation.json").write_text(
         json.dumps(validation, indent=2, sort_keys=True) + "\n",
