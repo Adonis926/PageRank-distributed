@@ -615,7 +615,7 @@ append_task_metrics() {
   local phase=$1 index=$2 log=$3
   [[ -f "$log" ]] || return 0
   awk -v phase="$phase" -v run="$index" '
-    $1 == "task_result_v2" {
+    $1 == "task_result_v3" {
       delete v
       for (i = 2; i <= NF; i++) {
         split($i, kv, "=")
@@ -623,11 +623,17 @@ append_task_metrics() {
       }
       printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
         phase, run, v["task"], v["kind"], v["node"], v["worker"],
-        v["pid"], v["status"], v["roundtrip_ns"], v["porter_total_ns"],
-        v["dispatch_ns"], v["fork_ns"], v["wakeup_ns"],
-        v["restore_ioctl_ns"], v["template_validate_ns"], v["task_ns"],
-        v["reap_ns"], v["refill_ns"], v["restore_id"], v["path_mask"],
-        v["kernel_total_ns"], v["shared_leaf_pages"], v["fallback_pages"],
+        v["pid"], v["status"], v["roundtrip_ns"],
+        v["agent_collect_ns"] - v["porter_submit_ns"],
+        v["supervisor_recv_ns"] - v["porter_submit_ns"],
+        v["fork_return_ns"] - v["fork_begin_ns"],
+        v["worker_entry_ns"] - v["slot_publish_ns"],
+        v["restore_wrapper_ns"], v["bind_end_ns"] - v["bind_begin_ns"],
+        v["task_done_ns"] - v["business_entry_ns"],
+        v["reap_end_ns"] - v["reap_begin_ns"],
+        v["refill_end_ns"] - v["refill_begin_ns"],
+        v["restore_id"], v["path_mask"],
+        v["kernel_total_ns"], v["shared_data_pages"], v["fallback_pages"],
         v["local_copy_pages"], v["leaf_copy_pages"],
         v["template_state_checksum"], v["template_access_checksum"],
         v["template_access_count"], v["template_state_pages"],

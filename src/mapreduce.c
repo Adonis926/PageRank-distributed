@@ -1762,6 +1762,7 @@ static void report_task_result_observed(
             " worker_observe_ns=%" PRIu64 " worker_entry_ns=%" PRIu64
             " restore_begin_ns=%" PRIu64 " restore_end_ns=%" PRIu64
             " resume_begin_ns=%" PRIu64 " resume_end_ns=%" PRIu64
+            " restore_postcheck_done_ns=%" PRIu64
             " bind_begin_ns=%" PRIu64 " bind_end_ns=%" PRIu64
             " state_ready_ns=%" PRIu64 " business_entry_ns=%" PRIu64
             " first_state_access_ns=%" PRIu64
@@ -1775,6 +1776,7 @@ static void report_task_result_observed(
             " reap_end_ns=%" PRIu64 " refill_begin_ns=%" PRIu64
             " refill_end_ns=%" PRIu64 " pool_ready_ns=%" PRIu64
             " agent_collect_ns=%" PRIu64
+            " response_encode_done_ns=%" PRIu64
             " restore_wrapper_ns=%" PRIu64
             " session_alloc_ns=%" PRIu64 " device_open_ns=%" PRIu64
             " query_caps_ns=%" PRIu64 " policy_check_ns=%" PRIu64
@@ -1782,6 +1784,8 @@ static void report_task_result_observed(
             " preopen_device_ns=%" PRIu64 " preopen_caps_ns=%" PRIu64
             " preopen_policy_ns=%" PRIu64 " restore_setup=%" PRIu64
             " restore_id=%" PRIu64 " path_mask=%" PRIu64
+            " template_key=%" PRIu64 " template_generation=%" PRIu64
+            " total_pages=%" PRIu64 " page_checksum=%" PRIu64
             " kernel_supported_mask=%" PRIu64
             " kernel_valid_mask=%" PRIu64
             " kernel_total_ns=%" PRIu64
@@ -1796,9 +1800,12 @@ static void report_task_result_observed(
             " kernel_dirty_prefault_ns=%" PRIu64
             " kernel_global_ns=%" PRIu64 " kernel_other_ns=%" PRIu64
             " faults=%" PRIu64 " fault_dispatch_ns=%" PRIu64
+            " leaf_materialize_ns=%" PRIu64 " data_cow_ns=%" PRIu64
             " cxl_copy_ns=%" PRIu64 " shared_leaf_count=%" PRIu64
             " shared_data_pages=%" PRIu64 " fallback_pages=%" PRIu64
+            " direct_pte_install_pages=%" PRIu64
             " local_copy_pages=%" PRIu64 " leaf_copy_pages=%" PRIu64
+            " dirty_prefault_pages=%" PRIu64 " validated_ptes=%" PRIu64
             " template_state_checksum=%" PRIu64
             " template_access_checksum=%" PRIu64
             " template_access_count=%" PRIu64
@@ -1821,6 +1828,7 @@ static void report_task_result_observed(
             result->trace.restore_wrapper_end_ns,
             result->trace.resume_ioctl_begin_ns,
             result->trace.resume_ioctl_end_ns,
+            result->trace.restore_postcheck_done_ns,
             result->trace.template_bind_begin_ns,
             result->trace.template_bind_end_ns,
             result->trace.state_ready_ns, result->trace.business_entry_ns,
@@ -1839,6 +1847,7 @@ static void report_task_result_observed(
             result->trace.reap_begin_ns, result->trace.reap_end_ns,
             result->trace.refill_begin_ns, result->trace.refill_end_ns,
             result->trace.pool_ready_ns, result->trace.agent_collect_done_ns,
+            result->trace.response_encode_done_ns,
             result->restore_wrapper_ns, result->session_alloc_ns,
             result->device_open_ns, result->query_caps_ns,
             result->policy_check_ns, result->resume_ioctl_ns,
@@ -1846,6 +1855,8 @@ static void report_task_result_observed(
             result->preopen_caps_ns, result->preopen_policy_ns,
             result->restore_setup_mode,
             result->restore_id, result->restore_path_mask,
+            result->template_key, result->template_generation,
+            result->total_pages, result->page_checksum,
             result->kernel.supported_mask, result->kernel.valid_mask,
             result->kernel.total_ns, result->kernel.lock_wait_ns,
             result->kernel.lifecycle_ns,
@@ -1862,12 +1873,17 @@ static void report_task_result_observed(
             result->kernel.dirty_prefault_ns,
             result->kernel.global_restore_ns, result->kernel.other_ns,
             result->kernel.faults, result->kernel.fault_dispatch_ns,
+            result->kernel.leaf_materialize_ns,
+            result->kernel.data_cow_ns,
             result->kernel.cxl_to_local_copy_ns,
             result->kernel.shared_leaf_count,
             result->kernel.shared_data_pages,
             result->kernel.fallback_pages,
+            result->kernel.direct_pte_install_pages,
             result->kernel.local_copy_pages,
             result->kernel.leaf_copy_pages,
+            result->kernel.dirty_prefault_pages,
+            result->kernel.validated_ptes,
             result->template_state_checksum,
             result->template_access_checksum,
             result->template_access_count, result->template_state_pages,
