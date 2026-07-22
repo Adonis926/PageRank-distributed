@@ -307,8 +307,21 @@ def validate_row(row: dict[str, int | str]) -> list[str]:
     if int(row.get("launch", 0)) == 3:
         if int(row.get("restore_id", 0)) == 0:
             errors.append(f"{label}: CXLfork restore_id is zero")
-        if int(row.get("shared_leaf_count", 0)) == 0:
-            errors.append(f"{label}: no shared leaf was attached")
+        policy = int(row.get("policy", -1))
+        if policy == 1 and int(row.get("shared_leaf_count", 0)) == 0:
+            errors.append(f"{label}: MoW did not attach a shared leaf")
+        if policy == 2 and (
+                int(row.get("faults", 0)) == 0 or
+                int(row.get("local_copy_pages", 0)) == 0 or
+                int(row.get("cxl_copy_ns", 0)) == 0):
+            errors.append(f"{label}: MoA has no fault-driven local-copy evidence")
+        if policy == 3 and (
+                int(row.get("shared_leaf_count", 0)) == 0 and
+                int(row.get("local_copy_pages", 0)) == 0 and
+                int(row.get("dirty_prefault_pages", 0)) == 0):
+            errors.append(
+                f"{label}: Hybrid selected neither shared, fault-copy nor prefault path"
+            )
         if int(row.get("kernel_unaccounted_ns", 1)) != 0:
             errors.append(f"{label}: kernel exclusive buckets do not sum to total")
     return errors

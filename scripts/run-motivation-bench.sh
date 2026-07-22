@@ -25,6 +25,7 @@ WORDCOUNT_MODES="localfork,cxlfork-preopen"
 WORDCOUNT_REPEATS=1
 GUEST_BIN=/tmp/mr_hydra
 BUILD=1
+RUN_ACTIVATION=1
 
 usage() {
   printf '%s\n' \
@@ -33,7 +34,7 @@ usage() {
     "  --modes=CSV --template-bytes-list=CSV" \
     "  --policy=mow|moa|hybrid|readonly --validation=fast|full" \
     "  --wordcount-input=FILE --wordcount-expected=FILE" \
-    "  --wordcount-modes=CSV --wordcount-repeats=N --no-build --smoke"
+    "  --wordcount-modes=CSV --wordcount-repeats=N --skip-activation --no-build --smoke"
 }
 
 for arg in "$@"; do
@@ -56,6 +57,7 @@ for arg in "$@"; do
     --wordcount-expected=*) WORDCOUNT_EXPECTED=${arg#*=} ;;
     --wordcount-modes=*) WORDCOUNT_MODES=${arg#*=} ;;
     --wordcount-repeats=*) WORDCOUNT_REPEATS=${arg#*=} ;;
+    --skip-activation) RUN_ACTIVATION=0 ;;
     --no-build) BUILD=0 ;;
     --smoke)
       SAMPLES=5
@@ -74,7 +76,7 @@ done
 [[ "$WARMUPS" =~ ^[0-9]+$ ]]
 [[ "$WORKERS" =~ ^[0-9]+$ && "$WORKERS" -gt 0 ]]
 [[ "$ACTIVATION_BLOCKS" =~ ^[0-9]+$ && "$ACTIVATION_BLOCKS" -gt 0 ]]
-((ACTIVATION_BLOCKS <= SAMPLES))
+((RUN_ACTIVATION == 0 || ACTIVATION_BLOCKS <= SAMPLES))
 [[ "$WORDCOUNT_REPEATS" =~ ^[0-9]+$ && "$WORDCOUNT_REPEATS" -gt 0 ]]
 [[ "$POLICY" == mow || "$POLICY" == moa || "$POLICY" == hybrid || "$POLICY" == readonly ]]
 [[ "$VALIDATION" == fast || "$VALIDATION" == full ]]
@@ -154,6 +156,7 @@ done
   printf 'kernel_commit=%s\n' "$(git -C "$CXLFORK_ROOT/kernel/linux-6.6.32" rev-parse HEAD)"
   printf 'samples=%s\nwarmups_per_block=%s\nworkers=%s\n' "$SAMPLES" "$WARMUPS" "$WORKERS"
   printf 'activation_blocks=%s\n' "$ACTIVATION_BLOCKS"
+  printf 'run_activation=%s\n' "$RUN_ACTIVATION"
   printf 'modes=%s\ntemplate_bytes_list=%s\n' "$MODES" "$TEMPLATE_BYTES_LIST"
   printf 'policy=%s\nvalidation=%s\n' "$POLICY" "$VALIDATION"
   printf 'wordcount_repeats=%s\n' "$WORDCOUNT_REPEATS"
@@ -207,16 +210,16 @@ start_agents() {
     reduce_template+=" --template-page-checksum='$TEMPLATE_CHECKSUM'"
   fi
   guest "$VM0_PORT" \
-    "sudo rm -rf /tmp/${scenario}-map; sudo sh -c 'nohup $GUEST_BIN agent --backend=ivshmem --path=/sys/bus/pci/devices/0000:00:02.0/resource2 --node-id=0 --agent-count=2 --workers=$WORKERS --role=map --launch=localfork --template-bytes=$bytes --store-dir=/tmp/${scenario}-map --size=$MAP_SIZE --payload-max=$PAYLOAD_MAX --queue-capacity=$QUEUE_CAPACITY --shuffle-connections=$WORKERS --queue-policy=shared_pair --quiet > /tmp/${scenario}-agent0.log 2>&1 &'"
+    "sudo rm -rf /tmp/${scenario}-map; sudo sh -c 'nohup $GUEST_BIN agent --backend=ivshmem --path=/sys/bus/pci/devices/0000:00:02.0/resource2 --node-id=0 --agent-count=2 --workers=$WORKERS --role=map --launch=localfork --template-bytes=$bytes --ready-file=/tmp/${scenario}-agent0.ready --store-dir=/tmp/${scenario}-map --size=$MAP_SIZE --payload-max=$PAYLOAD_MAX --queue-capacity=$QUEUE_CAPACITY --shuffle-connections=$WORKERS --queue-policy=shared_pair --quiet > /tmp/${scenario}-agent0.log 2>&1 &'"
   guest "$VM1_PORT" \
-    "sudo rm -rf /tmp/${scenario}-reduce; sudo sh -c 'nohup $GUEST_BIN agent --backend=ivshmem --path=/sys/bus/pci/devices/0000:00:03.0/resource2 --node-id=1 --agent-count=2 --workers=$WORKERS --global-worker-base=$WORKERS --role=reduce --launch=$launch $reduce_template --cxlfork-policy=$POLICY --validation=$VALIDATION --restore-setup=$setup --store-dir=/tmp/${scenario}-reduce --size=$MAP_SIZE --payload-max=$PAYLOAD_MAX --queue-capacity=$QUEUE_CAPACITY --shuffle-connections=$WORKERS --queue-policy=shared_pair --quiet > /tmp/${scenario}-agent1.log 2>&1 &'"
+    "sudo rm -rf /tmp/${scenario}-reduce; sudo sh -c 'nohup $GUEST_BIN agent --backend=ivshmem --path=/sys/bus/pci/devices/0000:00:03.0/resource2 --node-id=1 --agent-count=2 --workers=$WORKERS --global-worker-base=$WORKERS --role=reduce --launch=$launch $reduce_template --cxlfork-policy=$POLICY --validation=$VALIDATION --restore-setup=$setup --ready-file=/tmp/${scenario}-agent1.ready --store-dir=/tmp/${scenario}-reduce --size=$MAP_SIZE --payload-max=$PAYLOAD_MAX --queue-capacity=$QUEUE_CAPACITY --shuffle-connections=$WORKERS --queue-policy=shared_pair --quiet > /tmp/${scenario}-agent1.log 2>&1 &'"
   : > "$scenario_dir/agent0.log"
   : > "$scenario_dir/agent1.log"
 }
 
-wait_master_ready() {
-  local ready_file=$1
-  guest "$VM0_PORT" \
+wait_guest_ready() {
+  local port=$1 ready_file=$2
+  guest "$port" \
     "for i in \$(seq 1 1000); do sudo test -f '$ready_file' && exit 0; sleep 0.01; done; exit 1"
 }
 
@@ -245,13 +248,22 @@ run_probe_scenario() {
   fi
   stop_agents
   local ready_file="/tmp/${scenario}-master.ready"
-  guest "$VM0_PORT" "sudo rm -f '$ready_file'"
+  local start_file="/tmp/${scenario}-master.start"
+  guest "$VM0_PORT" "sudo rm -f '$ready_file' '$start_file' /tmp/${scenario}-agent0.ready"
+  guest "$VM1_PORT" "sudo rm -f /tmp/${scenario}-agent1.ready"
   guest "$VM0_PORT" \
-    "sudo '$GUEST_BIN' master --backend=ivshmem --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --workers-per-agent='$WORKERS' --activation-warmups='$WARMUPS' --activation-probes='$block_samples' --probe-agent=1 --probe-role=reduce --probe-state-checksum='$TEMPLATE_STATE_CHECKSUM' --ready-file='$ready_file' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
+    "sudo '$GUEST_BIN' master --backend=ivshmem --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --workers-per-agent='$WORKERS' --activation-warmups='$WARMUPS' --activation-probes='$block_samples' --probe-agent=1 --probe-role=reduce --probe-state-checksum='$TEMPLATE_STATE_CHECKSUM' --ready-file='$ready_file' --start-file='$start_file' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
     > "$scenario_dir/master.log" 2>&1 &
   local master_ssh_pid=$!
-  if wait_master_ready "$ready_file"; then
+  if wait_guest_ready "$VM0_PORT" "$ready_file"; then
     start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
+    wait_guest_ready "$VM0_PORT" "/tmp/${scenario}-agent0.ready" || rc=1
+    wait_guest_ready "$VM1_PORT" "/tmp/${scenario}-agent1.ready" || rc=1
+    if ((rc == 0)); then
+      guest "$VM0_PORT" "sudo touch '$start_file'"
+    else
+      stop_agents
+    fi
   else
     rc=1
     stop_agents
@@ -291,13 +303,22 @@ run_wordcount_scenario() {
   fi
   stop_agents
   local ready_file="/tmp/${scenario}-master.ready"
-  guest "$VM0_PORT" "sudo rm -f '$ready_file'"
+  local start_file="/tmp/${scenario}-master.start"
+  guest "$VM0_PORT" "sudo rm -f '$ready_file' '$start_file' /tmp/${scenario}-agent0.ready"
+  guest "$VM1_PORT" "sudo rm -f /tmp/${scenario}-agent1.ready"
   guest "$VM0_PORT" \
-    "sudo '$GUEST_BIN' master --backend=ivshmem --input=/tmp/motivation-wordcount-input.txt --output=/tmp/${scenario}-output.txt --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --schedule=role-static --workers-per-agent='$WORKERS' --reducers='$WORKERS' --ready-file='$ready_file' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
+    "sudo '$GUEST_BIN' master --backend=ivshmem --input=/tmp/motivation-wordcount-input.txt --output=/tmp/${scenario}-output.txt --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --schedule=role-static --workers-per-agent='$WORKERS' --reducers='$WORKERS' --ready-file='$ready_file' --start-file='$start_file' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
     > "$scenario_dir/master.log" 2>&1 &
   local master_ssh_pid=$!
-  if wait_master_ready "$ready_file"; then
+  if wait_guest_ready "$VM0_PORT" "$ready_file"; then
     start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
+    wait_guest_ready "$VM0_PORT" "/tmp/${scenario}-agent0.ready" || rc=1
+    wait_guest_ready "$VM1_PORT" "/tmp/${scenario}-agent1.ready" || rc=1
+    if ((rc == 0)); then
+      guest "$VM0_PORT" "sudo touch '$start_file'"
+    else
+      stop_agents
+    fi
   else
     rc=1
     stop_agents
@@ -323,15 +344,17 @@ IFS=, read -r -a byte_values <<< "$TEMPLATE_BYTES_LIST"
 IFS=, read -r -a mode_values <<< "$MODES"
 for bytes in "${byte_values[@]}"; do
   [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -ge 2097152 && $((bytes % 2097152)) -eq 0 ]]
-  for ((block = 0; block < ACTIVATION_BLOCKS; block++)); do
-    block_samples=$((SAMPLES / ACTIVATION_BLOCKS))
-    ((block < SAMPLES % ACTIVATION_BLOCKS)) && block_samples=$((block_samples + 1))
-    for ((position = 0; position < ${#mode_values[@]}; position++)); do
-      mode_index=$(((position + block) % ${#mode_values[@]}))
-      run_probe_scenario "${mode_values[$mode_index]}" "$bytes" \
-        "$block" "$block_samples"
+  if ((RUN_ACTIVATION)); then
+    for ((block = 0; block < ACTIVATION_BLOCKS; block++)); do
+      block_samples=$((SAMPLES / ACTIVATION_BLOCKS))
+      ((block < SAMPLES % ACTIVATION_BLOCKS)) && block_samples=$((block_samples + 1))
+      for ((position = 0; position < ${#mode_values[@]}; position++)); do
+        mode_index=$(((position + block) % ${#mode_values[@]}))
+        run_probe_scenario "${mode_values[$mode_index]}" "$bytes" \
+          "$block" "$block_samples"
+      done
     done
-  done
+  fi
 done
 
 if [[ -n "$WORDCOUNT_INPUT" ]]; then

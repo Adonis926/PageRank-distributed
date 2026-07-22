@@ -118,6 +118,7 @@ typedef struct master_args {
     const char *output;
     const char *schedule;
     const char *ready_file;
+    const char *start_file;
     uint64_t map_size;
     uint64_t queue_capacity;
     uint64_t payload_max;
@@ -152,6 +153,7 @@ typedef struct agent_args {
     mr_backend shuffle_backend;
     const char *path;
     const char *store_dir;
+    const char *ready_file;
     uint64_t node_id;
     uint64_t agent_count;
     uint64_t global_worker_base;
@@ -1424,6 +1426,19 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         return 1;
     }
 
+    if (args->ready_file != NULL) {
+        int ready_fd = open(args->ready_file,
+                            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (ready_fd < 0 || close(ready_fd) != 0) {
+            int ready_err = errno;
+            fprintf(stderr, "agent: create ready file failed: %s\n",
+                    strerror(ready_err));
+            hydra_close(ctx);
+            mr_porter_stop(porter);
+            return 1;
+        }
+    }
+
     if (!args->quiet) {
         printf("agent[%" PRIu64 "]: role=%s launch=%s workers=%" PRIu64
                " endpoint=%s store=%s\n",
@@ -2080,6 +2095,22 @@ static int run_master(const master_args *args)
             goto cleanup;
         }
     }
+    if (args->start_file != NULL) {
+        uint64_t deadline = hydra_now_ns() + UINT64_C(30000000000);
+
+        while (access(args->start_file, F_OK) != 0) {
+            if (errno != ENOENT) {
+                fprintf(stderr, "master: check start file failed: %s\n",
+                        strerror(errno));
+                goto cleanup;
+            }
+            if (hydra_now_ns() >= deadline) {
+                fprintf(stderr, "master: timed out waiting for start file\n");
+                goto cleanup;
+            }
+            usleep(1000);
+        }
+    }
 
     if (probe_only) {
         uint64_t total = args->activation_warmups + args->activation_probes;
@@ -2488,9 +2519,11 @@ static void usage(const char *argv0)
             "        [--probe-agent=N] [--probe-role=map|reduce]\n"
             "        [--probe-state-checksum=N]\n"
             "        [--ready-file=PATH] (runner synchronization)\n"
+            "        [--start-file=PATH] (runner synchronization)\n"
             "        [--connections=N]\n"
             "        [--queue-policy=shared_pair|per_connection]\n"
             "agent: [--store-dir=DIR] [--agent-count=N] [--global-worker-base=N]\n"
+            "       [--ready-file=PATH] (runner synchronization)\n"
             "       [--role=map|reduce|both]\n"
             "       [--launch=persistent|localfork|local-prefork|cxlfork]\n"
             "       [--template-base=N] [--template-bytes=N] [--template-seed=N]\n"
@@ -2529,6 +2562,8 @@ static int parse_master_args(master_args *args, int argc, char **argv)
             args->schedule = value;
         } else if ((value = arg_value(argv[i], "--ready-file=")) != NULL) {
             args->ready_file = value;
+        } else if ((value = arg_value(argv[i], "--start-file=")) != NULL) {
+            args->start_file = value;
         } else if ((value = arg_value(argv[i], "--agent=")) != NULL) {
             str_list_push(&args->agents, value);
         } else if ((value = arg_value(argv[i], "--agents=")) != NULL) {
@@ -2621,6 +2656,8 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
             args->global_worker_base = mr_parse_u64(value, "global-worker-base");
         } else if ((value = arg_value(argv[i], "--store-dir=")) != NULL) {
             args->store_dir = value;
+        } else if ((value = arg_value(argv[i], "--ready-file=")) != NULL) {
+            args->ready_file = value;
         } else if ((value = arg_value(argv[i], "--role=")) != NULL) {
             if (mr_role_parse(value, &args->role) != 0) {
                 fprintf(stderr, "invalid role: %s\n", value);
