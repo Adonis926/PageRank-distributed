@@ -21,8 +21,8 @@ def main() -> int:
     parser.add_argument("result_root", type=Path)
     args = parser.parse_args()
     root = args.result_root.resolve()
-    required = ["metadata.txt", "run-manifest.csv", "tasks.csv",
-                "summary.csv", "validation.json"]
+    required = ["metadata.txt", "run-manifest.csv", "tasks.csv", "jobs.csv",
+                "summary.csv", "job-summary.csv", "validation.json"]
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
         print("missing result files: " + ", ".join(missing))
@@ -36,10 +36,21 @@ def main() -> int:
                      if int(row.get("warmup", "0")) == 0)
     warmups = Counter(row["scenario"] for row in rows
                       if int(row.get("warmup", "0")) != 0)
+    with (root / "jobs.csv").open(newline="", encoding="utf-8") as stream:
+        jobs = list(csv.DictReader(stream))
+    job_counts = Counter(job["scenario"] for job in jobs)
 
     with (root / "run-manifest.csv").open(newline="", encoding="utf-8") as stream:
         for entry in csv.DictReader(stream):
             if entry["type"] != "probe":
+                scenario = entry["scenario"]
+                if job_counts[scenario] != 1:
+                    errors.append(
+                        f"{scenario}: WordCount job record count is {job_counts[scenario]}"
+                    )
+                output_diff = root / "raw" / scenario / "output.diff"
+                if not output_diff.is_file() or output_diff.stat().st_size != 0:
+                    errors.append(f"{scenario}: WordCount output is not verified")
                 continue
             scenario = entry["scenario"]
             expected = int(entry["expected_measured"])

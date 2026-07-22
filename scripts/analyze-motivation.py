@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 from pathlib import Path
 
@@ -34,6 +35,10 @@ DERIVED_FIELDS = [
     "master_response_consume_ns",
     "target_response_send_wall_ns",
     "cross_os_unassigned_ns",
+    "clock_offset_estimate_ns",
+    "cross_vm_delay_estimate_ns",
+    "one_way_estimate_ns",
+    "one_way_error_bound_ns",
     "kernel_accounted_ns",
     "kernel_unaccounted_ns",
     "kernel_roundtrip_fraction_ppm",
@@ -55,6 +60,8 @@ SUMMARY_METRICS = [
     "master_request_send_wall_ns",
     "target_response_send_wall_ns",
     "cross_os_unassigned_ns",
+    "cross_vm_delay_estimate_ns",
+    "one_way_estimate_ns",
 ]
 
 KERNEL_EXCLUSIVE_FIELDS = [
@@ -89,6 +96,25 @@ def parse_record(line: str, prefix: str) -> dict[str, int] | None:
         except ValueError:
             continue
     return record if "task" in record else None
+
+
+def parse_values(line: str, prefix: str) -> dict[str, int] | None:
+    if not line.startswith(prefix + " "):
+        return None
+    record: dict[str, int] = {}
+    for token in line.split()[1:]:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        try:
+            record[key] = int(value, 0)
+        except ValueError:
+            continue
+    return record
+
+
+def scenario_group(name: str) -> str:
+    return re.sub(r"_(?:run|block)[0-9]+$", "", name)
 
 
 def delta(record: dict[str, int], end: str, begin: str) -> int | None:
@@ -140,7 +166,11 @@ def load_scenario(directory: Path) -> list[dict[str, int | str]]:
 
     rows: list[dict[str, int | str]] = []
     for task_id, task in sorted(task_records.items()):
-        row: dict[str, int | str] = {"scenario": directory.name, **task}
+        row: dict[str, int | str] = {
+            "scenario": directory.name,
+            "scenario_group": scenario_group(directory.name),
+            **task,
+        }
         for key, value in hydra_records.get(task_id, {}).items():
             if key != "task":
                 row[f"hydra_{key}"] = value
@@ -200,6 +230,19 @@ def load_scenario(directory: Path) -> list[dict[str, int | str]]:
             row["kernel_roundtrip_fraction_ppm"] = (
                 kernel_total * 1_000_000 // roundtrip
             )
+
+        t1 = int(row.get("hydra_request_ready_ns", 0))
+        t2 = int(row.get("hydra_server_recv_ns", 0))
+        t3 = int(row.get("hydra_response_ready_ns", 0))
+        t4 = int(row.get("hydra_response_recv_ns", 0))
+        if t1 and t2 and t3 and t4 and t4 >= t1 and t3 >= t2:
+            network_delay = (t4 - t1) - (t3 - t2)
+            if network_delay >= 0:
+                offset = ((t2 - t1) + (t3 - t4)) // 2
+                row["clock_offset_estimate_ns"] = offset
+                row["cross_vm_delay_estimate_ns"] = network_delay
+                row["one_way_estimate_ns"] = network_delay // 2
+                row["one_way_error_bound_ns"] = network_delay // 2
         target_activation = int(row.get("target_to_state_ready_ns", 0))
         if target_activation:
             row["restore_target_activation_fraction_ppm"] = (
@@ -208,6 +251,21 @@ def load_scenario(directory: Path) -> list[dict[str, int | str]]:
             )
         rows.append(row)
     return rows
+
+
+def load_jobs(directory: Path) -> list[dict[str, int | str]]:
+    jobs: list[dict[str, int | str]] = []
+    for path in sorted(directory.glob("master*.log")):
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                record = parse_values(line, "master_job_v1")
+                if record is not None:
+                    jobs.append({
+                        "scenario": directory.name,
+                        "scenario_group": scenario_group(directory.name),
+                        **record,
+                    })
+    return jobs
 
 
 def validate_row(row: dict[str, int | str]) -> list[str]:
@@ -267,14 +325,17 @@ def main() -> int:
         parser.error(f"missing raw directory: {raw}")
 
     rows: list[dict[str, int | str]] = []
+    jobs: list[dict[str, int | str]] = []
     for scenario in sorted(path for path in raw.iterdir() if path.is_dir()):
         rows.extend(load_scenario(scenario))
+        jobs.extend(load_jobs(scenario))
     if not rows:
         parser.error("no task_result_v3 records found")
 
     errors = [error for row in rows for error in validate_row(row)]
-    fixed = ["scenario", "task", "kind", "warmup", "launch", "policy",
-             "validation", "status", "node", "worker", "pid"]
+    fixed = ["scenario", "scenario_group", "task", "kind", "warmup",
+             "launch", "policy", "validation", "status", "node", "worker",
+             "pid"]
     all_fields = {str(key) for row in rows for key in row}
     fieldnames = fixed + [name for name in DERIVED_FIELDS if name not in fixed]
     fieldnames += sorted(all_fields - set(fieldnames))
@@ -285,9 +346,9 @@ def main() -> int:
         writer.writerows(rows)
 
     summaries: list[dict[str, int | float | str]] = []
-    for scenario in sorted({str(row["scenario"]) for row in rows}):
+    for scenario in sorted({str(row["scenario_group"]) for row in rows}):
         selected = [row for row in rows
-                    if row["scenario"] == scenario and
+                    if row["scenario_group"] == scenario and
                     int(row.get("warmup", 0)) == 0 and
                     int(row.get("status", 1)) == 0]
         for metric in SUMMARY_METRICS:
@@ -314,10 +375,43 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(summaries)
 
+    job_fields = ["scenario", "scenario_group", "status", "begin_ns",
+                  "end_ns", "total_ns", "map_tasks", "reducers"]
+    with (root / "jobs.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=job_fields,
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(jobs)
+
+    job_summaries: list[dict[str, int | float | str]] = []
+    for group in sorted({str(job["scenario_group"]) for job in jobs}):
+        values = [int(job["total_ns"]) for job in jobs
+                  if job["scenario_group"] == group and
+                  int(job.get("status", 1)) == 0]
+        if not values:
+            continue
+        job_summaries.append({
+            "scenario": group,
+            "metric": "job_total_ns",
+            "n": len(values),
+            "mean": statistics.fmean(values),
+            "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
+            "p50": percentile(values, 0.50),
+            "p95": percentile(values, 0.95),
+            "p99": percentile(values, 0.99) if len(values) >= 500 else "",
+            "min": min(values),
+            "max": max(values),
+        })
+    with (root / "job-summary.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=summary_fields)
+        writer.writeheader()
+        writer.writerows(job_summaries)
+
     validation = {
         "format": "cxlfork-motivation-validation-v1",
         "tasks": len(rows),
         "measured_tasks": sum(int(row.get("warmup", 0)) == 0 for row in rows),
+        "jobs": len(jobs),
         "validation_errors": errors,
         "clock_rule": (
             "Absolute CLOCK_MONOTONIC timestamps are compared only inside one "

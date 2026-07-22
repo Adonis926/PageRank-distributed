@@ -10,6 +10,7 @@ SSH_PASSWORD=123
 SAMPLES=1000
 WARMUPS=50
 WORKERS=4
+ACTIVATION_BLOCKS=10
 MODES="persistent,localfork,local-prefork,cxlfork-preopen,cxlfork-per-request"
 TEMPLATE_BYTES_LIST=4194304
 TEMPLATE_KEY=2026072201
@@ -21,17 +22,18 @@ QUEUE_CAPACITY=4096
 WORDCOUNT_INPUT=""
 WORDCOUNT_EXPECTED=""
 WORDCOUNT_MODES="localfork,cxlfork-preopen"
+WORDCOUNT_REPEATS=1
 GUEST_BIN=/tmp/mr_hydra
 BUILD=1
 
 usage() {
   printf '%s\n' \
     "usage: $0 --output-dir=DIR [options]" \
-    "  --samples=N --warmups=N --workers=N" \
+    "  --samples=N --warmups=N --workers=N --activation-blocks=N" \
     "  --modes=CSV --template-bytes-list=CSV" \
     "  --policy=mow|moa|hybrid|readonly --validation=fast|full" \
     "  --wordcount-input=FILE --wordcount-expected=FILE" \
-    "  --wordcount-modes=CSV --no-build --smoke"
+    "  --wordcount-modes=CSV --wordcount-repeats=N --no-build --smoke"
 }
 
 for arg in "$@"; do
@@ -40,6 +42,7 @@ for arg in "$@"; do
     --samples=*) SAMPLES=${arg#*=} ;;
     --warmups=*) WARMUPS=${arg#*=} ;;
     --workers=*) WORKERS=${arg#*=} ;;
+    --activation-blocks=*) ACTIVATION_BLOCKS=${arg#*=} ;;
     --modes=*) MODES=${arg#*=} ;;
     --template-bytes-list=*) TEMPLATE_BYTES_LIST=${arg#*=} ;;
     --template-key=*) TEMPLATE_KEY=${arg#*=} ;;
@@ -52,11 +55,13 @@ for arg in "$@"; do
     --wordcount-input=*) WORDCOUNT_INPUT=${arg#*=} ;;
     --wordcount-expected=*) WORDCOUNT_EXPECTED=${arg#*=} ;;
     --wordcount-modes=*) WORDCOUNT_MODES=${arg#*=} ;;
+    --wordcount-repeats=*) WORDCOUNT_REPEATS=${arg#*=} ;;
     --no-build) BUILD=0 ;;
     --smoke)
       SAMPLES=5
       WARMUPS=2
       WORKERS=2
+      ACTIVATION_BLOCKS=1
       MODES="persistent,cxlfork-preopen"
       ;;
     -h|--help) usage; exit 0 ;;
@@ -68,6 +73,9 @@ done
 [[ "$SAMPLES" =~ ^[0-9]+$ && "$SAMPLES" -gt 0 ]]
 [[ "$WARMUPS" =~ ^[0-9]+$ ]]
 [[ "$WORKERS" =~ ^[0-9]+$ && "$WORKERS" -gt 0 ]]
+[[ "$ACTIVATION_BLOCKS" =~ ^[0-9]+$ && "$ACTIVATION_BLOCKS" -gt 0 ]]
+((ACTIVATION_BLOCKS <= SAMPLES))
+[[ "$WORDCOUNT_REPEATS" =~ ^[0-9]+$ && "$WORDCOUNT_REPEATS" -gt 0 ]]
 [[ "$POLICY" == mow || "$POLICY" == moa || "$POLICY" == hybrid || "$POLICY" == readonly ]]
 [[ "$VALIDATION" == fast || "$VALIDATION" == full ]]
 if [[ -n "$WORDCOUNT_INPUT" || -n "$WORDCOUNT_EXPECTED" ]]; then
@@ -144,9 +152,11 @@ done
   printf 'mr_commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
   printf 'main_commit=%s\n' "$(git -C "$CXLFORK_ROOT" rev-parse HEAD)"
   printf 'kernel_commit=%s\n' "$(git -C "$CXLFORK_ROOT/kernel/linux-6.6.32" rev-parse HEAD)"
-  printf 'samples=%s\nwarmups=%s\nworkers=%s\n' "$SAMPLES" "$WARMUPS" "$WORKERS"
+  printf 'samples=%s\nwarmups_per_block=%s\nworkers=%s\n' "$SAMPLES" "$WARMUPS" "$WORKERS"
+  printf 'activation_blocks=%s\n' "$ACTIVATION_BLOCKS"
   printf 'modes=%s\ntemplate_bytes_list=%s\n' "$MODES" "$TEMPLATE_BYTES_LIST"
   printf 'policy=%s\nvalidation=%s\n' "$POLICY" "$VALIDATION"
+  printf 'wordcount_repeats=%s\n' "$WORDCOUNT_REPEATS"
   printf 'clock_contract=never subtract absolute CLOCK_MONOTONIC timestamps from different VMs\n'
 } > "$RESULT_ROOT/metadata.txt"
 printf 'scenario,type,expected_measured,expected_warmup,mode,template_bytes,policy,validation\n' \
@@ -212,11 +222,13 @@ collect_agent_logs() {
 }
 
 run_probe_scenario() {
-  local mode=$1 bytes=$2 parsed launch setup scenario scenario_dir rc=0
+  local mode=$1 bytes=$2 block=$3 block_samples=$4
+  local parsed launch setup scenario scenario_dir rc=0
   parsed=$(mode_args "$mode")
   launch=${parsed%%$'\t'*}
   setup=${parsed#*$'\t'}
-  scenario="probe_${mode//-/_}_${bytes}"
+  printf -v scenario 'probe_%s_%s_block%02d' \
+    "${mode//-/_}" "$bytes" "$block"
   scenario_dir="$RESULT_ROOT/raw/$scenario"
   mkdir -p "$scenario_dir"
   if [[ "$launch" == cxlfork ]]; then
@@ -228,29 +240,30 @@ run_probe_scenario() {
   fi
   start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
   guest "$VM0_PORT" \
-    "sudo '$GUEST_BIN' master --backend=ivshmem --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --workers-per-agent='$WORKERS' --activation-warmups='$WARMUPS' --activation-probes='$SAMPLES' --probe-agent=1 --probe-role=reduce --probe-state-checksum='$TEMPLATE_STATE_CHECKSUM' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
+    "sudo '$GUEST_BIN' master --backend=ivshmem --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --workers-per-agent='$WORKERS' --activation-warmups='$WARMUPS' --activation-probes='$block_samples' --probe-agent=1 --probe-role=reduce --probe-state-checksum='$TEMPLATE_STATE_CHECKSUM' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
     > "$scenario_dir/master.log" 2>&1 || rc=$?
   collect_agent_logs "$scenario" "$scenario_dir"
   if [[ "$launch" == cxlfork ]]; then
     release_template "$scenario_dir/template-release.log" || rc=$?
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$scenario" probe "$SAMPLES" "$WARMUPS" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$scenario" probe "$block_samples" "$WARMUPS" \
     "$mode" "$bytes" "$POLICY" "$VALIDATION" >> "$RESULT_ROOT/run-manifest.csv"
   ((rc == 0)) || { printf 'scenario failed: %s\n' "$scenario" >&2; return "$rc"; }
   local got
   got=$(grep -c '^task_result_v3 ' "$scenario_dir/master.log" || true)
-  [[ "$got" -eq $((SAMPLES + WARMUPS)) ]] || {
-    printf '%s: expected %s task records, got %s\n' "$scenario" "$((SAMPLES + WARMUPS))" "$got" >&2
+  [[ "$got" -eq $((block_samples + WARMUPS)) ]] || {
+    printf '%s: expected %s task records, got %s\n' "$scenario" "$((block_samples + WARMUPS))" "$got" >&2
     return 1
   }
 }
 
 run_wordcount_scenario() {
-  local mode=$1 bytes=$2 parsed launch setup scenario scenario_dir rc=0
+  local mode=$1 bytes=$2 run_index=$3 parsed launch setup scenario scenario_dir rc=0
   parsed=$(mode_args "$mode")
   launch=${parsed%%$'\t'*}
   setup=${parsed#*$'\t'}
-  scenario="wordcount_${mode//-/_}_${bytes}"
+  printf -v scenario 'wordcount_%s_%s_run%03d' \
+    "${mode//-/_}" "$bytes" "$run_index"
   scenario_dir="$RESULT_ROOT/raw/$scenario"
   mkdir -p "$scenario_dir"
   copy_to_guest "$VM0_PORT" "$WORDCOUNT_INPUT" /tmp/motivation-wordcount-input.txt
@@ -285,15 +298,31 @@ IFS=, read -r -a byte_values <<< "$TEMPLATE_BYTES_LIST"
 IFS=, read -r -a mode_values <<< "$MODES"
 for bytes in "${byte_values[@]}"; do
   [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -ge 2097152 && $((bytes % 2097152)) -eq 0 ]]
-  for mode in "${mode_values[@]}"; do
-    run_probe_scenario "$mode" "$bytes"
+  for ((block = 0; block < ACTIVATION_BLOCKS; block++)); do
+    block_samples=$((SAMPLES / ACTIVATION_BLOCKS))
+    ((block < SAMPLES % ACTIVATION_BLOCKS)) && block_samples=$((block_samples + 1))
+    for ((position = 0; position < ${#mode_values[@]}; position++)); do
+      mode_index=$(((position + block) % ${#mode_values[@]}))
+      run_probe_scenario "${mode_values[$mode_index]}" "$bytes" \
+        "$block" "$block_samples"
+    done
   done
 done
 
 if [[ -n "$WORDCOUNT_INPUT" ]]; then
   IFS=, read -r -a wordcount_mode_values <<< "$WORDCOUNT_MODES"
-  for mode in "${wordcount_mode_values[@]}"; do
-    run_wordcount_scenario "$mode" "${byte_values[0]}"
+  for ((run_index = 0; run_index < WORDCOUNT_REPEATS; run_index++)); do
+    if ((run_index % 2 == 0)); then
+      for mode in "${wordcount_mode_values[@]}"; do
+        run_wordcount_scenario "$mode" "${byte_values[0]}" "$run_index"
+      done
+    else
+      for ((mode_index = ${#wordcount_mode_values[@]} - 1;
+            mode_index >= 0; mode_index--)); do
+        run_wordcount_scenario "${wordcount_mode_values[$mode_index]}" \
+          "${byte_values[0]}" "$run_index"
+      done
+    fi
   done
 fi
 

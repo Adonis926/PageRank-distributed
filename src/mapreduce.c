@@ -2050,6 +2050,8 @@ static int run_master(const master_args *args)
     bool use_role_static = false;
     mr_partitions final_output = {0};
     bool final_init = false;
+    uint64_t workflow_begin_ns = 0;
+    size_t slice_count = 0;
     int rc = 1;
 
     agents = mr_xcalloc(args->agents.len, sizeof(agents[0]));
@@ -2108,6 +2110,8 @@ static int run_master(const master_args *args)
         goto cleanup;
     }
 
+    workflow_begin_ns = hydra_now_ns();
+
     size_t input_len = 0;
     input = read_file(args->input, &input_len);
     if (input == NULL) {
@@ -2117,7 +2121,6 @@ static int run_master(const master_args *args)
     if (chunk_size == 0 || chunk_size > max_body - sizeof(control_map_task)) {
         chunk_size = max_body - sizeof(control_map_task);
     }
-    size_t slice_count = 0;
     slices = make_slices(input, input_len, chunk_size, &slice_count);
 
     if (args->schedule != NULL && strcmp(args->schedule, "role-static") == 0) {
@@ -2416,6 +2419,16 @@ static int run_master(const master_args *args)
     rc = mr_partitions_write_text(&final_output, args->output);
 
 cleanup:
+    if (workflow_begin_ns != 0) {
+        uint64_t workflow_end_ns = hydra_now_ns();
+        fprintf(stderr,
+                "master_job_v1 status=%d begin_ns=%" PRIu64
+                " end_ns=%" PRIu64 " total_ns=%" PRIu64
+                " map_tasks=%zu reducers=%d\n",
+                rc, workflow_begin_ns, workflow_end_ns,
+                workflow_end_ns - workflow_begin_ns, slice_count,
+                reducer_count);
+    }
     if (agents != NULL) {
         for (size_t i = 0; i < args->agents.len; i++) {
             if (agents[i].ctx != NULL) {
