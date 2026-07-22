@@ -360,6 +360,10 @@ def main() -> int:
 
     summaries: list[dict[str, int | float | str]] = []
     for scenario in sorted({str(row["scenario_group"]) for row in rows}):
+        if scenario.startswith("wordcount_"):
+            # Map and reduce tasks in one job are heterogeneous and clustered.
+            # Job-level repetition is summarized exclusively in job-summary.csv.
+            continue
         selected = [row for row in rows
                     if row["scenario_group"] == scenario and
                     int(row.get("warmup", 0)) == 0 and
