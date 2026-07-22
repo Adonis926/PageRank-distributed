@@ -124,6 +124,11 @@ typedef struct master_args {
     uint64_t reducers;
     uint64_t connections;
     uint64_t workers_per_agent;
+    uint64_t activation_probes;
+    uint64_t activation_warmups;
+    uint64_t probe_agent;
+    uint64_t probe_state_checksum;
+    mr_worker_role probe_role;
     mr_queue_policy queue_policy;
     bool quiet;
 } master_args;
@@ -168,6 +173,7 @@ typedef struct agent_args {
     mr_cxlfork_policy cxlfork_policy;
     uint64_t restore_hold_ms;
     bool validate_full;
+    bool restore_preopen;
     bool create;
     bool quiet;
 } agent_args;
@@ -197,6 +203,7 @@ static const MR_WorkerStateV1 *current_worker_state;
 static uint64_t current_worker_state_access_checksum;
 static uint64_t current_worker_state_access_count;
 static int current_worker_state_error;
+static mr_task_trace_v3 *current_task_trace;
 
 static const char *arg_value(const char *arg, const char *prefix)
 {
@@ -559,6 +566,10 @@ const MR_WorkerStateV1 *MR_GetWorkerState(void)
         return NULL;
     }
     current_worker_state_access_count++;
+    if (current_task_trace != NULL &&
+        current_task_trace->first_state_access_ns == 0) {
+        current_task_trace->first_state_access_ns = hydra_now_ns();
+    }
     current_worker_state_access_checksum ^=
         current_worker_state->checksum + UINT64_C(0x9e3779b97f4a7c15) +
         (current_worker_state_access_count << 6) +
@@ -574,14 +585,14 @@ void MR_TaskFail(int error)
 }
 
 static void begin_worker_state(const MR_WorkerStateV1 *state,
-                               uint32_t kind)
+                               mr_worker_role expected_role,
+                               mr_task_trace_v3 *trace)
 {
     current_worker_state = state;
     current_worker_state_access_checksum = 0;
     current_worker_state_access_count = 0;
     current_worker_state_error = 0;
-    uint32_t expected_role =
-        kind == MR_TASK_MAP ? MR_WORKER_ROLE_MAP : MR_WORKER_ROLE_REDUCE;
+    current_task_trace = trace;
     if (state == NULL ||
         (state->role != MR_WORKER_ROLE_BOTH &&
          state->role != expected_role)) {
@@ -606,6 +617,7 @@ static int finish_worker_state(mr_template_binding_result *binding)
     current_worker_state_access_checksum = 0;
     current_worker_state_access_count = 0;
     current_worker_state_error = 0;
+    current_task_trace = NULL;
     return err;
 }
 
@@ -652,17 +664,35 @@ static byte_buf make_wire(mr_task_kind kind, uint64_t task_id,
     return mr_wire_make(kind, task_id, partition_id, partition_count, data, len);
 }
 
+static int send_hydra_request_observed(
+    hydra_ctx *ctx, mr_task_kind kind, uint64_t task_id,
+    uint64_t partition_id, uint64_t partition_count,
+    const void *data, size_t len, mr_hydra_send_observation *observation);
+
 static int send_hydra_request(hydra_ctx *ctx, mr_task_kind kind, uint64_t task_id,
                               uint64_t partition_id, uint64_t partition_count,
                               const void *data, size_t len)
 {
+    return send_hydra_request_observed(ctx, kind, task_id, partition_id,
+                                       partition_count, data, len, NULL);
+}
+
+static int send_hydra_request_observed(
+    hydra_ctx *ctx, mr_task_kind kind, uint64_t task_id,
+    uint64_t partition_id, uint64_t partition_count,
+    const void *data, size_t len, mr_hydra_send_observation *observation)
+{
     byte_buf wire = make_wire(kind, task_id, partition_id, partition_count, data, len);
-    int err = mr_hydra_send_request_poll(ctx, task_id, &wire);
+    int err = mr_hydra_send_request_poll_observed(
+        ctx, task_id, &wire, observation);
     byte_buf_clear(&wire);
     return err;
 }
 
-static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr, byte_buf *body)
+static int recv_hydra_response_observed(hydra_ctx *ctx, mr_wire_header *hdr,
+                                        byte_buf *body, hydra_msg *message_out,
+                                        uint64_t *receive_ns,
+                                        uint64_t *release_done_ns)
 {
     for (;;) {
         uint64_t offset = 0;
@@ -676,6 +706,12 @@ static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr, byte_buf *bo
         if (err != 0) {
             return err;
         }
+        if (receive_ns != NULL) {
+            *receive_ns = hydra_now_ns();
+        }
+        if (message_out != NULL) {
+            *message_out = *msg;
+        }
 
         const char *wire_body = NULL;
         size_t wire_body_len = 0;
@@ -685,6 +721,9 @@ static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr, byte_buf *bo
         }
         uint32_t status = msg->status;
         int release_err = hydra_release_message(ctx, offset);
+        if (release_done_ns != NULL) {
+            *release_done_ns = hydra_now_ns();
+        }
         if (release_err != 0) {
             return release_err;
         }
@@ -692,8 +731,9 @@ static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr, byte_buf *bo
             return err;
         }
         if (status != 0 &&
-            (hdr->kind == MR_TASK_MAP || hdr->kind == MR_TASK_REDUCE) &&
-            body->len >= sizeof(mr_task_result_v2)) {
+            (hdr->kind == MR_TASK_MAP || hdr->kind == MR_TASK_REDUCE ||
+             hdr->kind == MR_TASK_ACTIVATION_PROBE) &&
+            body->len >= sizeof(mr_task_result_v3)) {
             /*
              * Porter failures still carry a versioned measurement envelope.
              * Let the caller unwrap and report it instead of printing binary
@@ -709,6 +749,12 @@ static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr, byte_buf *bo
         }
         return 0;
     }
+}
+
+static int recv_hydra_response(hydra_ctx *ctx, mr_wire_header *hdr,
+                               byte_buf *body)
+{
+    return recv_hydra_response_observed(ctx, hdr, body, NULL, NULL, NULL);
 }
 
 static int write_partition_file(const char *path, const byte_buf *data)
@@ -769,13 +815,17 @@ static int append_file_range(FILE *out, const char *path, uint64_t offset,
 static int worker_do_map(const worker_child_args *args, Mapper map,
                          Partitioner partitioner, const char *data, size_t len,
                          uint64_t job_id, uint64_t map_task_id,
-                         int reducer_count, byte_buf *out)
+                         int reducer_count, byte_buf *out,
+                         mr_task_trace_v3 *trace)
 {
     mr_partitions partitions = {0};
     mr_partitions_init(&partitions, reducer_count);
     set_emit_context(EMIT_MAP, &partitions, partitioner);
+    trace->first_callback_entry_ns = hydra_now_ns();
     map(data, len);
+    trace->callback_region_end_ns = hydra_now_ns();
     clear_emit_context();
+    trace->serialize_begin_ns = hydra_now_ns();
     mr_partitions_combine_counts(&partitions);
 
     control_locations_header header = {.count = (uint64_t)reducer_count};
@@ -825,6 +875,7 @@ static int worker_do_map(const worker_child_args *args, Mapper map,
     }
 
     mr_partitions_destroy(&partitions);
+    trace->serialize_end_ns = hydra_now_ns();
     return 0;
 }
 
@@ -923,7 +974,8 @@ static int shuffle_fetch_remote(const worker_child_args *args,
 static int worker_do_reduce(const worker_child_args *args, Reducer reduce,
                             uint32_t reducer_id, uint32_t reducer_count,
                             const IntermediateLocation *locations,
-                            size_t location_count, byte_buf *out)
+                            size_t location_count, byte_buf *out,
+                            mr_task_trace_v3 *trace)
 {
     char spill_path[MR_PATH_MAX];
     int n = snprintf(spill_path, sizeof(spill_path),
@@ -932,6 +984,7 @@ static int worker_do_reduce(const worker_child_args *args, Reducer reduce,
     if (n < 0 || (size_t)n >= sizeof(spill_path)) {
         return ENAMETOOLONG;
     }
+    trace->shuffle_begin_ns = hydra_now_ns();
     FILE *spill = fopen(spill_path, "wb");
     if (spill == NULL) {
         return errno;
@@ -954,7 +1007,9 @@ static int worker_do_reduce(const worker_child_args *args, Reducer reduce,
         }
     }
     fclose(spill);
+    trace->shuffle_end_ns = hydra_now_ns();
 
+    trace->parse_sort_begin_ns = hydra_now_ns();
     size_t spill_len = 0;
     char *spill_data = read_file(spill_path, &spill_len);
     if (spill_data == NULL) {
@@ -969,22 +1024,29 @@ static int worker_do_reduce(const worker_child_args *args, Reducer reduce,
     free(spill_data);
     if (err == 0) {
         mr_partitions_sort(&input);
+        trace->parse_sort_end_ns = hydra_now_ns();
         current_reduce_input = &input;
         current_reduce_partition_number = (int)reducer_id;
         set_emit_context(EMIT_REDUCE, &output, MR_DefaultHashPartition);
         mr_partition *partition = &input.items[0];
         while (partition->cursor < partition->len) {
             char *key = partition->pairs[partition->cursor].key;
+            if (trace->first_callback_entry_ns == 0) {
+                trace->first_callback_entry_ns = hydra_now_ns();
+            }
             reduce(key, reduce_get_next, (int)reducer_id);
             while (partition->cursor < partition->len &&
                    strcmp(partition->pairs[partition->cursor].key, key) == 0) {
                 partition->cursor++;
             }
         }
+        trace->callback_region_end_ns = hydra_now_ns();
         clear_emit_context();
         current_reduce_input = NULL;
         current_reduce_partition_number = 0;
+        trace->serialize_begin_ns = hydra_now_ns();
         err = mr_partitions_serialize(&output, out, 0);
+        trace->serialize_end_ns = hydra_now_ns();
     }
     mr_partitions_destroy(&output);
     mr_partitions_destroy(&input);
@@ -1060,7 +1122,7 @@ static int porter_execute_task(void *context, uint32_t worker_id,
                                const MR_WorkerStateV1 *worker_state,
                                mr_template_binding_result *binding,
                                const void *payload, size_t payload_len,
-                               byte_buf *out)
+                               byte_buf *out, mr_task_trace_v3 *trace)
 {
     (void)task_id;
     (void)partition_id;
@@ -1069,7 +1131,14 @@ static int porter_execute_task(void *context, uint32_t worker_id,
     args.worker_id = worker_id;
     args.global_worker_id = args.global_worker_base + worker_id;
     (void)mkdir_p(args.store_dir);
-    begin_worker_state(worker_state, kind);
+    mr_worker_role expected_role =
+        kind == MR_TASK_MAP ? MR_ROLE_MAP : MR_ROLE_REDUCE;
+    if (kind == MR_TASK_ACTIVATION_PROBE &&
+        payload_len >= sizeof(mr_activation_probe_request)) {
+        const mr_activation_probe_request *probe = payload;
+        expected_role = (mr_worker_role)probe->expected_role;
+    }
+    begin_worker_state(worker_state, expected_role, trace);
     int err = 0;
 
     if (kind == MR_TASK_MAP) {
@@ -1086,7 +1155,8 @@ static int porter_execute_task(void *context, uint32_t worker_id,
         }
         err = worker_do_map(&args, args.map, args.partitioner, data,
                             (size_t)task.data_len, task.job_id,
-                            task.map_task_id, (int)task.reducer_count, out);
+                            task.map_task_id, (int)task.reducer_count, out,
+                            trace);
     } else if (kind == MR_TASK_REDUCE) {
         if (payload_len < sizeof(control_reduce_task)) {
             err = EINVAL;
@@ -1104,7 +1174,37 @@ static int porter_execute_task(void *context, uint32_t worker_id,
             (const IntermediateLocation *)((const char *)payload + sizeof(task));
         err = worker_do_reduce(&args, args.reduce, task.reducer_id,
                                task.reducer_count, locs,
-                               (size_t)task.location_count, out);
+                               (size_t)task.location_count, out, trace);
+    } else if (kind == MR_TASK_ACTIVATION_PROBE) {
+        if (payload_len != sizeof(mr_activation_probe_request)) {
+            err = EINVAL;
+            goto out;
+        }
+        const mr_activation_probe_request *probe = payload;
+        if (probe->reserved0 != 0 || probe->reserved1[0] != 0 ||
+            probe->reserved1[1] != 0 ||
+            (probe->expected_role != MR_ROLE_MAP &&
+             probe->expected_role != MR_ROLE_REDUCE)) {
+            err = EINVAL;
+            goto out;
+        }
+        trace->first_callback_entry_ns = hydra_now_ns();
+        const MR_WorkerStateV1 *state = MR_GetWorkerState();
+        if (state == NULL ||
+            (probe->expected_state_checksum != 0 &&
+             probe->expected_state_checksum != state->checksum)) {
+            err = EILSEQ;
+            goto out;
+        }
+        mr_activation_probe_response response = {
+            .sequence = probe->sequence,
+            .state_checksum = state->checksum,
+            .proof = state->checksum ^ state->value_scale ^
+                     ((uint64_t)state->role << 32) ^ probe->sequence,
+            .access_count = 1,
+        };
+        byte_buf_append(out, &response, sizeof(response));
+        trace->callback_region_end_ns = hydra_now_ns();
     } else {
         err = EINVAL;
     }
@@ -1118,7 +1218,9 @@ out:
 static int agent_submit_request(mr_porter *porter, size_t worker_count,
                                 mr_worker_role role, uint64_t agent_count,
                                 const mr_wire_header *hdr, const char *body,
-                                size_t body_len, uint32_t *worker_out)
+                                size_t body_len, uint32_t *worker_out,
+                                uint64_t request_received_ns,
+                                uint64_t parse_done_ns)
 {
     uint32_t worker_index;
     if (hdr->kind == MR_TASK_MAP) {
@@ -1157,16 +1259,74 @@ static int agent_submit_request(mr_porter *porter, size_t worker_count,
         if (worker_index >= worker_count) {
             return EINVAL;
         }
+    } else if (hdr->kind == MR_TASK_ACTIVATION_PROBE) {
+        if (body_len != sizeof(mr_activation_probe_request)) {
+            return EINVAL;
+        }
+        mr_activation_probe_request probe = {0};
+        memcpy(&probe, body, sizeof(probe));
+        if ((probe.expected_role != MR_ROLE_MAP &&
+             probe.expected_role != MR_ROLE_REDUCE) ||
+            (role != MR_ROLE_BOTH && role != (mr_worker_role)probe.expected_role)) {
+            return EACCES;
+        }
+        worker_index = probe.target_worker_id == MR_TARGET_WORKER_AUTO ?
+            (uint32_t)(probe.sequence % worker_count) :
+            probe.target_worker_id;
+        if (worker_index >= worker_count) {
+            return EINVAL;
+        }
     } else {
         return EINVAL;
     }
     int err = mr_porter_submit(porter, worker_index, hdr->kind, hdr->task_id,
                                hdr->partition_id, hdr->partition_count, body,
-                               body_len);
+                               body_len, request_received_ns, parse_done_ns);
     if (err == 0 && worker_out != NULL) {
         *worker_out = worker_index;
     }
     return err;
+}
+
+static mr_kernel_restore_stats_v3 kernel_stats_from_restore(
+    const mr_cxlfork_result *restore)
+{
+    mr_kernel_restore_stats_v3 stats = {
+        .supported_mask = restore->exclusive_supported_mask,
+        .valid_mask = restore->exclusive_valid_mask,
+        .path_mask = restore->path_mask,
+        .total_ns = restore->kernel_total_ns,
+        .lock_wait_ns = restore->lock_wait_ns,
+        .lifecycle_ns = restore->lifecycle_ns,
+        .manifest_validate_ns = restore->manifest_validate_ns,
+        .image_validate_ns = restore->image_validate_ns,
+        .checksum_validate_ns = restore->checksum_validate_ns,
+        .address_conflict_ns = restore->address_conflict_ns,
+        .vma_create_ns = restore->vma_create_ns,
+        .upper_pt_alloc_ns = restore->upper_pt_alloc_ns,
+        .shared_leaf_attach_ns = restore->shared_leaf_attach_exclusive_ns,
+        .pte_image_validate_ns = restore->pte_image_validate_ns,
+        .direct_pte_install_ns = restore->direct_pte_install_ns,
+        .fallback_other_ns = restore->fallback_other_ns,
+        .dirty_prefault_ns = restore->dirty_prefault_ns,
+        .global_restore_ns = restore->global_restore_ns,
+        .other_ns = restore->kernel_other_ns,
+        .faults = restore->faults,
+        .fault_dispatch_ns = restore->fault_dispatch_ns,
+        .leaf_materialize_ns = restore->leaf_materialize_ns,
+        .data_cow_ns = restore->data_cow_ns,
+        .cxl_to_local_copy_ns = restore->cxl_to_local_copy_ns,
+        .shared_leaf_count = restore->shared_leaf_count,
+        .shared_data_pages = restore->shared_data_pages,
+        .fallback_pages = restore->fallback_pages,
+        .direct_pte_install_pages = restore->direct_pte_install_pages,
+        .local_copy_pages = restore->local_copy_pages,
+        .leaf_copy_pages = restore->leaf_copy_pages,
+        .dirty_prefault_pages = restore->dirty_prefault_pages,
+        .validated_ptes = restore->validated_ptes,
+    };
+
+    return stats;
 }
 
 static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
@@ -1223,6 +1383,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             .validate_full = args->validate_full,
         },
         .restore_hold_ms = (uint32_t)args->restore_hold_ms,
+        .restore_preopen = args->restore_preopen,
         .task_fn = porter_execute_task,
         .task_context = &worker_context,
     };
@@ -1288,7 +1449,9 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         err = hydra_recv_request(ctx, &offset, &msg, &payload);
         if (err == 0) {
             progress = true;
+            uint64_t agent_received_ns = hydra_now_ns();
             hydra_msg request = *msg;
+            request.server_recv_ns = agent_received_ns;
             mr_wire_header hdr = {0};
             const char *body = NULL;
             size_t body_len = 0;
@@ -1296,14 +1459,18 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             uint32_t status = 0;
             int request_err =
                 mr_wire_parse(payload, msg->len, &hdr, &body, &body_len);
+            uint64_t parse_done_ns = hydra_now_ns();
+            request.server_dispatch_ns = parse_done_ns - agent_received_ns;
             bool deferred = false;
 
             if (request_err == 0 &&
-                (hdr.kind == MR_TASK_MAP || hdr.kind == MR_TASK_REDUCE)) {
+                (hdr.kind == MR_TASK_MAP || hdr.kind == MR_TASK_REDUCE ||
+                 hdr.kind == MR_TASK_ACTIVATION_PROBE)) {
                 uint32_t worker = UINT32_MAX;
                 request_err = agent_submit_request(
                     porter, (size_t)args->workers, args->role,
-                    args->agent_count, &hdr, body, body_len, &worker);
+                    args->agent_count, &hdr, body, body_len, &worker,
+                    agent_received_ns, parse_done_ns);
                 if (request_err == 0) {
                     if (pending[worker].active) {
                         request_err = EBUSY;
@@ -1337,8 +1504,10 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                     request_err == 0 ? (mr_task_kind)hdr.kind : MR_TASK_ERROR,
                     hdr.task_id, hdr.partition_id, hdr.partition_count,
                     response.data, response.len);
-                (void)mr_hydra_send_response_poll(ctx, &request, status,
-                                                  &wire);
+                request.server_stack_ns = hydra_now_ns() - agent_received_ns;
+                mr_hydra_send_observation ignored_send = {0};
+                (void)mr_hydra_send_response_poll_observed(
+                    ctx, &request, status, &wire, &ignored_send);
                 byte_buf_clear(&wire);
                 byte_buf_clear(&response);
             }
@@ -1405,13 +1574,14 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                        porter_result.binding.flags);
                 fflush(stdout);
             }
+            porter_result.trace.agent_collect_done_ns = hydra_now_ns();
             uint32_t status = collect_err == 0 ? 0 : 1;
             if (collect_err != 0) {
                 byte_buf_clear(&response);
                 const char *text = "agent task failed\n";
                 byte_buf_append(&response, text, strlen(text));
             }
-            mr_task_result_v2 task_result = {
+            mr_task_result_v3 task_result = {
                 .magic = MR_TASK_RESULT_MAGIC,
                 .size = sizeof(task_result),
                 .version = MR_TASK_RESULT_VERSION,
@@ -1421,24 +1591,40 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 .worker_id = porter_result.worker_id,
                 .task_id = completed.header.task_id,
                 .worker_pid = porter_result.worker_pid,
-                .dispatch_ns = porter_result.dispatch_ns,
-                .fork_ns = porter_result.fork_ns,
-                .wakeup_ns = porter_result.wakeup_ns,
-                .restore_ioctl_ns = porter_result.restore_ioctl_ns,
-                .template_validate_ns =
-                    porter_result.template_validate_ns,
-                .task_ns = porter_result.task_ns,
-                .reap_ns = porter_result.reap_ns,
-                .refill_ns = porter_result.refill_ns,
-                .porter_total_ns = porter_result.total_ns,
+                .launch_mode = args->launch_mode,
+                .policy = args->cxlfork_policy,
+                .validate_full = args->validate_full ? 1U : 0U,
+                .trace_flags = porter_result.trace_flags,
+                .trace = porter_result.trace,
+                .restore_wrapper_ns =
+                    porter_result.restore_timing.wrapper_total_ns,
+                .session_alloc_ns =
+                    porter_result.restore_timing.session_alloc_ns,
+                .device_open_ns =
+                    porter_result.restore_timing.device_open_ns,
+                .query_caps_ns =
+                    porter_result.restore_timing.query_caps_ns,
+                .policy_check_ns =
+                    porter_result.restore_timing.policy_check_ns,
+                .resume_ioctl_ns =
+                    porter_result.restore_timing.resume_ioctl_ns,
+                .restore_postcheck_ns =
+                    porter_result.restore_timing.postcheck_ns,
+                .preopen_device_ns =
+                    porter_result.restore_timing.preopen_device_ns,
+                .preopen_caps_ns =
+                    porter_result.restore_timing.preopen_caps_ns,
+                .preopen_policy_ns =
+                    porter_result.restore_timing.preopen_policy_ns,
+                .restore_setup_mode =
+                    porter_result.restore_timing.setup_mode,
+                .kernel = kernel_stats_from_restore(&porter_result.restore),
+                .template_key = args->template_key,
+                .template_generation = args->template_generation,
                 .restore_id = porter_result.restore.restore_id,
                 .restore_path_mask = porter_result.restore.path_mask,
-                .kernel_total_ns = porter_result.restore.kernel_total_ns,
-                .shared_leaf_pages =
-                    porter_result.restore.shared_leaf_pages,
-                .fallback_pages = porter_result.restore.fallback_pages,
-                .local_copy_pages = porter_result.restore.local_copy_pages,
-                .leaf_copy_pages = porter_result.restore.leaf_copy_pages,
+                .total_pages = porter_result.restore.total_pages,
+                .page_checksum = porter_result.restore.page_checksum,
                 .template_state_checksum =
                     porter_result.binding.state_checksum,
                 .template_access_checksum =
@@ -1450,6 +1636,8 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             byte_buf measured = {0};
             byte_buf_append(&measured, &task_result, sizeof(task_result));
             byte_buf_append(&measured, response.data, response.len);
+            task_result.trace.response_encode_done_ns = hydra_now_ns();
+            memcpy(measured.data, &task_result, sizeof(task_result));
             byte_buf_clear(&response);
             response = measured;
             byte_buf wire = make_wire(
@@ -1457,8 +1645,30 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 completed.header.task_id, completed.header.partition_id,
                 completed.header.partition_count, response.data,
                 response.len);
-            (void)mr_hydra_send_response_poll(ctx, &completed.request, status,
-                                              &wire);
+            completed.request.server_stack_ns =
+                hydra_now_ns() - completed.request.server_recv_ns;
+            mr_hydra_send_observation response_send = {0};
+            (void)mr_hydra_send_response_poll_observed(
+                ctx, &completed.request, status, &wire, &response_send);
+            fprintf(stderr,
+                    "hydra_response_v1 task=%" PRIu64
+                    " call_begin_ns=%" PRIu64
+                    " publish_done_ns=%" PRIu64
+                    " queue_ns=%" PRIu64 " alloc_ns=%" PRIu64
+                    " header_ns=%" PRIu64 " copy_ns=%" PRIu64
+                    " checksum_ns=%" PRIu64 " visibility_ns=%" PRIu64
+                    " publish_ns=%" PRIu64 " wait_ns=%" PRIu64
+                    " retries=%" PRIu64 " queue_empty=%u\n",
+                    completed.header.task_id, response_send.call_begin_ns,
+                    response_send.publish_done_ns,
+                    response_send.phases.queue_reserve_ns,
+                    response_send.phases.alloc_ns,
+                    response_send.phases.header_ns,
+                    response_send.phases.payload_copy_ns,
+                    response_send.phases.checksum_ns,
+                    response_send.phases.visibility_ns,
+                    response_send.phases.publish_ns, response_send.wait_ns,
+                    response_send.retries, response_send.queue_was_empty);
             byte_buf_clear(&wire);
             byte_buf_clear(&response);
         }
@@ -1493,9 +1703,21 @@ static int open_agent_endpoint(mr_endpoint *ep, const master_args *args,
     return mr_hydra_open_ex(&ep->ctx, &config);
 }
 
-static int unwrap_task_result(byte_buf *response, mr_task_result_v2 *result)
+static int unwrap_task_result(byte_buf *response, mr_task_result_v3 *result)
 {
-    if (response->len < sizeof(*result)) {
+    struct {
+        uint32_t magic;
+        uint16_t size;
+        uint16_t version;
+    } header;
+
+    if (response->len < sizeof(header)) {
+        return EPROTO;
+    }
+    memcpy(&header, response->data, sizeof(header));
+    if (header.magic != MR_TASK_RESULT_MAGIC ||
+        header.version != MR_TASK_RESULT_VERSION ||
+        header.size != sizeof(*result) || response->len < sizeof(*result)) {
         return EPROTO;
     }
     memcpy(result, response->data, sizeof(*result));
@@ -1523,21 +1745,60 @@ static int unwrap_task_result(byte_buf *response, mr_task_result_v2 *result)
     return result->status == 0 ? 0 : EREMOTEIO;
 }
 
-static void report_task_result(const mr_task_result_v2 *result,
-                               uint64_t master_roundtrip_ns)
+static void report_task_result_observed(
+    const mr_task_result_v3 *result, uint64_t master_roundtrip_ns,
+    const mr_hydra_send_observation *request_send,
+    const hydra_msg *response_msg, uint64_t response_recv_ns,
+    uint64_t response_release_done_ns)
 {
     fprintf(stderr,
-            "task_result_v2 task=%" PRIu64 " kind=%u node=%u worker=%u"
+            "task_result_v3 task=%" PRIu64 " kind=%u node=%u worker=%u"
             " pid=%" PRId64 " status=%u roundtrip_ns=%" PRIu64
-            " porter_total_ns=%" PRIu64 " dispatch_ns=%" PRIu64
-            " fork_ns=%" PRIu64 " wakeup_ns=%" PRIu64
-            " restore_ioctl_ns=%" PRIu64
-            " template_validate_ns=%" PRIu64 " task_ns=%" PRIu64
-            " reap_ns=%" PRIu64 " refill_ns=%" PRIu64
+            " launch=%u policy=%u validation=%u trace_flags=%u"
+            " agent_recv_ns=%" PRIu64 " parse_done_ns=%" PRIu64
+            " porter_submit_ns=%" PRIu64 " payload_done_ns=%" PRIu64
+            " slot_publish_ns=%" PRIu64 " supervisor_recv_ns=%" PRIu64
+            " fork_begin_ns=%" PRIu64 " fork_return_ns=%" PRIu64
+            " worker_observe_ns=%" PRIu64 " worker_entry_ns=%" PRIu64
+            " restore_begin_ns=%" PRIu64 " restore_end_ns=%" PRIu64
+            " resume_begin_ns=%" PRIu64 " resume_end_ns=%" PRIu64
+            " bind_begin_ns=%" PRIu64 " bind_end_ns=%" PRIu64
+            " state_ready_ns=%" PRIu64 " business_entry_ns=%" PRIu64
+            " first_state_access_ns=%" PRIu64
+            " first_callback_ns=%" PRIu64 " callback_end_ns=%" PRIu64
+            " shuffle_begin_ns=%" PRIu64 " shuffle_end_ns=%" PRIu64
+            " parse_sort_begin_ns=%" PRIu64 " parse_sort_end_ns=%" PRIu64
+            " serialize_begin_ns=%" PRIu64 " serialize_end_ns=%" PRIu64
+            " task_done_ns=%" PRIu64 " collect_begin_ns=%" PRIu64
+            " collect_end_ns=%" PRIu64 " slot_done_ns=%" PRIu64
+            " supervisor_done_ns=%" PRIu64 " reap_begin_ns=%" PRIu64
+            " reap_end_ns=%" PRIu64 " refill_begin_ns=%" PRIu64
+            " refill_end_ns=%" PRIu64 " pool_ready_ns=%" PRIu64
+            " agent_collect_ns=%" PRIu64
+            " restore_wrapper_ns=%" PRIu64
+            " session_alloc_ns=%" PRIu64 " device_open_ns=%" PRIu64
+            " query_caps_ns=%" PRIu64 " policy_check_ns=%" PRIu64
+            " resume_ioctl_ns=%" PRIu64 " restore_postcheck_ns=%" PRIu64
+            " preopen_device_ns=%" PRIu64 " preopen_caps_ns=%" PRIu64
+            " preopen_policy_ns=%" PRIu64 " restore_setup=%" PRIu64
             " restore_id=%" PRIu64 " path_mask=%" PRIu64
-            " kernel_total_ns=%" PRIu64 " shared_leaf_pages=%" PRIu64
-            " fallback_pages=%" PRIu64 " local_copy_pages=%" PRIu64
-            " leaf_copy_pages=%" PRIu64
+            " kernel_supported_mask=%" PRIu64
+            " kernel_valid_mask=%" PRIu64
+            " kernel_total_ns=%" PRIu64
+            " kernel_lock_ns=%" PRIu64 " kernel_lifecycle_ns=%" PRIu64
+            " kernel_manifest_ns=%" PRIu64 " kernel_image_ns=%" PRIu64
+            " kernel_checksum_ns=%" PRIu64 " kernel_conflict_ns=%" PRIu64
+            " kernel_vma_ns=%" PRIu64 " kernel_upper_pt_ns=%" PRIu64
+            " kernel_shared_leaf_ns=%" PRIu64
+            " kernel_pte_validate_ns=%" PRIu64
+            " kernel_pte_install_ns=%" PRIu64
+            " kernel_fallback_other_ns=%" PRIu64
+            " kernel_dirty_prefault_ns=%" PRIu64
+            " kernel_global_ns=%" PRIu64 " kernel_other_ns=%" PRIu64
+            " faults=%" PRIu64 " fault_dispatch_ns=%" PRIu64
+            " cxl_copy_ns=%" PRIu64 " shared_leaf_count=%" PRIu64
+            " shared_data_pages=%" PRIu64 " fallback_pages=%" PRIu64
+            " local_copy_pages=%" PRIu64 " leaf_copy_pages=%" PRIu64
             " template_state_checksum=%" PRIu64
             " template_access_checksum=%" PRIu64
             " template_access_count=%" PRIu64
@@ -1545,45 +1806,165 @@ static void report_task_result(const mr_task_result_v2 *result,
             " template_binding_flags=%" PRIu64 "\n",
             result->task_id, result->kind, result->node_id,
             result->worker_id, result->worker_pid, result->status,
-            master_roundtrip_ns, result->porter_total_ns,
-            result->dispatch_ns, result->fork_ns, result->wakeup_ns,
-            result->restore_ioctl_ns, result->template_validate_ns,
-            result->task_ns, result->reap_ns, result->refill_ns,
+            master_roundtrip_ns, result->launch_mode, result->policy,
+            result->validate_full, result->trace_flags,
+            result->trace.agent_request_received_ns,
+            result->trace.agent_parse_done_ns,
+            result->trace.porter_submit_begin_ns,
+            result->trace.payload_copy_done_ns,
+            result->trace.slot_ready_publish_ns,
+            result->trace.supervisor_command_received_ns,
+            result->trace.fork_begin_ns, result->trace.fork_return_ns,
+            result->trace.worker_slot_observed_ns,
+            result->trace.worker_entry_ns,
+            result->trace.restore_wrapper_begin_ns,
+            result->trace.restore_wrapper_end_ns,
+            result->trace.resume_ioctl_begin_ns,
+            result->trace.resume_ioctl_end_ns,
+            result->trace.template_bind_begin_ns,
+            result->trace.template_bind_end_ns,
+            result->trace.state_ready_ns, result->trace.business_entry_ns,
+            result->trace.first_state_access_ns,
+            result->trace.first_callback_entry_ns,
+            result->trace.callback_region_end_ns,
+            result->trace.shuffle_begin_ns, result->trace.shuffle_end_ns,
+            result->trace.parse_sort_begin_ns,
+            result->trace.parse_sort_end_ns,
+            result->trace.serialize_begin_ns,
+            result->trace.serialize_end_ns, result->trace.task_done_ns,
+            result->trace.restore_collect_begin_ns,
+            result->trace.restore_collect_end_ns,
+            result->trace.slot_done_publish_ns,
+            result->trace.supervisor_done_observed_ns,
+            result->trace.reap_begin_ns, result->trace.reap_end_ns,
+            result->trace.refill_begin_ns, result->trace.refill_end_ns,
+            result->trace.pool_ready_ns, result->trace.agent_collect_done_ns,
+            result->restore_wrapper_ns, result->session_alloc_ns,
+            result->device_open_ns, result->query_caps_ns,
+            result->policy_check_ns, result->resume_ioctl_ns,
+            result->restore_postcheck_ns, result->preopen_device_ns,
+            result->preopen_caps_ns, result->preopen_policy_ns,
+            result->restore_setup_mode,
             result->restore_id, result->restore_path_mask,
-            result->kernel_total_ns, result->shared_leaf_pages,
-            result->fallback_pages, result->local_copy_pages,
-            result->leaf_copy_pages, result->template_state_checksum,
+            result->kernel.supported_mask, result->kernel.valid_mask,
+            result->kernel.total_ns, result->kernel.lock_wait_ns,
+            result->kernel.lifecycle_ns,
+            result->kernel.manifest_validate_ns,
+            result->kernel.image_validate_ns,
+            result->kernel.checksum_validate_ns,
+            result->kernel.address_conflict_ns,
+            result->kernel.vma_create_ns,
+            result->kernel.upper_pt_alloc_ns,
+            result->kernel.shared_leaf_attach_ns,
+            result->kernel.pte_image_validate_ns,
+            result->kernel.direct_pte_install_ns,
+            result->kernel.fallback_other_ns,
+            result->kernel.dirty_prefault_ns,
+            result->kernel.global_restore_ns, result->kernel.other_ns,
+            result->kernel.faults, result->kernel.fault_dispatch_ns,
+            result->kernel.cxl_to_local_copy_ns,
+            result->kernel.shared_leaf_count,
+            result->kernel.shared_data_pages,
+            result->kernel.fallback_pages,
+            result->kernel.local_copy_pages,
+            result->kernel.leaf_copy_pages,
+            result->template_state_checksum,
             result->template_access_checksum,
             result->template_access_count, result->template_state_pages,
             result->template_binding_flags);
+
+    if (request_send != NULL && response_msg != NULL) {
+        fprintf(stderr,
+                "hydra_task_v1 task=%" PRIu64
+                " request_call_begin_ns=%" PRIu64
+                " request_publish_done_ns=%" PRIu64
+                " request_queue_ns=%" PRIu64
+                " request_alloc_ns=%" PRIu64
+                " request_header_ns=%" PRIu64
+                " request_copy_ns=%" PRIu64
+                " request_checksum_ns=%" PRIu64
+                " request_visibility_ns=%" PRIu64
+                " request_publish_ns=%" PRIu64
+                " request_wait_ns=%" PRIu64 " request_retries=%" PRIu64
+                " request_queue_empty=%u response_recv_ns=%" PRIu64
+                " response_release_done_ns=%" PRIu64
+                " request_timestamp_ns=%" PRIu64
+                " request_ready_ns=%" PRIu64
+                " server_recv_ns=%" PRIu64
+                " server_dispatch_ns=%" PRIu64
+                " server_stack_ns=%" PRIu64
+                " request_verify_ns=%" PRIu64
+                " response_queue_ns=%" PRIu64
+                " response_alloc_ns=%" PRIu64
+                " response_fill_ns=%" PRIu64
+                " response_checksum_ns=%" PRIu64
+                " response_visibility_ns=%" PRIu64
+                " response_placement_ns=%" PRIu64
+                " response_ready_ns=%" PRIu64 "\n",
+                result->task_id, request_send->call_begin_ns,
+                request_send->publish_done_ns,
+                request_send->phases.queue_reserve_ns,
+                request_send->phases.alloc_ns,
+                request_send->phases.header_ns,
+                request_send->phases.payload_copy_ns,
+                request_send->phases.checksum_ns,
+                request_send->phases.visibility_ns,
+                request_send->phases.publish_ns, request_send->wait_ns,
+                request_send->retries, request_send->queue_was_empty,
+                response_recv_ns, response_release_done_ns,
+                response_msg->timestamp_ns,
+                response_msg->request_ready_ns,
+                response_msg->server_recv_ns,
+                response_msg->server_dispatch_ns,
+                response_msg->server_stack_ns,
+                response_msg->request_checksum_verify_ns,
+                response_msg->response_queue_reserve_ns,
+                response_msg->response_alloc_ns,
+                response_msg->response_fill_ns,
+                response_msg->response_checksum_generate_ns,
+                response_msg->response_visibility_ns,
+                response_msg->response_placement_ns,
+                response_msg->response_ready_ns);
+    }
 }
 
 static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
                       uint64_t partition_id, uint64_t partition_count,
                       const void *body, size_t body_len, byte_buf *response)
 {
-    uint64_t begin_ns = hydra_now_ns();
-    int err = send_hydra_request(agent->ctx, kind, task_id, partition_id,
-                                 partition_count, body, body_len);
+    mr_hydra_send_observation request_send = {0};
+    hydra_msg response_msg = {0};
+    uint64_t response_recv_ns = 0;
+    uint64_t response_release_done_ns = 0;
+    int err = send_hydra_request_observed(
+        agent->ctx, kind, task_id, partition_id, partition_count,
+        body, body_len, &request_send);
     if (err != 0) {
         return err;
     }
     mr_wire_header hdr = {0};
-    err = recv_hydra_response(agent->ctx, &hdr, response);
+    err = recv_hydra_response_observed(
+        agent->ctx, &hdr, response, &response_msg, &response_recv_ns,
+        &response_release_done_ns);
     if (err != 0) {
         return err;
     }
     if (hdr.kind != kind || hdr.task_id != task_id) {
         return EPROTO;
     }
-    if (kind == MR_TASK_MAP || kind == MR_TASK_REDUCE) {
-        mr_task_result_v2 result = {0};
+    if (kind == MR_TASK_MAP || kind == MR_TASK_REDUCE ||
+        kind == MR_TASK_ACTIVATION_PROBE) {
+        mr_task_result_v3 result = {0};
         err = unwrap_task_result(response, &result);
         if ((err != 0 && err != EREMOTEIO) || result.kind != kind ||
             result.task_id != task_id) {
             return err != 0 ? err : EPROTO;
         }
-        report_task_result(&result, hydra_now_ns() - begin_ns);
+        report_task_result_observed(
+            &result,
+            response_release_done_ns - request_send.call_begin_ns,
+            &request_send, &response_msg, response_recv_ns,
+            response_release_done_ns);
         if (err != 0) {
             return err;
         }
@@ -1624,8 +2005,17 @@ static int collect_reduce_output(mr_partitions *output, uint32_t reducer_id,
 
 static int run_master(const master_args *args)
 {
-    if (args->agents.len == 0 || args->input == NULL || args->output == NULL) {
-        fprintf(stderr, "master requires --input, --output and --agent/--agents\n");
+    bool probe_only = args->activation_probes != 0 ||
+                      args->activation_warmups != 0;
+
+    if (args->agents.len == 0 ||
+        (!probe_only && (args->input == NULL || args->output == NULL))) {
+        fprintf(stderr,
+                "master requires --agent/--agents and, except in activation-probe mode, --input and --output\n");
+        return 2;
+    }
+    if (probe_only && args->probe_agent >= args->agents.len) {
+        fprintf(stderr, "master: probe-agent is outside the agent list\n");
         return 2;
     }
     if (args->payload_max <= sizeof(mr_wire_header) + 64) {
@@ -1655,6 +2045,51 @@ static int run_master(const master_args *args)
                     i, hydra_strerror(err));
             goto cleanup;
         }
+    }
+
+    if (probe_only) {
+        uint64_t total = args->activation_warmups + args->activation_probes;
+
+        for (uint64_t i = 0; i < total; i++) {
+            mr_activation_probe_request probe = {
+                .target_worker_id =
+                    (uint32_t)(i % args->workers_per_agent),
+                .expected_role = (uint32_t)args->probe_role,
+                .flags = i < args->activation_warmups ?
+                    MR_TRACE_F_WARMUP : 0,
+                .sequence = i,
+                .expected_state_checksum = args->probe_state_checksum,
+            };
+            byte_buf response = {0};
+            uint64_t task_id = UINT64_C(0x8000000000000000) + i;
+            int err = call_agent(&agents[args->probe_agent],
+                                 MR_TASK_ACTIVATION_PROBE, task_id, 0, 1,
+                                 &probe, sizeof(probe), &response);
+            if (err == 0 &&
+                response.len != sizeof(mr_activation_probe_response)) {
+                err = EPROTO;
+            }
+            if (err == 0) {
+                mr_activation_probe_response proof = {0};
+
+                memcpy(&proof, response.data, sizeof(proof));
+                if (proof.sequence != probe.sequence ||
+                    proof.access_count != 1 || proof.proof == 0 ||
+                    (probe.expected_state_checksum != 0 &&
+                     proof.state_checksum != probe.expected_state_checksum)) {
+                    err = EILSEQ;
+                }
+            }
+            byte_buf_clear(&response);
+            if (err != 0) {
+                fprintf(stderr,
+                        "master: activation probe %" PRIu64 " failed: %s\n",
+                        i, strerror(err));
+                goto cleanup;
+            }
+        }
+        rc = 0;
+        goto cleanup;
     }
 
     size_t input_len = 0;
@@ -1714,7 +2149,8 @@ static int run_master(const master_args *args)
             if (batch > args->workers_per_agent) {
                 batch = (size_t)args->workers_per_agent;
             }
-            uint64_t *sent_at = mr_xcalloc(batch, sizeof(*sent_at));
+            mr_hydra_send_observation *send_obs =
+                mr_xcalloc(batch, sizeof(*send_obs));
             for (size_t j = 0; j < batch; j++) {
                 size_t i = base + j;
                 control_map_task task = {
@@ -1727,27 +2163,32 @@ static int run_master(const master_args *args)
                 byte_buf body = {0};
                 byte_buf_append(&body, &task, sizeof(task));
                 byte_buf_append(&body, slices[i].data, slices[i].len);
-                sent_at[j] = hydra_now_ns();
-                int err = send_hydra_request(
+                int err = send_hydra_request_observed(
                     agents[0].ctx, MR_TASK_MAP, i, 0,
-                    (uint64_t)reducer_count, body.data, body.len);
+                    (uint64_t)reducer_count, body.data, body.len,
+                    &send_obs[j]);
                 byte_buf_clear(&body);
                 if (err != 0) {
-                    free(sent_at);
+                    free(send_obs);
                     goto cleanup;
                 }
             }
             for (size_t j = 0; j < batch; j++) {
                 mr_wire_header hdr = {0};
                 byte_buf response = {0};
-                int err = recv_hydra_response(agents[0].ctx, &hdr, &response);
+                hydra_msg response_msg = {0};
+                uint64_t response_recv_ns = 0;
+                uint64_t response_release_done_ns = 0;
+                int err = recv_hydra_response_observed(
+                    agents[0].ctx, &hdr, &response, &response_msg,
+                    &response_recv_ns, &response_release_done_ns);
                 if (err == 0 &&
                     (hdr.kind != MR_TASK_MAP || hdr.task_id < base ||
                      hdr.task_id >= base + batch)) {
                     err = EPROTO;
                 }
                 if (err == 0) {
-                    mr_task_result_v2 result = {0};
+                    mr_task_result_v3 result = {0};
                     err = unwrap_task_result(&response, &result);
                     if ((err == 0 || err == EREMOTEIO) &&
                         (result.kind != MR_TASK_MAP ||
@@ -1755,9 +2196,13 @@ static int run_master(const master_args *args)
                         err = EPROTO;
                     }
                     if (err == 0 || err == EREMOTEIO) {
-                        report_task_result(
+                        size_t index = (size_t)(hdr.task_id - base);
+                        report_task_result_observed(
                             &result,
-                            hydra_now_ns() - sent_at[hdr.task_id - base]);
+                            response_release_done_ns -
+                                send_obs[index].call_begin_ns,
+                            &send_obs[index], &response_msg,
+                            response_recv_ns, response_release_done_ns);
                     }
                 }
                 if (err == 0) {
@@ -1765,11 +2210,11 @@ static int run_master(const master_args *args)
                 }
                 byte_buf_clear(&response);
                 if (err != 0) {
-                    free(sent_at);
+                    free(send_obs);
                     goto cleanup;
                 }
             }
-            free(sent_at);
+            free(send_obs);
         }
     } else for (size_t i = 0; i < slice_count; i++) {
         size_t agent_index = i % args->agents.len;
@@ -1819,8 +2264,8 @@ static int run_master(const master_args *args)
             if ((uint64_t)batch > args->workers_per_agent) {
                 batch = (int)args->workers_per_agent;
             }
-            uint64_t *sent_at =
-                mr_xcalloc((size_t)batch, sizeof(*sent_at));
+            mr_hydra_send_observation *send_obs =
+                mr_xcalloc((size_t)batch, sizeof(*send_obs));
             for (int j = 0; j < batch; j++) {
                 int r = base + j;
                 location_vec reducer_locations = {0};
@@ -1844,22 +2289,27 @@ static int run_master(const master_args *args)
                         &body, reducer_locations.items,
                         reducer_locations.len * sizeof(reducer_locations.items[0]));
                 }
-                sent_at[j] = hydra_now_ns();
-                int err = send_hydra_request(
+                int err = send_hydra_request_observed(
                     agents[1].ctx, MR_TASK_REDUCE,
                     slice_count + (uint64_t)r, (uint64_t)r,
-                    (uint64_t)reducer_count, body.data, body.len);
+                    (uint64_t)reducer_count, body.data, body.len,
+                    &send_obs[j]);
                 byte_buf_clear(&body);
                 location_vec_destroy(&reducer_locations);
                 if (err != 0) {
-                    free(sent_at);
+                    free(send_obs);
                     goto cleanup;
                 }
             }
             for (int j = 0; j < batch; j++) {
                 mr_wire_header hdr = {0};
                 byte_buf response = {0};
-                int err = recv_hydra_response(agents[1].ctx, &hdr, &response);
+                hydra_msg response_msg = {0};
+                uint64_t response_recv_ns = 0;
+                uint64_t response_release_done_ns = 0;
+                int err = recv_hydra_response_observed(
+                    agents[1].ctx, &hdr, &response, &response_msg,
+                    &response_recv_ns, &response_release_done_ns);
                 if (err == 0 &&
                     (hdr.kind != MR_TASK_REDUCE ||
                      hdr.partition_id < (uint64_t)base ||
@@ -1867,7 +2317,7 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
-                    mr_task_result_v2 result = {0};
+                    mr_task_result_v3 result = {0};
                     err = unwrap_task_result(&response, &result);
                     if ((err == 0 || err == EREMOTEIO) &&
                         (result.kind != MR_TASK_REDUCE ||
@@ -1875,10 +2325,14 @@ static int run_master(const master_args *args)
                         err = EPROTO;
                     }
                     if (err == 0 || err == EREMOTEIO) {
-                        report_task_result(
+                        size_t index = (size_t)(hdr.partition_id -
+                                                (uint64_t)base);
+                        report_task_result_observed(
                             &result,
-                            hydra_now_ns() -
-                                sent_at[hdr.partition_id - (uint64_t)base]);
+                            response_release_done_ns -
+                                send_obs[index].call_begin_ns,
+                            &send_obs[index], &response_msg,
+                            response_recv_ns, response_release_done_ns);
                     }
                 }
                 if (err == 0) {
@@ -1887,11 +2341,11 @@ static int run_master(const master_args *args)
                 }
                 byte_buf_clear(&response);
                 if (err != 0) {
-                    free(sent_at);
+                    free(send_obs);
                     goto cleanup;
                 }
             }
-            free(sent_at);
+            free(send_obs);
         }
     } else for (int r = 0; r < reducer_count; r++) {
         size_t agent_index = (size_t)r % args->agents.len;
@@ -1985,6 +2439,9 @@ static void usage(const char *argv0)
             "master: [--map-chunk=N] [--reducers=N]\n"
             "        [--schedule=static|role-static|file:PATH]\n"
             "        [--workers-per-agent=N]\n"
+            "        [--activation-probes=N] [--activation-warmups=N]\n"
+            "        [--probe-agent=N] [--probe-role=map|reduce]\n"
+            "        [--probe-state-checksum=N]\n"
             "        [--connections=N]\n"
             "        [--queue-policy=shared_pair|per_connection]\n"
             "agent: [--store-dir=DIR] [--agent-count=N] [--global-worker-base=N]\n"
@@ -2010,6 +2467,8 @@ static int parse_master_args(master_args *args, int argc, char **argv)
     args->payload_max = MR_DEFAULT_PAYLOAD_MAX;
     args->connections = MR_DEFAULT_SHUFFLE_CONNECTIONS;
     args->workers_per_agent = MR_DEFAULT_WORKERS_PER_AGENT;
+    args->probe_agent = 1;
+    args->probe_role = MR_ROLE_REDUCE;
     args->queue_policy = MR_QUEUE_SHARED_PAIR;
 
     for (int i = 2; i < argc; i++) {
@@ -2041,6 +2500,23 @@ static int parse_master_args(master_args *args, int argc, char **argv)
         } else if ((value = arg_value(argv[i], "--workers-per-agent=")) != NULL) {
             args->workers_per_agent =
                 mr_parse_u64(value, "workers-per-agent");
+        } else if ((value = arg_value(argv[i], "--activation-probes=")) != NULL) {
+            args->activation_probes =
+                mr_parse_u64(value, "activation-probes");
+        } else if ((value = arg_value(argv[i], "--activation-warmups=")) != NULL) {
+            args->activation_warmups =
+                mr_parse_u64(value, "activation-warmups");
+        } else if ((value = arg_value(argv[i], "--probe-agent=")) != NULL) {
+            args->probe_agent = mr_parse_u64(value, "probe-agent");
+        } else if ((value = arg_value(argv[i], "--probe-role=")) != NULL) {
+            if (mr_role_parse(value, &args->probe_role) != 0 ||
+                args->probe_role == MR_ROLE_BOTH) {
+                fprintf(stderr, "probe-role must be map or reduce\n");
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--probe-state-checksum=")) != NULL) {
+            args->probe_state_checksum =
+                mr_parse_u64(value, "probe-state-checksum");
         } else if ((value = arg_value(argv[i], "--queue-policy=")) != NULL) {
             args->queue_policy = mr_queue_policy_parse(value);
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -2076,6 +2552,7 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
     args->template_seed = MR_TEMPLATE_SEED_DEFAULT;
     args->template_value_scale = MR_TEMPLATE_VALUE_SCALE_DEFAULT;
     args->cxlfork_policy = MR_CXLFORK_POLICY_MOW;
+    args->restore_preopen = true;
     args->store_dir = "/tmp/mr-store";
 
     for (int i = 2; i < argc; i++) {
@@ -2138,6 +2615,16 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
                 args->validate_full = true;
             } else {
                 fprintf(stderr, "validation must be fast or full\n");
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--restore-setup=")) != NULL) {
+            if (strcmp(value, "preopen") == 0) {
+                args->restore_preopen = true;
+            } else if (strcmp(value, "per-request") == 0) {
+                args->restore_preopen = false;
+            } else {
+                fprintf(stderr,
+                        "restore-setup must be preopen or per-request\n");
                 return 2;
             }
         } else if ((value = arg_value(argv[i], "--restore-hold-ms=")) != NULL) {

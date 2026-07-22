@@ -3,7 +3,9 @@
 
 #include "mr_cxlfork.h"
 #include "mr_util.h"
+#include "mr_wire.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -21,7 +23,8 @@ typedef int (*mr_porter_task_fn)(void *context, uint32_t worker_id,
                                  const MR_WorkerStateV1 *worker_state,
                                  mr_template_binding_result *binding,
                                  const void *payload, size_t payload_len,
-                                 byte_buf *response);
+                                 byte_buf *response,
+                                 mr_task_trace_v3 *trace);
 
 typedef struct mr_porter_config {
     mr_launch_mode mode;
@@ -30,6 +33,7 @@ typedef struct mr_porter_config {
     mr_template_options template;
     mr_cxlfork_restore_options restore;
     uint32_t restore_hold_ms;
+    bool restore_preopen;
     mr_porter_task_fn task_fn;
     void *task_context;
 } mr_porter_config;
@@ -48,6 +52,9 @@ typedef struct mr_porter_result {
     uint64_t reap_ns;
     uint64_t refill_ns;
     uint64_t total_ns;
+    uint32_t trace_flags;
+    mr_task_trace_v3 trace;
+    mr_cxlfork_timing restore_timing;
     mr_template_binding_result binding;
     mr_cxlfork_result restore;
 } mr_porter_result;
@@ -60,7 +67,8 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out);
 int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
                      uint64_t task_id, uint64_t partition_id,
                      uint64_t partition_count, const void *payload,
-                     size_t payload_len);
+                     size_t payload_len, uint64_t agent_request_received_ns,
+                     uint64_t agent_parse_done_ns);
 int mr_porter_collect(mr_porter *porter, uint32_t *worker_id,
                       byte_buf *response, mr_porter_result *result);
 int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,

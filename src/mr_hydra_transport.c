@@ -119,40 +119,109 @@ int mr_hydra_open(hydra_ctx **ctx, mr_backend backend, const char *path,
     return mr_hydra_open_ex(ctx, &config);
 }
 
-int mr_hydra_send_request_poll(hydra_ctx *ctx, uint64_t req_id,
-                               const byte_buf *payload)
+static void add_send_timing(hydra_send_timing *dst,
+                            const hydra_send_timing *src)
+{
+    dst->queue_reserve_ns += src->queue_reserve_ns;
+    dst->alloc_ns += src->alloc_ns;
+    dst->header_ns += src->header_ns;
+    dst->payload_copy_ns += src->payload_copy_ns;
+    dst->checksum_ns += src->checksum_ns;
+    dst->visibility_ns += src->visibility_ns;
+    dst->publish_ns += src->publish_ns;
+}
+
+int mr_hydra_send_request_poll_observed(
+    hydra_ctx *ctx, uint64_t req_id, const byte_buf *payload,
+    mr_hydra_send_observation *observation)
 {
     if (payload->len > UINT32_MAX) {
         return EMSGSIZE;
     }
 
     int err = 0;
+    if (observation != NULL) {
+        memset(observation, 0, sizeof(*observation));
+        observation->call_begin_ns = hydra_now_ns();
+    }
     do {
-        err = hydra_send_request(ctx, req_id, MR_OP, payload->data,
-                                 (uint32_t)payload->len, hydra_now_ns());
+        hydra_send_timing attempt = {0};
+        bool queue_was_empty = false;
+        err = hydra_send_request_timed_observed(
+            ctx, req_id, MR_OP, payload->data, (uint32_t)payload->len,
+            hydra_now_ns(), observation != NULL ? &attempt : NULL,
+            observation != NULL ? &queue_was_empty : NULL);
+        if (observation != NULL) {
+            add_send_timing(&observation->phases, &attempt);
+        }
         if (err == EAGAIN) {
+            uint64_t wait_begin = hydra_now_ns();
             hydra_wait(ctx, HYDRA_WAIT_REQUEST_SPACE, HYDRA_NOTIFY_BUSY);
+            if (observation != NULL) {
+                observation->wait_ns += hydra_now_ns() - wait_begin;
+                observation->retries++;
+            }
+        } else if (err == 0 && observation != NULL) {
+            observation->queue_was_empty = queue_was_empty ? 1U : 0U;
         }
     } while (err == EAGAIN);
+    if (observation != NULL) {
+        observation->publish_done_ns = hydra_now_ns();
+    }
+    return err;
+}
+
+int mr_hydra_send_request_poll(hydra_ctx *ctx, uint64_t req_id,
+                               const byte_buf *payload)
+{
+    return mr_hydra_send_request_poll_observed(ctx, req_id, payload, NULL);
+}
+
+int mr_hydra_send_response_poll_observed(
+    hydra_ctx *ctx, const hydra_msg *request, uint32_t status,
+    const byte_buf *payload, mr_hydra_send_observation *observation)
+{
+    if (payload->len > UINT32_MAX) {
+        return EMSGSIZE;
+    }
+
+    int err = 0;
+    if (observation != NULL) {
+        memset(observation, 0, sizeof(*observation));
+        observation->call_begin_ns = hydra_now_ns();
+    }
+    do {
+        hydra_send_timing attempt = {0};
+        bool queue_was_empty = false;
+        err = hydra_send_response_timed_observed(
+            ctx, request, status, payload->data, (uint32_t)payload->len,
+            observation != NULL ? &attempt : NULL,
+            observation != NULL ? &queue_was_empty : NULL);
+        if (observation != NULL) {
+            add_send_timing(&observation->phases, &attempt);
+        }
+        if (err == EAGAIN) {
+            uint64_t wait_begin = hydra_now_ns();
+            hydra_wait(ctx, HYDRA_WAIT_RESPONSE_SPACE, HYDRA_NOTIFY_BUSY);
+            if (observation != NULL) {
+                observation->wait_ns += hydra_now_ns() - wait_begin;
+                observation->retries++;
+            }
+        } else if (err == 0 && observation != NULL) {
+            observation->queue_was_empty = queue_was_empty ? 1U : 0U;
+        }
+    } while (err == EAGAIN);
+    if (observation != NULL) {
+        observation->publish_done_ns = hydra_now_ns();
+    }
     return err;
 }
 
 int mr_hydra_send_response_poll(hydra_ctx *ctx, const hydra_msg *request,
                                 uint32_t status, const byte_buf *payload)
 {
-    if (payload->len > UINT32_MAX) {
-        return EMSGSIZE;
-    }
-
-    int err = 0;
-    do {
-        err = hydra_send_response(ctx, request, status, payload->data,
-                                  (uint32_t)payload->len);
-        if (err == EAGAIN) {
-            hydra_wait(ctx, HYDRA_WAIT_RESPONSE_SPACE, HYDRA_NOTIFY_BUSY);
-        }
-    } while (err == EAGAIN);
-    return err;
+    return mr_hydra_send_response_poll_observed(
+        ctx, request, status, payload, NULL);
 }
 
 int mr_hydra_recv_request_poll(hydra_ctx *ctx, uint64_t *offset,

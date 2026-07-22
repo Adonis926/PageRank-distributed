@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #if MR_ENABLE_CXLFORK
@@ -26,20 +27,43 @@ _Static_assert(sizeof(struct cxlfork_release_v2) == 64,
                "unexpected cxlfork_release_v2 ABI size");
 _Static_assert(sizeof(struct cxlfork_call_stats_v2) == 272,
                "unexpected cxlfork_call_stats_v2 ABI size");
+_Static_assert(sizeof(struct cxlfork_call_stats_v3) == 320,
+               "unexpected cxlfork_call_stats_v3 ABI size");
 _Static_assert(sizeof(struct cxlfork_query_caps_v2) == 128,
                "unexpected cxlfork_query_caps_v2 ABI size");
 
 struct mr_cxlfork_session {
     int fd;
+    bool owns_fd;
+    bool v3_stats_supported;
     uint64_t key;
     uint64_t generation;
     uint64_t restore_id;
     uint32_t region_count;
     struct cxlfork_region regions[CXLFORK_MAX_REGIONS];
 };
+
+struct mr_cxlfork_worker_context {
+    int fd;
+    struct cxlfork_query_caps_v2 caps;
+    uint64_t device_open_ns;
+    uint64_t query_caps_ns;
+    uint64_t policy_check_ns;
+};
 #endif
 
 #define MR_TEMPLATE_ALIGNMENT (2ULL * 1024ULL * 1024ULL)
+
+#if MR_ENABLE_CXLFORK
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)ts.tv_nsec;
+}
+#endif
 
 _Static_assert(sizeof(mr_template_header) == 120,
                "mr template v2 header size must stay stable");
@@ -464,6 +488,33 @@ static uint64_t restore_policy_flags(mr_cxlfork_policy policy)
     }
 }
 
+static int validate_restore_caps(
+    const mr_cxlfork_restore_options *options,
+    const struct cxlfork_query_caps_v2 *caps)
+{
+    uint64_t flags = restore_policy_flags(options->policy);
+
+    if (flags == UINT64_MAX) {
+        return EINVAL;
+    }
+    if (!(caps->restore_policy_mask & flags)) {
+        return EOPNOTSUPP;
+    }
+    if (options->policy == MR_CXLFORK_POLICY_MOW &&
+        !(caps->capabilities & CXLFORK_CAP_MOW_DATA_COW)) {
+        return EOPNOTSUPP;
+    }
+    if (options->policy == MR_CXLFORK_POLICY_MOA &&
+        !(caps->capabilities & CXLFORK_CAP_MOA_DATA_COPY)) {
+        return EOPNOTSUPP;
+    }
+    if (options->policy == MR_CXLFORK_POLICY_HYBRID &&
+        !(caps->capabilities & CXLFORK_CAP_A_BIT_HYBRID)) {
+        return EOPNOTSUPP;
+    }
+    return 0;
+}
+
 static void copy_restore_stats(mr_cxlfork_result *result,
                                const struct cxlfork_restore_stats_v2 *stats)
 {
@@ -494,17 +545,63 @@ static void copy_restore_stats(mr_cxlfork_result *result,
     result->dirty_prefault_pages = stats->dirty_prefault_pages;
     result->validated_ptes = stats->validated_ptes;
 }
+
+static void copy_restore_stats_v3(
+    mr_cxlfork_result *result,
+    const struct cxlfork_restore_stats_v3 *stats)
+{
+    result->stats_version = 3;
+    result->exclusive_supported_mask = stats->supported_mask;
+    result->exclusive_valid_mask = stats->valid_mask;
+    result->path_mask = stats->path_mask;
+    result->kernel_total_ns = stats->total_ns;
+    result->lock_wait_ns = stats->lock_wait_ns;
+    result->lifecycle_ns = stats->lifecycle_ns;
+    result->manifest_validate_ns = stats->manifest_validate_ns;
+    result->image_validate_ns = stats->image_validate_ns;
+    result->checksum_validate_ns = stats->checksum_validate_ns;
+    result->address_conflict_ns = stats->address_conflict_ns;
+    result->vma_create_ns = stats->vma_create_ns;
+    result->upper_pt_alloc_ns = stats->upper_pt_alloc_ns;
+    result->shared_leaf_attach_exclusive_ns =
+        stats->shared_leaf_attach_ns;
+    result->pte_image_validate_ns = stats->pte_image_validate_ns;
+    result->direct_pte_install_ns = stats->direct_pte_install_ns;
+    result->fallback_other_ns = stats->fallback_other_ns;
+    result->dirty_prefault_ns = stats->dirty_prefault_ns;
+    result->global_restore_ns = stats->global_restore_ns;
+    result->kernel_other_ns = stats->other_ns;
+    result->faults = stats->faults;
+    result->fault_dispatch_ns = stats->fault_dispatch_ns;
+    result->leaf_materialize_ns = stats->leaf_materialize_ns;
+    result->data_cow_ns = stats->data_cow_ns;
+    result->cxl_to_local_copy_ns = stats->cxl_to_local_copy_ns;
+    result->shared_leaf_count = stats->shared_leaf_count;
+    result->shared_data_pages = stats->shared_data_pages;
+    result->shared_leaf_pages = stats->shared_data_pages;
+    result->fallback_pages = stats->fallback_pages;
+    result->direct_pte_install_pages = stats->direct_pte_install_pages;
+    result->local_copy_pages = stats->local_copy_pages;
+    result->leaf_copy_pages = stats->leaf_copy_pages;
+    result->dirty_prefault_pages = stats->dirty_prefault_pages;
+    result->validated_ptes = stats->validated_ptes;
+}
 #endif
 
-int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
-                             mr_cxlfork_session **session_out,
-                             mr_cxlfork_result *result)
-{
 #if MR_ENABLE_CXLFORK
+static int restore_begin_internal(
+    const mr_cxlfork_restore_options *options,
+    mr_cxlfork_worker_context *worker,
+    mr_cxlfork_session **session_out,
+    mr_cxlfork_result *result,
+    mr_cxlfork_timing *timing)
+{
     struct cxlfork_query_caps_v2 caps;
     struct cxlfork_resume_v2 resume;
     mr_cxlfork_session *session;
     uint64_t flags;
+    uint64_t begin;
+    uint64_t wrapper_begin = monotonic_ns();
     int err;
 
     if (options == NULL || session_out == NULL || result == NULL ||
@@ -512,47 +609,71 @@ int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
         options->template.role == MR_ROLE_BOTH) {
         return EINVAL;
     }
+    memset(result, 0, sizeof(*result));
+    if (timing != NULL) {
+        memset(timing, 0, sizeof(*timing));
+    }
     flags = restore_policy_flags(options->policy);
     if (flags == UINT64_MAX) {
         return EINVAL;
     }
+
+    begin = monotonic_ns();
     session = calloc(1, sizeof(*session));
+    if (timing != NULL) {
+        timing->session_alloc_ns = monotonic_ns() - begin;
+    }
     if (session == NULL) {
         return ENOMEM;
     }
-    session->fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
-    if (session->fd < 0) {
-        err = errno;
-        free(session);
-        return err;
-    }
-    err = query_caps_fd(session->fd, &caps);
-    if (err != 0 || !(caps.restore_policy_mask & flags)) {
-        if (err == 0) {
-            err = EOPNOTSUPP;
+    session->fd = -1;
+    if (worker != NULL) {
+        session->fd = worker->fd;
+        session->owns_fd = false;
+        caps = worker->caps;
+        if (timing != NULL) {
+            timing->setup_mode = 1;
+            timing->preopen_device_ns = worker->device_open_ns;
+            timing->preopen_caps_ns = worker->query_caps_ns;
+            timing->preopen_policy_ns = worker->policy_check_ns;
         }
-        close(session->fd);
+    } else {
+        begin = monotonic_ns();
+        session->fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+        if (timing != NULL) {
+            timing->device_open_ns = monotonic_ns() - begin;
+        }
+        if (session->fd < 0) {
+            err = errno;
+            free(session);
+            return err;
+        }
+        session->owns_fd = true;
+        begin = monotonic_ns();
+        err = query_caps_fd(session->fd, &caps);
+        if (timing != NULL) {
+            timing->query_caps_ns = monotonic_ns() - begin;
+        }
+        if (err != 0) {
+            close(session->fd);
+            free(session);
+            return err;
+        }
+    }
+    begin = monotonic_ns();
+    err = validate_restore_caps(options, &caps);
+    if (timing != NULL) {
+        timing->policy_check_ns = monotonic_ns() - begin;
+    }
+    if (err != 0) {
+        if (session->owns_fd) {
+            close(session->fd);
+        }
         free(session);
         return err;
     }
-    if (options->policy == MR_CXLFORK_POLICY_MOW &&
-        !(caps.capabilities & CXLFORK_CAP_MOW_DATA_COW)) {
-        close(session->fd);
-        free(session);
-        return EOPNOTSUPP;
-    }
-    if (options->policy == MR_CXLFORK_POLICY_MOA &&
-        !(caps.capabilities & CXLFORK_CAP_MOA_DATA_COPY)) {
-        close(session->fd);
-        free(session);
-        return EOPNOTSUPP;
-    }
-    if (options->policy == MR_CXLFORK_POLICY_HYBRID &&
-        !(caps.capabilities & CXLFORK_CAP_A_BIT_HYBRID)) {
-        close(session->fd);
-        free(session);
-        return EOPNOTSUPP;
-    }
+    session->v3_stats_supported =
+        (caps.capabilities & CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS) != 0;
 
     init_v2(&resume, sizeof(resume));
     resume.key = options->template.key;
@@ -563,17 +684,27 @@ int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
     }
     resume.regions_ptr = (uintptr_t)session->regions;
     resume.region_capacity = CXLFORK_MAX_REGIONS;
+    begin = monotonic_ns();
     if (ioctl(session->fd, CXLFORK_RESUME_V2, &resume) != 0) {
         err = errno;
-        close(session->fd);
+        if (timing != NULL) {
+            timing->resume_ioctl_ns = monotonic_ns() - begin;
+            timing->wrapper_total_ns = monotonic_ns() - wrapper_begin;
+        }
+        if (session->owns_fd) {
+            close(session->fd);
+        }
         free(session);
         return err;
     }
+    if (timing != NULL) {
+        timing->resume_ioctl_ns = monotonic_ns() - begin;
+    }
+    begin = monotonic_ns();
     session->key = options->template.key;
     session->generation = options->generation;
     session->restore_id = resume.restore_id;
     session->region_count = resume.region_count;
-    memset(result, 0, sizeof(*result));
     result->restore_id = resume.restore_id;
     result->total_pages = resume.total_pages;
     result->page_checksum = resume.page_checksum;
@@ -581,15 +712,129 @@ int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
     if (resume.generation != options->generation || resume.region_count == 0 ||
         resume.page_checksum != options->page_checksum ||
         resume.total_pages != options->template.bytes / 4096) {
+        if (timing != NULL) {
+            timing->postcheck_ns = monotonic_ns() - begin;
+            timing->wrapper_total_ns = monotonic_ns() - wrapper_begin;
+        }
         mr_cxlfork_restore_end(session);
         return EILSEQ;
     }
+    if (timing != NULL) {
+        timing->postcheck_ns = monotonic_ns() - begin;
+        timing->wrapper_total_ns = monotonic_ns() - wrapper_begin;
+    }
     *session_out = session;
     return 0;
+}
+#endif
+
+int mr_cxlfork_worker_context_open(
+    const mr_cxlfork_restore_options *options,
+    mr_cxlfork_worker_context **context_out,
+    mr_cxlfork_timing *timing)
+{
+#if MR_ENABLE_CXLFORK
+    mr_cxlfork_worker_context *context;
+    uint64_t begin;
+    int err;
+
+    if (options == NULL || context_out == NULL) {
+        return EINVAL;
+    }
+    if (timing != NULL) {
+        memset(timing, 0, sizeof(*timing));
+        timing->setup_mode = 1;
+    }
+    context = calloc(1, sizeof(*context));
+    if (context == NULL) {
+        return ENOMEM;
+    }
+    context->fd = -1;
+    begin = monotonic_ns();
+    context->fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+    context->device_open_ns = monotonic_ns() - begin;
+    if (context->fd < 0) {
+        err = errno;
+        free(context);
+        return err;
+    }
+    begin = monotonic_ns();
+    err = query_caps_fd(context->fd, &context->caps);
+    context->query_caps_ns = monotonic_ns() - begin;
+    if (err == 0) {
+        begin = monotonic_ns();
+        err = validate_restore_caps(options, &context->caps);
+        context->policy_check_ns = monotonic_ns() - begin;
+    }
+    if (err != 0) {
+        close(context->fd);
+        free(context);
+        return err;
+    }
+    if (timing != NULL) {
+        timing->preopen_device_ns = context->device_open_ns;
+        timing->preopen_caps_ns = context->query_caps_ns;
+        timing->preopen_policy_ns = context->policy_check_ns;
+    }
+    *context_out = context;
+    return 0;
+#else
+    (void)options;
+    (void)context_out;
+    (void)timing;
+    return EOPNOTSUPP;
+#endif
+}
+
+void mr_cxlfork_worker_context_close(mr_cxlfork_worker_context *context)
+{
+#if MR_ENABLE_CXLFORK
+    if (context != NULL) {
+        if (context->fd >= 0) {
+            close(context->fd);
+        }
+        free(context);
+    }
+#else
+    (void)context;
+#endif
+}
+
+int mr_cxlfork_restore_begin_preopened(
+    const mr_cxlfork_restore_options *options,
+    mr_cxlfork_worker_context *context,
+    mr_cxlfork_session **session_out,
+    mr_cxlfork_result *result,
+    mr_cxlfork_timing *timing)
+{
+#if MR_ENABLE_CXLFORK
+    if (context == NULL) {
+        return EINVAL;
+    }
+    return restore_begin_internal(options, context, session_out, result,
+                                  timing);
+#else
+    (void)options;
+    (void)context;
+    (void)session_out;
+    (void)result;
+    (void)timing;
+    return EOPNOTSUPP;
+#endif
+}
+
+int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
+                             mr_cxlfork_session **session_out,
+                             mr_cxlfork_result *result,
+                             mr_cxlfork_timing *timing)
+{
+#if MR_ENABLE_CXLFORK
+    return restore_begin_internal(options, NULL, session_out, result, timing);
 #else
     (void)options;
     (void)session_out;
     (void)result;
+    (void)timing;
     return EOPNOTSUPP;
 #endif
 }
@@ -598,18 +843,34 @@ int mr_cxlfork_restore_collect(mr_cxlfork_session *session,
                                mr_cxlfork_result *result)
 {
 #if MR_ENABLE_CXLFORK
-    struct cxlfork_call_stats_v2 call;
     if (session == NULL || result == NULL) {
         return EINVAL;
     }
-    init_v2(&call, sizeof(call));
-    call.key = session->key;
-    call.generation = session->generation;
-    call.restore_id = session->restore_id;
-    if (ioctl(session->fd, CXLFORK_GET_CALL_STATS_V2, &call) != 0) {
-        return errno;
+    if (session->v3_stats_supported) {
+        struct cxlfork_call_stats_v3 call = {
+            .size = sizeof(call),
+            .abi_version = CXLFORK_ABI_VERSION_V3,
+            .key = session->key,
+            .generation = session->generation,
+            .restore_id = session->restore_id,
+        };
+
+        if (ioctl(session->fd, CXLFORK_GET_CALL_STATS_V3, &call) != 0) {
+            return errno;
+        }
+        copy_restore_stats_v3(result, &call.stats);
+    } else {
+        struct cxlfork_call_stats_v2 call;
+
+        init_v2(&call, sizeof(call));
+        call.key = session->key;
+        call.generation = session->generation;
+        call.restore_id = session->restore_id;
+        if (ioctl(session->fd, CXLFORK_GET_CALL_STATS_V2, &call) != 0) {
+            return errno;
+        }
+        copy_restore_stats(result, &call.stats);
     }
-    copy_restore_stats(result, &call.stats);
     result->restore_id = session->restore_id;
     return 0;
 #else
@@ -632,7 +893,9 @@ void mr_cxlfork_restore_end(mr_cxlfork_session *session)
                          (size_t)region->length);
         }
     }
-    close(session->fd);
+    if (session->owns_fd) {
+        close(session->fd);
+    }
     free(session);
 #else
     (void)session;

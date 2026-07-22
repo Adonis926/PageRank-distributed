@@ -29,9 +29,11 @@
 
 typedef struct mr_porter_slot {
     volatile uint32_t state;
+    volatile uint32_t worker_ready;
+    uint32_t worker_preopen_status;
     uint32_t status;
     uint32_t kind;
-    uint32_t reserved;
+    uint32_t trace_flags;
     uint64_t task_id;
     uint64_t partition_id;
     uint64_t partition_count;
@@ -42,6 +44,8 @@ typedef struct mr_porter_slot {
     uint64_t restore_ioctl_ns;
     uint64_t template_validate_ns;
     uint64_t task_ns;
+    mr_task_trace_v3 trace;
+    mr_cxlfork_timing restore_timing;
     mr_template_binding_result binding;
     mr_cxlfork_result restore;
 } mr_porter_slot;
@@ -191,7 +195,8 @@ int mr_launch_mode_parse(const char *text, mr_launch_mode *mode)
 }
 
 static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
-                           mr_porter_slot *slot)
+                           mr_porter_slot *slot,
+                           mr_cxlfork_worker_context *worker_context)
 {
     byte_buf response = {0};
     const MR_WorkerStateV1 *worker_state = NULL;
@@ -199,17 +204,41 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
     mr_cxlfork_session *session = NULL;
     int err = 0;
 
-    slot->worker_begin_ns = nsec_now();
+    slot->trace.worker_entry_ns = nsec_now();
+    slot->worker_begin_ns = slot->trace.worker_entry_ns;
     memset(&slot->restore, 0, sizeof(slot->restore));
     slot->restore_ioctl_ns = 0;
     slot->template_validate_ns = 0;
+    memset(&slot->restore_timing, 0, sizeof(slot->restore_timing));
     memset(&slot->binding, 0, sizeof(slot->binding));
     if (config->mode == MR_LAUNCH_CXLFORK) {
         template = &config->restore.template;
-        uint64_t begin = nsec_now();
-        err = mr_cxlfork_restore_begin(&config->restore, &session,
-                                       &slot->restore);
-        slot->restore_ioctl_ns = nsec_now() - begin;
+        slot->trace.restore_wrapper_begin_ns = nsec_now();
+        if (worker_context != NULL) {
+            err = mr_cxlfork_restore_begin_preopened(
+                &config->restore, worker_context, &session, &slot->restore,
+                &slot->restore_timing);
+        } else {
+            err = mr_cxlfork_restore_begin(&config->restore, &session,
+                                           &slot->restore,
+                                           &slot->restore_timing);
+        }
+        slot->trace.restore_wrapper_end_ns = nsec_now();
+        slot->restore_ioctl_ns = slot->restore_timing.wrapper_total_ns;
+        slot->trace.restore_postcheck_done_ns =
+            slot->trace.restore_wrapper_end_ns;
+        if (slot->restore_timing.postcheck_ns <=
+            slot->trace.restore_wrapper_end_ns) {
+            slot->trace.resume_ioctl_end_ns =
+                slot->trace.restore_wrapper_end_ns -
+                slot->restore_timing.postcheck_ns;
+        }
+        if (slot->restore_timing.resume_ioctl_ns <=
+            slot->trace.resume_ioctl_end_ns) {
+            slot->trace.resume_ioctl_begin_ns =
+                slot->trace.resume_ioctl_end_ns -
+                slot->restore_timing.resume_ioctl_ns;
+        }
     }
     if (err == 0) {
         mr_worker_role expected_role;
@@ -217,16 +246,27 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
             expected_role = MR_ROLE_MAP;
         } else if (slot->kind == MR_TASK_REDUCE) {
             expected_role = MR_ROLE_REDUCE;
+        } else if (slot->kind == MR_TASK_ACTIVATION_PROBE &&
+                   slot->payload_len >= sizeof(mr_activation_probe_request)) {
+            const mr_activation_probe_request *probe = slot_payload(slot);
+            expected_role = (mr_worker_role)probe->expected_role;
         } else {
             expected_role = 0;
             err = EINVAL;
         }
         if (err == 0) {
-            uint64_t begin = nsec_now();
+            slot->trace.template_bind_begin_ns = nsec_now();
             err = mr_template_bind((void *)(uintptr_t)template->base,
                                    template, expected_role, &worker_state,
                                    &slot->binding);
-            slot->template_validate_ns = nsec_now() - begin;
+            slot->trace.template_bind_end_ns = nsec_now();
+            slot->template_validate_ns =
+                slot->trace.template_bind_end_ns -
+                slot->trace.template_bind_begin_ns;
+            if (err == 0) {
+                slot->trace.state_ready_ns =
+                    slot->trace.template_bind_end_ns;
+            }
         }
         if (err == 0 && config->mode == MR_LAUNCH_CXLFORK &&
             config->restore_hold_ms != 0) {
@@ -237,13 +277,16 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
     if (err == 0 && slot->payload_len > config->slot_bytes) {
         err = EMSGSIZE;
     } else if (err == 0) {
-        uint64_t begin = nsec_now();
+        slot->trace.business_entry_ns = nsec_now();
         err = config->task_fn(config->task_context, worker_id, slot->kind,
                               slot->task_id, slot->partition_id,
                               slot->partition_count, worker_state,
                               &slot->binding, slot_payload(slot),
-                              (size_t)slot->payload_len, &response);
-        slot->task_ns = nsec_now() - begin;
+                              (size_t)slot->payload_len, &response,
+                              &slot->trace);
+        slot->trace.task_done_ns = nsec_now();
+        slot->task_ns = slot->trace.task_done_ns -
+                        slot->trace.business_entry_ns;
         if (err == 0 &&
             (slot->binding.flags &
              (MR_TEMPLATE_BIND_VALIDATED | MR_TEMPLATE_BIND_ROLE_MATCH |
@@ -255,7 +298,9 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
         }
     }
     if (session != NULL) {
+        slot->trace.restore_collect_begin_ns = nsec_now();
         int collect_err = mr_cxlfork_restore_collect(session, &slot->restore);
+        slot->trace.restore_collect_end_ns = nsec_now();
         if (err == 0 && collect_err != 0) {
             err = collect_err;
         }
@@ -271,16 +316,31 @@ static void worker_run_one(const mr_porter_config *config, uint32_t worker_id,
                response.len);
     }
     byte_buf_clear(&response);
+    slot->trace.slot_done_publish_ns = nsec_now();
     slot_publish(slot, MR_PORTER_SLOT_DONE);
 }
 
 static void worker_main(const mr_porter_config *config, uint32_t worker_id,
                         mr_porter_slot *slot, bool persistent, int control_fd)
 {
+    mr_cxlfork_worker_context *worker_context = NULL;
+    mr_cxlfork_timing preopen_timing = {0};
+    int startup_err = 0;
+
     close(control_fd);
-    if (config->mode != MR_LAUNCH_CXLFORK &&
-        mr_template_validate((void *)(uintptr_t)config->template.base,
-                             &config->template, NULL) != 0) {
+    if (config->mode == MR_LAUNCH_CXLFORK && config->restore_preopen) {
+        startup_err = mr_cxlfork_worker_context_open(
+            &config->restore, &worker_context, &preopen_timing);
+    } else if (config->mode != MR_LAUNCH_CXLFORK) {
+        startup_err = mr_template_validate(
+            (void *)(uintptr_t)config->template.base,
+            &config->template, NULL);
+    }
+    slot->worker_preopen_status = (uint32_t)startup_err;
+    __sync_synchronize();
+    slot->worker_ready = 1;
+    __sync_synchronize();
+    if (startup_err != 0) {
         _exit(120);
     }
     if (!persistent) {
@@ -289,10 +349,13 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
             sched_yield();
         }
         if (slot->state == MR_PORTER_SLOT_STOP) {
+            mr_cxlfork_worker_context_close(worker_context);
             _exit(0);
         }
         __sync_synchronize();
-        worker_run_one(config, worker_id, slot);
+        slot->trace.worker_slot_observed_ns = nsec_now();
+        worker_run_one(config, worker_id, slot, worker_context);
+        mr_cxlfork_worker_context_close(worker_context);
         _exit(slot->status == 0 ? 0 : 1);
     }
     for (;;) {
@@ -301,10 +364,13 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
             sched_yield();
         }
         if (slot->state == MR_PORTER_SLOT_STOP) {
+            mr_cxlfork_worker_context_close(worker_context);
             _exit(0);
         }
         if (slot->state == MR_PORTER_SLOT_READY) {
-            worker_run_one(config, worker_id, slot);
+            __sync_synchronize();
+            slot->trace.worker_slot_observed_ns = nsec_now();
+            worker_run_one(config, worker_id, slot, worker_context);
         }
     }
 }
@@ -312,11 +378,37 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
 static pid_t spawn_worker(const mr_porter_config *config, uint32_t worker_id,
                           mr_porter_slot *slot, bool persistent, int control_fd)
 {
+    slot->worker_ready = 0;
+    slot->worker_preopen_status = 0;
+    __sync_synchronize();
     pid_t pid = fork();
     if (pid == 0) {
         worker_main(config, worker_id, slot, persistent, control_fd);
     }
     return pid;
+}
+
+static int wait_worker_ready(pid_t pid, mr_porter_slot *slot)
+{
+    uint64_t deadline = nsec_now() + UINT64_C(5000000000);
+
+    while (!slot->worker_ready) {
+        int status;
+        pid_t done = waitpid(pid, &status, WNOHANG);
+
+        if (done == pid) {
+            return ECHILD;
+        }
+        if (done < 0) {
+            return errno;
+        }
+        if (nsec_now() >= deadline) {
+            return ETIMEDOUT;
+        }
+        sched_yield();
+    }
+    __sync_synchronize();
+    return (int)slot->worker_preopen_status;
 }
 
 static void stop_workers(pid_t *pids, const mr_porter_config *config,
@@ -376,6 +468,11 @@ static void supervisor_main(mr_porter_config config, void *shared,
                 err = errno;
                 break;
             }
+            err = wait_worker_ready(
+                pids[i], slot_at(shared, config.slot_bytes, i));
+            if (err != 0) {
+                break;
+            }
         }
     }
     if (err != 0 && pids != NULL) {
@@ -430,19 +527,30 @@ static void supervisor_main(mr_porter_config config, void *shared,
             mr_porter_slot *slot =
                 slot_at(shared, config.slot_bytes, worker);
             begin_ns[worker] = nsec_now();
+            slot->trace.supervisor_command_received_ns = begin_ns[worker];
             dispatch_ns[worker] = begin_ns[worker] - command.dispatch_ns;
             fork_ns[worker] = 0;
             executed_pids[worker] = pids[worker];
             inflight[worker] = true;
             if (config.mode == MR_LAUNCH_LOCALFORK) {
                 uint64_t phase = nsec_now();
+                slot->trace.fork_begin_ns = phase;
                 executed_pids[worker] =
                     spawn_worker(&config, worker, slot, false, control_fd);
-                fork_ns[worker] = nsec_now() - phase;
+                slot->trace.fork_return_ns = nsec_now();
+                fork_ns[worker] = slot->trace.fork_return_ns - phase;
                 if (executed_pids[worker] < 0) {
                     slot->status = (uint32_t)errno;
                     slot_publish(slot, MR_PORTER_SLOT_DONE);
+                } else {
+                    slot->trace.slot_ready_publish_ns = nsec_now();
+                    slot->submit_ns = slot->trace.slot_ready_publish_ns;
+                    slot_publish(slot, MR_PORTER_SLOT_READY);
                 }
+            } else {
+                slot->trace.slot_ready_publish_ns = nsec_now();
+                slot->submit_ns = slot->trace.slot_ready_publish_ns;
+                slot_publish(slot, MR_PORTER_SLOT_READY);
             }
         } else if (command_err != EAGAIN && command_err != EWOULDBLOCK) {
             break;
@@ -459,6 +567,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
             }
             __sync_synchronize();
             progress = true;
+            slot->trace.supervisor_done_observed_ns = nsec_now();
             uint64_t phase;
             memset(&reply.result, 0, sizeof(reply.result));
             reply.op = MR_PORTER_OP_DISPATCH;
@@ -477,22 +586,38 @@ static void supervisor_main(mr_porter_config config, void *shared,
             reply.result.template_validate_ns = slot->template_validate_ns;
             reply.result.binding = slot->binding;
             reply.result.restore = slot->restore;
+            reply.result.trace_flags = slot->trace_flags;
+            reply.result.trace = slot->trace;
+            reply.result.restore_timing = slot->restore_timing;
 
             if (config.mode != MR_LAUNCH_PERSISTENT &&
                 executed_pids[worker] > 0) {
                 phase = nsec_now();
+                reply.result.trace.reap_begin_ns = phase;
                 (void)waitpid(executed_pids[worker], NULL, 0);
-                reply.result.reap_ns = nsec_now() - phase;
+                reply.result.trace.reap_end_ns = nsec_now();
+                reply.result.reap_ns =
+                    reply.result.trace.reap_end_ns - phase;
             }
             if (config.mode == MR_LAUNCH_LOCAL_PREFORK ||
                 config.mode == MR_LAUNCH_CXLFORK) {
                 phase = nsec_now();
+                reply.result.trace.refill_begin_ns = phase;
                 pids[worker] = spawn_worker(&config, worker, slot, false,
                                             control_fd);
                 if (pids[worker] < 0 && reply.result.status == 0) {
                     reply.result.status = (uint32_t)errno;
+                } else if (pids[worker] > 0) {
+                    int ready_err = wait_worker_ready(pids[worker], slot);
+                    if (ready_err != 0 && reply.result.status == 0) {
+                        reply.result.status = (uint32_t)ready_err;
+                    }
                 }
-                reply.result.refill_ns = nsec_now() - phase;
+                reply.result.trace.refill_end_ns = nsec_now();
+                reply.result.trace.pool_ready_ns =
+                    reply.result.trace.refill_end_ns;
+                reply.result.refill_ns =
+                    reply.result.trace.refill_end_ns - phase;
             }
             reply.result.total_ns = nsec_now() - begin_ns[worker];
             inflight[worker] = false;
@@ -598,7 +723,8 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
 int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
                      uint64_t task_id, uint64_t partition_id,
                      uint64_t partition_count, const void *payload,
-                     size_t payload_len)
+                     size_t payload_len, uint64_t agent_request_received_ns,
+                     uint64_t agent_parse_done_ns)
 {
     if (porter == NULL || worker_id >= porter->workers ||
         payload_len > porter->slot_bytes) {
@@ -609,6 +735,11 @@ int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
         return EBUSY;
     }
     slot->status = 0;
+    memset(&slot->trace, 0, sizeof(slot->trace));
+    memset(&slot->restore_timing, 0, sizeof(slot->restore_timing));
+    slot->trace.porter_submit_begin_ns = nsec_now();
+    slot->trace.agent_request_received_ns = agent_request_received_ns;
+    slot->trace.agent_parse_done_ns = agent_parse_done_ns;
     slot->kind = kind;
     slot->task_id = task_id;
     slot->partition_id = partition_id;
@@ -620,15 +751,19 @@ int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
     slot->restore_ioctl_ns = 0;
     slot->template_validate_ns = 0;
     slot->task_ns = 0;
+    slot->trace_flags = 0;
     memset(&slot->binding, 0, sizeof(slot->binding));
     memset(&slot->restore, 0, sizeof(slot->restore));
     if (payload_len > 0) {
         memcpy(slot_payload(slot), payload, payload_len);
     }
+    if (kind == MR_TASK_ACTIVATION_PROBE &&
+        payload_len >= sizeof(mr_activation_probe_request)) {
+        const mr_activation_probe_request *probe = slot_payload(slot);
+        slot->trace_flags = probe->flags | MR_TRACE_F_ACTIVATION_PROBE;
+    }
+    slot->trace.payload_copy_done_ns = nsec_now();
     porter->busy[worker_id] = true;
-    slot->submit_ns = nsec_now();
-    slot_publish(slot, MR_PORTER_SLOT_READY);
-
     mr_porter_command command = {
         .size = sizeof(command),
         .version = MR_PORTER_PROTOCOL_VERSION,
@@ -701,7 +836,7 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
 {
     int err = mr_porter_submit(porter, worker_id, kind, task_id,
                                partition_id, partition_count, payload,
-                               payload_len);
+                               payload_len, 0, 0);
     if (err != 0) {
         return err;
     }

@@ -104,9 +104,38 @@ typedef struct mr_cxlfork_result {
     uint64_t leaf_copy_pages;
     uint64_t dirty_prefault_pages;
     uint64_t validated_ptes;
+    uint64_t stats_version;
+    uint64_t exclusive_supported_mask;
+    uint64_t exclusive_valid_mask;
+    uint64_t manifest_validate_ns;
+    uint64_t image_validate_ns;
+    uint64_t checksum_validate_ns;
+    uint64_t address_conflict_ns;
+    uint64_t shared_leaf_attach_exclusive_ns;
+    uint64_t pte_image_validate_ns;
+    uint64_t direct_pte_install_ns;
+    uint64_t fallback_other_ns;
+    uint64_t shared_leaf_count;
+    uint64_t shared_data_pages;
+    uint64_t direct_pte_install_pages;
 } mr_cxlfork_result;
 
+typedef struct mr_cxlfork_timing {
+    uint64_t wrapper_total_ns;
+    uint64_t session_alloc_ns;
+    uint64_t device_open_ns;
+    uint64_t query_caps_ns;
+    uint64_t policy_check_ns;
+    uint64_t resume_ioctl_ns;
+    uint64_t postcheck_ns;
+    uint64_t preopen_device_ns;
+    uint64_t preopen_caps_ns;
+    uint64_t preopen_policy_ns;
+    uint64_t setup_mode;
+} mr_cxlfork_timing;
+
 typedef struct mr_cxlfork_session mr_cxlfork_session;
+typedef struct mr_cxlfork_worker_context mr_cxlfork_worker_context;
 
 const char *mr_role_name(mr_worker_role role);
 int mr_role_parse(const char *text, mr_worker_role *role);
@@ -122,7 +151,19 @@ int mr_template_bind(const void *mapping, const mr_template_options *opts,
 void mr_template_unmap(void *mapping, uint64_t bytes);
 int mr_cxlfork_restore_begin(const mr_cxlfork_restore_options *options,
                              mr_cxlfork_session **session,
-                             mr_cxlfork_result *result);
+                             mr_cxlfork_result *result,
+                             mr_cxlfork_timing *timing);
+int mr_cxlfork_worker_context_open(
+    const mr_cxlfork_restore_options *options,
+    mr_cxlfork_worker_context **context,
+    mr_cxlfork_timing *timing);
+void mr_cxlfork_worker_context_close(mr_cxlfork_worker_context *context);
+int mr_cxlfork_restore_begin_preopened(
+    const mr_cxlfork_restore_options *options,
+    mr_cxlfork_worker_context *context,
+    mr_cxlfork_session **session,
+    mr_cxlfork_result *result,
+    mr_cxlfork_timing *timing);
 int mr_cxlfork_restore_collect(mr_cxlfork_session *session,
                                mr_cxlfork_result *result);
 void mr_cxlfork_restore_end(mr_cxlfork_session *session);

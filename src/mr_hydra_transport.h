@@ -40,6 +40,16 @@ typedef struct mr_hydra_open_config {
     bool create;
 } mr_hydra_open_config;
 
+typedef struct mr_hydra_send_observation {
+    hydra_send_timing phases;
+    uint64_t call_begin_ns;
+    uint64_t publish_done_ns;
+    uint64_t wait_ns;
+    uint64_t retries;
+    uint32_t queue_was_empty;
+    uint32_t reserved;
+} mr_hydra_send_observation;
+
 mr_backend mr_backend_parse(const char *value);
 const char *mr_backend_name(mr_backend backend);
 mr_queue_policy mr_queue_policy_parse(const char *value);
@@ -50,8 +60,14 @@ int mr_hydra_open(hydra_ctx **ctx, mr_backend backend, const char *path,
 int mr_hydra_open_ex(hydra_ctx **ctx, const mr_hydra_open_config *config);
 int mr_hydra_send_request_poll(hydra_ctx *ctx, uint64_t req_id,
                                const byte_buf *payload);
+int mr_hydra_send_request_poll_observed(
+    hydra_ctx *ctx, uint64_t req_id, const byte_buf *payload,
+    mr_hydra_send_observation *observation);
 int mr_hydra_send_response_poll(hydra_ctx *ctx, const hydra_msg *request,
                                 uint32_t status, const byte_buf *payload);
+int mr_hydra_send_response_poll_observed(
+    hydra_ctx *ctx, const hydra_msg *request, uint32_t status,
+    const byte_buf *payload, mr_hydra_send_observation *observation);
 int mr_hydra_recv_request_poll(hydra_ctx *ctx, uint64_t *offset,
                                const hydra_msg **msg, const uint8_t **payload);
 int mr_hydra_recv_response(hydra_ctx *ctx, uint64_t *offset,
