@@ -117,6 +117,7 @@ typedef struct master_args {
     const char *input;
     const char *output;
     const char *schedule;
+    const char *ready_file;
     uint64_t map_size;
     uint64_t queue_capacity;
     uint64_t payload_max;
@@ -2065,6 +2066,21 @@ static int run_master(const master_args *args)
         }
     }
 
+    if (args->ready_file != NULL) {
+        int ready_fd = open(args->ready_file,
+                            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (ready_fd < 0) {
+            fprintf(stderr, "master: create ready file failed: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        if (close(ready_fd) != 0) {
+            fprintf(stderr, "master: close ready file failed: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+    }
+
     if (probe_only) {
         uint64_t total = args->activation_warmups + args->activation_probes;
 
@@ -2471,6 +2487,7 @@ static void usage(const char *argv0)
             "        [--activation-probes=N] [--activation-warmups=N]\n"
             "        [--probe-agent=N] [--probe-role=map|reduce]\n"
             "        [--probe-state-checksum=N]\n"
+            "        [--ready-file=PATH] (runner synchronization)\n"
             "        [--connections=N]\n"
             "        [--queue-policy=shared_pair|per_connection]\n"
             "agent: [--store-dir=DIR] [--agent-count=N] [--global-worker-base=N]\n"
@@ -2510,6 +2527,8 @@ static int parse_master_args(master_args *args, int argc, char **argv)
             args->output = value;
         } else if ((value = arg_value(argv[i], "--schedule=")) != NULL) {
             args->schedule = value;
+        } else if ((value = arg_value(argv[i], "--ready-file=")) != NULL) {
+            args->ready_file = value;
         } else if ((value = arg_value(argv[i], "--agent=")) != NULL) {
             str_list_push(&args->agents, value);
         } else if ((value = arg_value(argv[i], "--agents=")) != NULL) {

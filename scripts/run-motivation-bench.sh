@@ -206,13 +206,18 @@ start_agents() {
     reduce_template+=" --template-key='$TEMPLATE_KEY' --template-generation='$ACTIVE_GENERATION'"
     reduce_template+=" --template-page-checksum='$TEMPLATE_CHECKSUM'"
   fi
-  stop_agents
   guest "$VM0_PORT" \
     "sudo rm -rf /tmp/${scenario}-map; sudo sh -c 'nohup $GUEST_BIN agent --backend=ivshmem --path=/sys/bus/pci/devices/0000:00:02.0/resource2 --node-id=0 --agent-count=2 --workers=$WORKERS --role=map --launch=localfork --template-bytes=$bytes --store-dir=/tmp/${scenario}-map --size=$MAP_SIZE --payload-max=$PAYLOAD_MAX --queue-capacity=$QUEUE_CAPACITY --shuffle-connections=$WORKERS --queue-policy=shared_pair --quiet > /tmp/${scenario}-agent0.log 2>&1 &'"
   guest "$VM1_PORT" \
     "sudo rm -rf /tmp/${scenario}-reduce; sudo sh -c 'nohup $GUEST_BIN agent --backend=ivshmem --path=/sys/bus/pci/devices/0000:00:03.0/resource2 --node-id=1 --agent-count=2 --workers=$WORKERS --global-worker-base=$WORKERS --role=reduce --launch=$launch $reduce_template --cxlfork-policy=$POLICY --validation=$VALIDATION --restore-setup=$setup --store-dir=/tmp/${scenario}-reduce --size=$MAP_SIZE --payload-max=$PAYLOAD_MAX --queue-capacity=$QUEUE_CAPACITY --shuffle-connections=$WORKERS --queue-policy=shared_pair --quiet > /tmp/${scenario}-agent1.log 2>&1 &'"
   : > "$scenario_dir/agent0.log"
   : > "$scenario_dir/agent1.log"
+}
+
+wait_master_ready() {
+  local ready_file=$1
+  guest "$VM0_PORT" \
+    "for i in \$(seq 1 1000); do sudo test -f '$ready_file' && exit 0; sleep 0.01; done; exit 1"
 }
 
 collect_agent_logs() {
@@ -238,10 +243,20 @@ run_probe_scenario() {
     TEMPLATE_CHECKSUM=0
     TEMPLATE_STATE_CHECKSUM=0
   fi
-  start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
+  stop_agents
+  local ready_file="/tmp/${scenario}-master.ready"
+  guest "$VM0_PORT" "sudo rm -f '$ready_file'"
   guest "$VM0_PORT" \
-    "sudo '$GUEST_BIN' master --backend=ivshmem --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --workers-per-agent='$WORKERS' --activation-warmups='$WARMUPS' --activation-probes='$block_samples' --probe-agent=1 --probe-role=reduce --probe-state-checksum='$TEMPLATE_STATE_CHECKSUM' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
-    > "$scenario_dir/master.log" 2>&1 || rc=$?
+    "sudo '$GUEST_BIN' master --backend=ivshmem --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --workers-per-agent='$WORKERS' --activation-warmups='$WARMUPS' --activation-probes='$block_samples' --probe-agent=1 --probe-role=reduce --probe-state-checksum='$TEMPLATE_STATE_CHECKSUM' --ready-file='$ready_file' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
+    > "$scenario_dir/master.log" 2>&1 &
+  local master_ssh_pid=$!
+  if wait_master_ready "$ready_file"; then
+    start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
+  else
+    rc=1
+    stop_agents
+  fi
+  wait "$master_ssh_pid" || rc=$?
   collect_agent_logs "$scenario" "$scenario_dir"
   if [[ "$launch" == cxlfork ]]; then
     release_template "$scenario_dir/template-release.log" || rc=$?
@@ -274,10 +289,20 @@ run_wordcount_scenario() {
     TEMPLATE_CHECKSUM=0
     TEMPLATE_STATE_CHECKSUM=0
   fi
-  start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
+  stop_agents
+  local ready_file="/tmp/${scenario}-master.ready"
+  guest "$VM0_PORT" "sudo rm -f '$ready_file'"
   guest "$VM0_PORT" \
-    "sudo '$GUEST_BIN' master --backend=ivshmem --input=/tmp/motivation-wordcount-input.txt --output=/tmp/${scenario}-output.txt --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --schedule=role-static --workers-per-agent='$WORKERS' --reducers='$WORKERS' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
-    > "$scenario_dir/master.log" 2>&1 || rc=$?
+    "sudo '$GUEST_BIN' master --backend=ivshmem --input=/tmp/motivation-wordcount-input.txt --output=/tmp/${scenario}-output.txt --agent=/sys/bus/pci/devices/0000:00:02.0/resource2 --agent=/sys/bus/pci/devices/0000:00:03.0/resource2 --schedule=role-static --workers-per-agent='$WORKERS' --reducers='$WORKERS' --ready-file='$ready_file' --size='$MAP_SIZE' --payload-max='$PAYLOAD_MAX' --queue-capacity='$QUEUE_CAPACITY' --connections='$WORKERS' --queue-policy=shared_pair --quiet" \
+    > "$scenario_dir/master.log" 2>&1 &
+  local master_ssh_pid=$!
+  if wait_master_ready "$ready_file"; then
+    start_agents "$scenario" "$launch" "$setup" "$bytes" "$scenario_dir"
+  else
+    rc=1
+    stop_agents
+  fi
+  wait "$master_ssh_pid" || rc=$?
   collect_agent_logs "$scenario" "$scenario_dir"
   copy_from_guest "$VM0_PORT" "/tmp/${scenario}-output.txt" "$scenario_dir/output.txt" || rc=$?
   if [[ -f "$scenario_dir/output.txt" ]]; then
