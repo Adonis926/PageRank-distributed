@@ -206,9 +206,9 @@ mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' |
 combined_input="$output_dir/combined-input.txt"
 cat "${input_files[@]}" > "$combined_input"
 
-ssh_base_opts=()
+ssh_base_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 if [[ -n "$ssh_key" ]]; then
-  ssh_base_opts+=(-i "$ssh_key")
+	ssh_base_opts+=(-o IdentitiesOnly=yes -i "$ssh_key")
 fi
 
 split_ssh_endpoint() {
