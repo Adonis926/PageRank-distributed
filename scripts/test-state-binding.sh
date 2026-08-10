@@ -11,10 +11,15 @@ EXPECTED=${EXPECTED:-/home/xtl/cxlfork/mr-file-sim-smoke/expected.txt}
 VM0_PORT=${VM0_PORT:-2200}
 VM1_PORT=${VM1_PORT:-2201}
 SSH_USER=${SSH_USER:-ubuntu}
+SSH_KEY=${SSH_KEY:-}
 TEST_KEY=${TEST_KEY:-2002}
 TEMPLATE_BYTES=${TEMPLATE_BYTES:-4194304}
 WORKERS=${WORKERS:-2}
 GUEST_BIN=${GUEST_BIN:-/tmp/mr_hydra_state_binding}
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_OPTS+=(-o IdentitiesOnly=yes -i "$SSH_KEY")
+fi
 
 die() {
   printf 'state-binding-test: %s\n' "$*" >&2
@@ -24,7 +29,7 @@ die() {
 guest() {
   local port=$1
   shift
-  ssh -p "$port" -o StrictHostKeyChecking=no "$SSH_USER"@localhost "$@"
+  ssh "${SSH_OPTS[@]}" -p "$port" "$SSH_USER"@localhost "$@"
 }
 
 field() {
@@ -66,6 +71,8 @@ run_case() {
   local policy=${6:-mow}
   local out="$RESULT_ROOT/$name"
   local input_bytes
+  local ssh_key_args=()
+  [[ -n "$SSH_KEY" ]] && ssh_key_args+=(--ssh-key="$SSH_KEY")
   input_bytes=$(find "$INPUT_DIR" -maxdepth 1 -type f -name '*.txt' -print0 |
     xargs -0 wc -c | awk 'END {print $1}')
   rm -rf "$out"
@@ -79,6 +86,7 @@ run_case() {
     --worker="127.0.0.1:$VM0_PORT,/sys/bus/pci/devices/0000:00:02.0/resource2,/sys/bus/pci/devices/0000:00:02.0/resource2,map,localfork,$WORKERS" \
     --worker="127.0.0.1:$VM1_PORT,/sys/bus/pci/devices/0000:00:03.0/resource2,/sys/bus/pci/devices/0000:00:03.0/resource2,reduce,cxlfork,$WORKERS" \
     --ssh-user="$SSH_USER" --remote-dir="/tmp/mr-binding-$name" \
+    "${ssh_key_args[@]}" \
     --no-remote-build --remote-binary="$GUEST_BIN" --sudo \
     --backend=ivshmem --shuffle-backend=ivshmem \
     --size=2147483648 --payload-max=4194304 \
@@ -159,7 +167,7 @@ cmake -S "$ROOT" -B "$ROOT/build-static-cxlfork" \
 cmake --build "$ROOT/build-static-cxlfork" -j"$(nproc)"
 
 for port in "$VM0_PORT" "$VM1_PORT"; do
-  scp -q -P "$port" -o StrictHostKeyChecking=no \
+  scp -q -P "$port" "${SSH_OPTS[@]}" \
     "$ROOT/build-static-cxlfork/mr_hydra" \
     "$SSH_USER"@localhost:"$GUEST_BIN"
   guest "$port" "sudo '$GUEST_BIN' cxlfork-caps"
