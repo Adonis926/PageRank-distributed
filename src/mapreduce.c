@@ -1752,6 +1752,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             " pool_spawn_begin_ns=%" PRIu64
             " first_worker_ready_ns=%" PRIu64
             " initial_pool_ready_ns=%" PRIu64
+            " porter_init_reply_received_ns=%" PRIu64
             " porter_start_end_ns=%" PRIu64
             " stop_begin_ns=%" PRIu64
             " stop_command_sent_ns=%" PRIu64
@@ -1776,6 +1777,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             porter_start_trace.pool_spawn_begin_ns,
             porter_start_trace.first_worker_ready_ns,
             porter_start_trace.pool_ready_ns,
+            porter_start_trace.init_reply_received_ns,
             porter_start_trace.start_end_ns,
             porter_stop_trace.stop_begin_ns,
             porter_stop_trace.stop_command_sent_ns,
@@ -2008,6 +2010,7 @@ static void report_task_result_observed(
             " pool_spawn_begin_ns=%" PRIu64
             " first_worker_ready_ns=%" PRIu64
             " initial_pool_ready_ns=%" PRIu64
+            " porter_init_reply_received_ns=%" PRIu64
             " porter_start_end_ns=%" PRIu64
             " executed_pid=%" PRId64
             " executed_spawn_flags=%u"
@@ -2040,6 +2043,7 @@ static void report_task_result_observed(
             result->cold_start.pool_spawn_begin_ns,
             result->cold_start.first_worker_ready_ns,
             result->cold_start.pool_ready_ns,
+            result->cold_start.init_reply_received_ns,
             result->cold_start.start_end_ns,
             result->executed_worker.pid,
             result->executed_worker.flags,
