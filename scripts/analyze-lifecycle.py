@@ -271,6 +271,19 @@ def load_scenario(directory: Path, manifest: dict[str, str]) -> tuple[
               "workers_stop_begin_ns")
     put_delta(lifecycle, "supervisor_wait_total_ns", "supervisor_wait_end_ns",
               "supervisor_wait_begin_ns")
+    prepare_accounted = sum(int(lifecycle.get(f"template_{name}", 0))
+                            for name in [
+                                "prepare_lock_ns", "prepare_lifecycle_ns",
+                                "prepare_vma_preflight_ns",
+                                "prepare_pte_walk_ns", "prepare_gup_ns",
+                                "prepare_page_copy_ns",
+                                "prepare_pte_recheck_ns",
+                                "prepare_metadata_ns", "prepare_checksum_ns",
+                                "prepare_publish_ns", "prepare_other_ns",
+                            ])
+    lifecycle["template_prepare_accounted_ns"] = prepare_accounted
+    lifecycle["template_prepare_unaccounted_ns"] = \
+        int(lifecycle.get("template_prepare_total_ns", 0)) - prepare_accounted
     lifecycle["observed_cold"] = sum(row["phase"] == "cold" for row in rows)
     lifecycle["observed_steady"] = sum(row["phase"] == "steady" for row in rows)
     return rows, lifecycle, jobs
@@ -379,6 +392,8 @@ def main() -> int:
             errors.append(f"{label}: steady task count mismatch")
         if int(row.get("template_prepare_total_ns", 0)) == 0:
             errors.append(f"{label}: missing template prepare stats")
+        if int(row.get("template_prepare_unaccounted_ns", 1)) != 0:
+            errors.append(f"{label}: prepare buckets do not sum to total")
         if int(row.get("porter_stop_total_ns", 0)) == 0:
             errors.append(f"{label}: missing porter teardown stats")
 
@@ -392,14 +407,15 @@ def main() -> int:
               ["scenario", "cycle", "status", "begin_ns", "end_ns",
                "total_ns", "map_tasks", "reducers"])
 
-    worker_by_pid: dict[int, dict[str, object]] = {}
+    worker_by_pid: dict[tuple[str, int], dict[str, object]] = {}
     for row in reducer_tasks:
         for relation, prefix in [("executed", "executed"),
                                  ("replacement", "replacement")]:
             pid = int(row.get(f"{prefix}_pid", 0))
             if pid <= 0:
                 continue
-            worker = worker_by_pid.setdefault(pid, {
+            worker_key = (str(row["scenario"]), pid)
+            worker = worker_by_pid.setdefault(worker_key, {
                 "scenario": row["scenario"], "cycle": row["cycle"],
                 "pid": pid, "worker": row.get("worker", ""),
                 "created_after_task": "", "executed_task": "",
