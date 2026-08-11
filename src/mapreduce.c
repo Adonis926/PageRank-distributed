@@ -177,6 +177,7 @@ typedef struct agent_args {
     uint64_t restore_hold_ms;
     bool validate_full;
     bool restore_preopen;
+    bool lazy_porter;
     bool create;
     bool quiet;
 } agent_args;
@@ -736,7 +737,7 @@ static int recv_hydra_response_observed(hydra_ctx *ctx, mr_wire_header *hdr,
         if (status != 0 &&
             (hdr->kind == MR_TASK_MAP || hdr->kind == MR_TASK_REDUCE ||
              hdr->kind == MR_TASK_ACTIVATION_PROBE) &&
-            body->len >= sizeof(mr_task_result_v3)) {
+            body->len >= sizeof(mr_task_result_v4)) {
             /*
              * Porter failures still carry a versioned measurement envelope.
              * Let the caller unwrap and report it instead of printing binary
@@ -1335,6 +1336,11 @@ static mr_kernel_restore_stats_v3 kernel_stats_from_restore(
 static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                      Partitioner partitioner)
 {
+    uint64_t agent_process_start_ns = hydra_now_ns();
+    uint64_t agent_transport_ready_ns = 0;
+    uint64_t agent_ready_published_ns = 0;
+    mr_porter_start_trace_v1 porter_start_trace = {0};
+    mr_porter_stop_trace_v1 porter_stop_trace = {0};
     int err = mkdir_p(args->store_dir);
     if (err != 0) {
         fprintf(stderr, "agent: create store failed: %s\n", strerror(err));
@@ -1391,11 +1397,6 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
         .task_context = &worker_context,
     };
     mr_porter *porter = NULL;
-    err = mr_porter_start(&porter_config, &porter);
-    if (err != 0) {
-        fprintf(stderr, "agent: start porter failed: %s\n", strerror(err));
-        return 1;
-    }
 
     hydra_ctx *ctx = NULL;
     mr_hydra_open_config config = {
@@ -1422,8 +1423,19 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
     if (err != 0) {
         fprintf(stderr, "agent: open control backend failed: %s\n",
                 hydra_strerror(err));
-        mr_porter_stop(porter);
         return 1;
+    }
+    agent_transport_ready_ns = hydra_now_ns();
+
+    if (!args->lazy_porter) {
+        err = mr_porter_start_timed(&porter_config, &porter,
+                                    &porter_start_trace);
+        if (err != 0) {
+            fprintf(stderr, "agent: start porter failed: %s\n",
+                    strerror(err));
+            hydra_close(ctx);
+            return 1;
+        }
     }
 
     if (args->ready_file != NULL) {
@@ -1438,20 +1450,24 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             return 1;
         }
     }
+    agent_ready_published_ns = hydra_now_ns();
 
     if (!args->quiet) {
         printf("agent[%" PRIu64 "]: role=%s launch=%s workers=%" PRIu64
-               " endpoint=%s store=%s\n",
+               " porter_start=%s endpoint=%s store=%s\n",
                args->node_id, mr_role_name(args->role),
                mr_launch_mode_name(args->launch_mode), args->workers,
+               args->lazy_porter ? "lazy" : "eager",
                args->path, args->store_dir);
         fflush(stdout);
     }
 
     typedef struct agent_pending {
         bool active;
+        bool lifecycle_cold;
         hydra_msg request;
         mr_wire_header header;
+        mr_porter_start_trace_v1 cold_start;
     } agent_pending;
     agent_pending *pending =
         mr_xcalloc((size_t)args->workers, sizeof(*pending));
@@ -1482,18 +1498,36 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             if (request_err == 0 &&
                 (hdr.kind == MR_TASK_MAP || hdr.kind == MR_TASK_REDUCE ||
                  hdr.kind == MR_TASK_ACTIVATION_PROBE)) {
+                bool lifecycle_cold = false;
+                mr_porter_start_trace_v1 cold_start = {0};
+                if (porter == NULL) {
+                    if (!args->lazy_porter) {
+                        request_err = EPROTO;
+                    } else {
+                        request_err = mr_porter_start_timed(
+                            &porter_config, &porter, &cold_start);
+                        if (request_err == 0) {
+                            porter_start_trace = cold_start;
+                            lifecycle_cold = true;
+                        }
+                    }
+                }
                 uint32_t worker = UINT32_MAX;
-                request_err = agent_submit_request(
-                    porter, (size_t)args->workers, args->role,
-                    args->agent_count, &hdr, body, body_len, &worker,
-                    agent_received_ns, parse_done_ns);
+                if (request_err == 0) {
+                    request_err = agent_submit_request(
+                        porter, (size_t)args->workers, args->role,
+                        args->agent_count, &hdr, body, body_len, &worker,
+                        agent_received_ns, parse_done_ns);
+                }
                 if (request_err == 0) {
                     if (pending[worker].active) {
                         request_err = EBUSY;
                     } else {
                         pending[worker].active = true;
+                        pending[worker].lifecycle_cold = lifecycle_cold;
                         pending[worker].request = request;
                         pending[worker].header = hdr;
+                        pending[worker].cold_start = cold_start;
                         active_count++;
                         deferred = true;
                     }
@@ -1533,7 +1567,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
             break;
         }
 
-        for (;;) {
+        while (porter != NULL) {
             uint32_t worker = UINT32_MAX;
             byte_buf response = {0};
             mr_porter_result porter_result = {0};
@@ -1597,7 +1631,7 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 const char *text = "agent task failed\n";
                 byte_buf_append(&response, text, strlen(text));
             }
-            mr_task_result_v3 task_result = {
+            mr_task_result_v4 task_result = {
                 .magic = MR_TASK_RESULT_MAGIC,
                 .size = sizeof(task_result),
                 .version = MR_TASK_RESULT_VERSION,
@@ -1610,7 +1644,9 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 .launch_mode = args->launch_mode,
                 .policy = args->cxlfork_policy,
                 .validate_full = args->validate_full ? 1U : 0U,
-                .trace_flags = porter_result.trace_flags,
+                .trace_flags = porter_result.trace_flags |
+                    (completed.lifecycle_cold ?
+                         MR_TRACE_F_LIFECYCLE_COLD : 0U),
                 .trace = porter_result.trace,
                 .restore_wrapper_ns =
                     porter_result.restore_timing.wrapper_total_ns,
@@ -1648,6 +1684,9 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
                 .template_access_count = porter_result.binding.access_count,
                 .template_state_pages = porter_result.binding.state_pages,
                 .template_binding_flags = porter_result.binding.flags,
+                .cold_start = completed.cold_start,
+                .executed_worker = porter_result.executed_worker,
+                .replacement_worker = porter_result.replacement_worker,
             };
             byte_buf measured = {0};
             byte_buf_append(&measured, &task_result, sizeof(task_result));
@@ -1695,7 +1734,58 @@ static int run_agent(const agent_args *args, Mapper map, Reducer reduce,
 
     free(pending);
     hydra_close(ctx);
-    mr_porter_stop(porter);
+    mr_porter_stop_timed(porter, &porter_stop_trace);
+    fprintf(stderr,
+            "porter_lifecycle_v1 node=%" PRIu64 " role=%u lazy=%u"
+            " workers=%" PRIu64
+            " agent_process_start_ns=%" PRIu64
+            " transport_ready_ns=%" PRIu64
+            " agent_ready_ns=%" PRIu64
+            " porter_start_begin_ns=%" PRIu64
+            " shared_map_begin_ns=%" PRIu64
+            " shared_map_end_ns=%" PRIu64
+            " socketpair_begin_ns=%" PRIu64
+            " socketpair_end_ns=%" PRIu64
+            " supervisor_fork_begin_ns=%" PRIu64
+            " supervisor_fork_return_ns=%" PRIu64
+            " supervisor_entry_ns=%" PRIu64
+            " pool_spawn_begin_ns=%" PRIu64
+            " first_worker_ready_ns=%" PRIu64
+            " initial_pool_ready_ns=%" PRIu64
+            " porter_start_end_ns=%" PRIu64
+            " stop_begin_ns=%" PRIu64
+            " stop_command_sent_ns=%" PRIu64
+            " supervisor_stop_received_ns=%" PRIu64
+            " workers_stop_begin_ns=%" PRIu64
+            " workers_stop_end_ns=%" PRIu64
+            " stop_reply_received_ns=%" PRIu64
+            " supervisor_wait_begin_ns=%" PRIu64
+            " supervisor_wait_end_ns=%" PRIu64
+            " stop_end_ns=%" PRIu64 "\n",
+            args->node_id, (unsigned int)args->role,
+            args->lazy_porter ? 1U : 0U, args->workers,
+            agent_process_start_ns, agent_transport_ready_ns,
+            agent_ready_published_ns, porter_start_trace.start_begin_ns,
+            porter_start_trace.shared_map_begin_ns,
+            porter_start_trace.shared_map_end_ns,
+            porter_start_trace.socketpair_begin_ns,
+            porter_start_trace.socketpair_end_ns,
+            porter_start_trace.supervisor_fork_begin_ns,
+            porter_start_trace.supervisor_fork_return_ns,
+            porter_start_trace.supervisor_entry_ns,
+            porter_start_trace.pool_spawn_begin_ns,
+            porter_start_trace.first_worker_ready_ns,
+            porter_start_trace.pool_ready_ns,
+            porter_start_trace.start_end_ns,
+            porter_stop_trace.stop_begin_ns,
+            porter_stop_trace.stop_command_sent_ns,
+            porter_stop_trace.supervisor_stop_received_ns,
+            porter_stop_trace.workers_stop_begin_ns,
+            porter_stop_trace.workers_stop_end_ns,
+            porter_stop_trace.stop_reply_received_ns,
+            porter_stop_trace.supervisor_wait_begin_ns,
+            porter_stop_trace.supervisor_wait_end_ns,
+            porter_stop_trace.stop_end_ns);
     return 0;
 }
 
@@ -1719,7 +1809,7 @@ static int open_agent_endpoint(mr_endpoint *ep, const master_args *args,
     return mr_hydra_open_ex(&ep->ctx, &config);
 }
 
-static int unwrap_task_result(byte_buf *response, mr_task_result_v3 *result)
+static int unwrap_task_result(byte_buf *response, mr_task_result_v4 *result)
 {
     struct {
         uint32_t magic;
@@ -1762,13 +1852,13 @@ static int unwrap_task_result(byte_buf *response, mr_task_result_v3 *result)
 }
 
 static void report_task_result_observed(
-    const mr_task_result_v3 *result, uint64_t master_roundtrip_ns,
+    const mr_task_result_v4 *result, uint64_t master_roundtrip_ns,
     const mr_hydra_send_observation *request_send,
     const hydra_msg *response_msg, uint64_t response_recv_ns,
     uint64_t response_release_done_ns)
 {
     fprintf(stderr,
-            "task_result_v3 task=%" PRIu64 " kind=%u node=%u worker=%u"
+            "task_result_v4 task=%" PRIu64 " kind=%u node=%u worker=%u"
             " pid=%" PRId64 " status=%u roundtrip_ns=%" PRIu64
             " launch=%u policy=%u validation=%u trace_flags=%u"
             " agent_recv_ns=%" PRIu64 " parse_done_ns=%" PRIu64
@@ -1905,6 +1995,71 @@ static void report_task_result_observed(
             result->template_access_count, result->template_state_pages,
             result->template_binding_flags);
 
+    fprintf(stderr,
+            "lifecycle_task_v1 task=%" PRIu64 " cold=%u"
+            " porter_start_begin_ns=%" PRIu64
+            " shared_map_begin_ns=%" PRIu64
+            " shared_map_end_ns=%" PRIu64
+            " socketpair_begin_ns=%" PRIu64
+            " socketpair_end_ns=%" PRIu64
+            " supervisor_fork_begin_ns=%" PRIu64
+            " supervisor_fork_return_ns=%" PRIu64
+            " supervisor_entry_ns=%" PRIu64
+            " pool_spawn_begin_ns=%" PRIu64
+            " first_worker_ready_ns=%" PRIu64
+            " initial_pool_ready_ns=%" PRIu64
+            " porter_start_end_ns=%" PRIu64
+            " executed_pid=%" PRId64
+            " executed_spawn_flags=%u"
+            " executed_fork_begin_ns=%" PRIu64
+            " executed_fork_return_ns=%" PRIu64
+            " executed_child_entry_ns=%" PRIu64
+            " executed_device_open_ns=%" PRIu64
+            " executed_query_caps_ns=%" PRIu64
+            " executed_policy_ns=%" PRIu64
+            " executed_ready_ns=%" PRIu64
+            " replacement_pid=%" PRId64
+            " replacement_spawn_flags=%u"
+            " replacement_fork_begin_ns=%" PRIu64
+            " replacement_fork_return_ns=%" PRIu64
+            " replacement_child_entry_ns=%" PRIu64
+            " replacement_device_open_ns=%" PRIu64
+            " replacement_query_caps_ns=%" PRIu64
+            " replacement_policy_ns=%" PRIu64
+            " replacement_ready_ns=%" PRIu64 "\n",
+            result->task_id,
+            (result->trace_flags & MR_TRACE_F_LIFECYCLE_COLD) != 0,
+            result->cold_start.start_begin_ns,
+            result->cold_start.shared_map_begin_ns,
+            result->cold_start.shared_map_end_ns,
+            result->cold_start.socketpair_begin_ns,
+            result->cold_start.socketpair_end_ns,
+            result->cold_start.supervisor_fork_begin_ns,
+            result->cold_start.supervisor_fork_return_ns,
+            result->cold_start.supervisor_entry_ns,
+            result->cold_start.pool_spawn_begin_ns,
+            result->cold_start.first_worker_ready_ns,
+            result->cold_start.pool_ready_ns,
+            result->cold_start.start_end_ns,
+            result->executed_worker.pid,
+            result->executed_worker.flags,
+            result->executed_worker.fork_begin_ns,
+            result->executed_worker.fork_return_ns,
+            result->executed_worker.child_entry_ns,
+            result->executed_worker.device_open_ns,
+            result->executed_worker.query_caps_ns,
+            result->executed_worker.policy_check_ns,
+            result->executed_worker.ready_ns,
+            result->replacement_worker.pid,
+            result->replacement_worker.flags,
+            result->replacement_worker.fork_begin_ns,
+            result->replacement_worker.fork_return_ns,
+            result->replacement_worker.child_entry_ns,
+            result->replacement_worker.device_open_ns,
+            result->replacement_worker.query_caps_ns,
+            result->replacement_worker.policy_check_ns,
+            result->replacement_worker.ready_ns);
+
     if (request_send != NULL && response_msg != NULL) {
         fprintf(stderr,
                 "hydra_task_v1 task=%" PRIu64
@@ -1986,7 +2141,7 @@ static int call_agent(mr_endpoint *agent, mr_task_kind kind, uint64_t task_id,
     }
     if (kind == MR_TASK_MAP || kind == MR_TASK_REDUCE ||
         kind == MR_TASK_ACTIVATION_PROBE) {
-        mr_task_result_v3 result = {0};
+        mr_task_result_v4 result = {0};
         err = unwrap_task_result(response, &result);
         if ((err != 0 && err != EREMOTEIO) || result.kind != kind ||
             result.task_id != task_id) {
@@ -2254,7 +2409,7 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
-                    mr_task_result_v3 result = {0};
+                    mr_task_result_v4 result = {0};
                     err = unwrap_task_result(&response, &result);
                     if ((err == 0 || err == EREMOTEIO) &&
                         (result.kind != MR_TASK_MAP ||
@@ -2383,7 +2538,7 @@ static int run_master(const master_args *args)
                     err = EPROTO;
                 }
                 if (err == 0) {
-                    mr_task_result_v3 result = {0};
+                    mr_task_result_v4 result = {0};
                     err = unwrap_task_result(&response, &result);
                     if ((err == 0 || err == EREMOTEIO) &&
                         (result.kind != MR_TASK_REDUCE ||
@@ -2531,6 +2686,7 @@ static void usage(const char *argv0)
             "       [--template-key=N] [--template-generation=N]\n"
             "       [--template-page-checksum=N] [--cxlfork-policy=mow|moa|hybrid|readonly]\n"
             "       [--validation=fast|full]\n"
+            "       [--porter-start=eager|lazy]\n"
             "       [--restore-hold-ms=N] (test only, max 10000)\n"
             "       [--shuffle-backend=file|devdax|ivshmem]\n"
             "       [--shuffle-connections=N]\n"
@@ -2710,6 +2866,15 @@ static int parse_agent_args(agent_args *args, int argc, char **argv)
             } else {
                 fprintf(stderr,
                         "restore-setup must be preopen or per-request\n");
+                return 2;
+            }
+        } else if ((value = arg_value(argv[i], "--porter-start=")) != NULL) {
+            if (strcmp(value, "eager") == 0) {
+                args->lazy_porter = false;
+            } else if (strcmp(value, "lazy") == 0) {
+                args->lazy_porter = true;
+            } else {
+                fprintf(stderr, "porter-start must be eager or lazy\n");
                 return 2;
             }
         } else if ((value = arg_value(argv[i], "--restore-hold-ms=")) != NULL) {

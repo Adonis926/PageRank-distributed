@@ -391,6 +391,15 @@ static int publish_template(const mr_template_options *opts,
     struct cxlfork_region regions[CXLFORK_MAX_REGIONS];
     void *wanted = (void *)(uintptr_t)opts->base;
     void *mapping = MAP_FAILED;
+    uint64_t wrapper_begin_ns = monotonic_ns();
+    uint64_t device_open_begin_ns;
+    uint64_t device_open_end_ns;
+    uint64_t query_caps_begin_ns;
+    uint64_t query_caps_end_ns;
+    uint64_t template_build_begin_ns;
+    uint64_t template_build_end_ns;
+    uint64_t prepare_ioctl_begin_ns;
+    uint64_t prepare_ioctl_end_ns;
     int fd = -1;
     int err;
 
@@ -401,11 +410,15 @@ static int publish_template(const mr_template_options *opts,
         return EINVAL;
     }
 
+    device_open_begin_ns = monotonic_ns();
     fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+    device_open_end_ns = monotonic_ns();
     if (fd < 0) {
         return errno;
     }
+    query_caps_begin_ns = monotonic_ns();
     err = query_caps_fd(fd, &caps);
+    query_caps_end_ns = monotonic_ns();
     if (err != 0) {
         close(fd);
         return err;
@@ -416,7 +429,9 @@ static int publish_template(const mr_template_options *opts,
     }
 
     (void)wanted;
+    template_build_begin_ns = monotonic_ns();
     err = mr_template_map_local(opts, &mapping);
+    template_build_end_ns = monotonic_ns();
     if (err != 0) {
         close(fd);
         return err;
@@ -440,12 +455,14 @@ static int publish_template(const mr_template_options *opts,
     prepare.scan_end = opts->base + opts->bytes;
     prepare.regions_ptr = (uintptr_t)regions;
     prepare.region_capacity = CXLFORK_MAX_REGIONS;
+    prepare_ioctl_begin_ns = monotonic_ns();
     if (ioctl(fd, CXLFORK_PREPARE_V2, &prepare) != 0) {
         err = errno;
         munmap(mapping, (size_t)opts->bytes);
         close(fd);
         return err;
     }
+    prepare_ioctl_end_ns = monotonic_ns();
 
     const mr_template_header *header = mapping;
     printf("mr_template_v2 role=%s key=%" PRIu64
@@ -455,17 +472,48 @@ static int publish_template(const mr_template_options *opts,
            " state_checksum=%" PRIu64 " state_valid=%s"
            " total_pages=%" PRIu64 " page_checksum=%" PRIu64
            " payload_checksum=%" PRIu64 " region_count=%u"
+           " wrapper_total_ns=%" PRIu64
+           " device_open_ns=%" PRIu64 " query_caps_ns=%" PRIu64
+           " template_build_ns=%" PRIu64
+           " prepare_ioctl_ns=%" PRIu64
            " prepare_total_ns=%" PRIu64 " prepare_path_mask=%" PRIu64
-           " prepare_valid_mask=%" PRIu64 " verify=ok\n",
+           " prepare_valid_mask=%" PRIu64
+           " prepare_lock_ns=%" PRIu64
+           " prepare_lifecycle_ns=%" PRIu64
+           " prepare_vma_preflight_ns=%" PRIu64
+           " prepare_pte_walk_ns=%" PRIu64
+           " prepare_gup_ns=%" PRIu64
+           " prepare_page_copy_ns=%" PRIu64
+           " prepare_pte_recheck_ns=%" PRIu64
+           " prepare_metadata_ns=%" PRIu64
+           " prepare_checksum_ns=%" PRIu64
+           " prepare_publish_ns=%" PRIu64
+           " prepare_other_ns=%" PRIu64 " verify=ok\n",
            mr_role_name(opts->role), opts->key, (uint64_t)prepare.generation,
            (uint64_t)prepare.slot, opts->base, opts->bytes, opts->seed,
            opts->value_scale, header->state_bytes, header->state_checksum,
            test_corrupt_state ? "no(test)" : "yes",
            (uint64_t)prepare.total_pages, (uint64_t)prepare.page_checksum,
            header->payload_checksum, prepare.region_count,
+           prepare_ioctl_end_ns - wrapper_begin_ns,
+           device_open_end_ns - device_open_begin_ns,
+           query_caps_end_ns - query_caps_begin_ns,
+           template_build_end_ns - template_build_begin_ns,
+           prepare_ioctl_end_ns - prepare_ioctl_begin_ns,
            (uint64_t)prepare.stats.total_ns,
            (uint64_t)prepare.stats.path_mask,
-           (uint64_t)prepare.stats.valid_mask);
+           (uint64_t)prepare.stats.valid_mask,
+           (uint64_t)prepare.stats.lock_wait_ns,
+           (uint64_t)prepare.stats.lifecycle_ns,
+           (uint64_t)prepare.stats.vma_preflight_ns,
+           (uint64_t)prepare.stats.pte_walk_ns,
+           (uint64_t)prepare.stats.gup_ns,
+           (uint64_t)prepare.stats.page_copy_ns,
+           (uint64_t)prepare.stats.pte_recheck_ns,
+           (uint64_t)prepare.stats.metadata_build_ns,
+           (uint64_t)prepare.stats.checksum_seal_ns,
+           (uint64_t)prepare.stats.publish_ns,
+           (uint64_t)prepare.stats.other_ns);
 
     munmap(mapping, (size_t)opts->bytes);
     close(fd);

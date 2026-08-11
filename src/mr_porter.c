@@ -48,6 +48,7 @@ typedef struct mr_porter_slot {
     mr_cxlfork_timing restore_timing;
     mr_template_binding_result binding;
     mr_cxlfork_result restore;
+    mr_worker_spawn_trace_v1 worker_spawn;
 } mr_porter_slot;
 
 typedef struct mr_porter_command {
@@ -65,6 +66,8 @@ typedef struct mr_porter_reply {
     uint16_t version;
     uint16_t op;
     mr_porter_result result;
+    mr_porter_start_trace_v1 start_trace;
+    mr_porter_stop_trace_v1 stop_trace;
 } mr_porter_reply;
 
 struct mr_porter {
@@ -328,6 +331,7 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
     int startup_err = 0;
 
     close(control_fd);
+    slot->worker_spawn.child_entry_ns = nsec_now();
     if (config->mode == MR_LAUNCH_CXLFORK && config->restore_preopen) {
         startup_err = mr_cxlfork_worker_context_open(
             &config->restore, &worker_context, &preopen_timing);
@@ -337,6 +341,10 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
             &config->template, NULL);
     }
     slot->worker_preopen_status = (uint32_t)startup_err;
+    slot->worker_spawn.device_open_ns = preopen_timing.preopen_device_ns;
+    slot->worker_spawn.query_caps_ns = preopen_timing.preopen_caps_ns;
+    slot->worker_spawn.policy_check_ns = preopen_timing.preopen_policy_ns;
+    slot->worker_spawn.ready_ns = nsec_now();
     __sync_synchronize();
     slot->worker_ready = 1;
     __sync_synchronize();
@@ -376,15 +384,23 @@ static void worker_main(const mr_porter_config *config, uint32_t worker_id,
 }
 
 static pid_t spawn_worker(const mr_porter_config *config, uint32_t worker_id,
-                          mr_porter_slot *slot, bool persistent, int control_fd)
+                          mr_porter_slot *slot, bool persistent, int control_fd,
+                          uint32_t spawn_flags)
 {
     slot->worker_ready = 0;
     slot->worker_preopen_status = 0;
+    memset(&slot->worker_spawn, 0, sizeof(slot->worker_spawn));
+    slot->worker_spawn.worker_id = worker_id;
+    slot->worker_spawn.flags = spawn_flags;
+    slot->worker_spawn.fork_begin_ns = nsec_now();
     __sync_synchronize();
     pid_t pid = fork();
     if (pid == 0) {
+        slot->worker_spawn.pid = (int64_t)getpid();
         worker_main(config, worker_id, slot, persistent, control_fd);
     }
+    slot->worker_spawn.pid = (int64_t)pid;
+    slot->worker_spawn.fork_return_ns = nsec_now();
     return pid;
 }
 
@@ -445,6 +461,9 @@ static void supervisor_main(mr_porter_config config, void *shared,
     void *template_mapping = NULL;
     int err = 0;
 
+    reply.start_trace.supervisor_entry_ns = nsec_now();
+    reply.start_trace.initial_workers = config.workers;
+
     if (pids == NULL || executed_pids == NULL || begin_ns == NULL ||
         dispatch_ns == NULL ||
         fork_ns == NULL || inflight == NULL) {
@@ -459,11 +478,13 @@ static void supervisor_main(mr_porter_config config, void *shared,
     if (err == 0 && (config.mode == MR_LAUNCH_PERSISTENT ||
                      config.mode == MR_LAUNCH_LOCAL_PREFORK ||
                      config.mode == MR_LAUNCH_CXLFORK)) {
+        reply.start_trace.pool_spawn_begin_ns = nsec_now();
         for (uint32_t i = 0; i < config.workers; i++) {
             pids[i] = spawn_worker(&config, i,
                                    slot_at(shared, config.slot_bytes, i),
                                    config.mode == MR_LAUNCH_PERSISTENT,
-                                   control_fd);
+                                   control_fd,
+                                   MR_WORKER_SPAWN_F_INITIAL);
             if (pids[i] < 0) {
                 err = errno;
                 break;
@@ -473,7 +494,13 @@ static void supervisor_main(mr_porter_config config, void *shared,
             if (err != 0) {
                 break;
             }
+            if (i == 0) {
+                reply.start_trace.first_worker_ready_ns =
+                    slot_at(shared, config.slot_bytes, i)
+                        ->worker_spawn.ready_ns;
+            }
         }
+        reply.start_trace.pool_ready_ns = nsec_now();
     }
     if (err != 0 && pids != NULL) {
         stop_workers(pids, &config, shared);
@@ -492,6 +519,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
     }
 
     bool stopping = false;
+    bool stop_reply_pending = false;
     while (!stopping) {
         bool progress = false;
         mr_porter_command command;
@@ -511,9 +539,8 @@ static void supervisor_main(mr_porter_config config, void *shared,
                 if (any_inflight) {
                     break;
                 }
-                reply.op = MR_PORTER_OP_STOP;
-                memset(&reply.result, 0, sizeof(reply.result));
-                (void)write_full(control_fd, &reply, sizeof(reply));
+                reply.stop_trace.supervisor_stop_received_ns = nsec_now();
+                stop_reply_pending = true;
                 stopping = true;
                 continue;
             }
@@ -536,7 +563,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
                 uint64_t phase = nsec_now();
                 slot->trace.fork_begin_ns = phase;
                 executed_pids[worker] =
-                    spawn_worker(&config, worker, slot, false, control_fd);
+                    spawn_worker(&config, worker, slot, false, control_fd, 0);
                 slot->trace.fork_return_ns = nsec_now();
                 fork_ns[worker] = slot->trace.fork_return_ns - phase;
                 if (executed_pids[worker] < 0) {
@@ -589,6 +616,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
             reply.result.trace_flags = slot->trace_flags;
             reply.result.trace = slot->trace;
             reply.result.restore_timing = slot->restore_timing;
+            reply.result.executed_worker = slot->worker_spawn;
 
             if (config.mode != MR_LAUNCH_PERSISTENT &&
                 executed_pids[worker] > 0) {
@@ -604,7 +632,8 @@ static void supervisor_main(mr_porter_config config, void *shared,
                 phase = nsec_now();
                 reply.result.trace.refill_begin_ns = phase;
                 pids[worker] = spawn_worker(&config, worker, slot, false,
-                                            control_fd);
+                                            control_fd,
+                                            MR_WORKER_SPAWN_F_REFILL);
                 if (pids[worker] < 0 && reply.result.status == 0) {
                     reply.result.status = (uint32_t)errno;
                 } else if (pids[worker] > 0) {
@@ -618,6 +647,7 @@ static void supervisor_main(mr_porter_config config, void *shared,
                     reply.result.trace.refill_end_ns;
                 reply.result.refill_ns =
                     reply.result.trace.refill_end_ns - phase;
+                reply.result.replacement_worker = slot->worker_spawn;
             }
             reply.result.total_ns = nsec_now() - begin_ns[worker];
             inflight[worker] = false;
@@ -631,8 +661,15 @@ static void supervisor_main(mr_porter_config config, void *shared,
         }
     }
 
+    reply.stop_trace.workers_stop_begin_ns = nsec_now();
     if (pids != NULL) {
         stop_workers(pids, &config, shared);
+    }
+    reply.stop_trace.workers_stop_end_ns = nsec_now();
+    if (stop_reply_pending) {
+        reply.op = MR_PORTER_OP_STOP;
+        memset(&reply.result, 0, sizeof(reply.result));
+        (void)write_full(control_fd, &reply, sizeof(reply));
     }
     mr_template_unmap(template_mapping, config.template.bytes);
     free(inflight);
@@ -645,18 +682,30 @@ static void supervisor_main(mr_porter_config config, void *shared,
     _exit(0);
 }
 
-int mr_porter_start(const mr_porter_config *config, mr_porter **out)
+int mr_porter_start_timed(const mr_porter_config *config, mr_porter **out,
+                          mr_porter_start_trace_v1 *trace)
 {
     int sockets[2];
     mr_porter_reply reply = {0};
     mr_porter *porter;
+    mr_porter_start_trace_v1 timing = {
+        .start_begin_ns = nsec_now(),
+    };
 
     if (config == NULL || out == NULL || config->workers == 0 ||
         config->slot_bytes == 0 || config->task_fn == NULL) {
+        timing.start_end_ns = nsec_now();
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return EINVAL;
     }
     porter = calloc(1, sizeof(*porter));
     if (porter == NULL) {
+        timing.start_end_ns = nsec_now();
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return ENOMEM;
     }
     porter->control_fd = -1;
@@ -665,25 +714,44 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
     porter->busy = calloc(config->workers, sizeof(*porter->busy));
     if (porter->busy == NULL) {
         free(porter);
+        timing.start_end_ns = nsec_now();
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return ENOMEM;
     }
     porter->shared_len = slot_stride(config->slot_bytes) * config->workers;
+    timing.shared_map_begin_ns = nsec_now();
     porter->shared = mmap(NULL, porter->shared_len, PROT_READ | PROT_WRITE,
                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    timing.shared_map_end_ns = nsec_now();
     if (porter->shared == MAP_FAILED) {
         int err = errno;
         free(porter->busy);
         free(porter);
+        timing.start_end_ns = nsec_now();
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return err;
     }
+    timing.socketpair_begin_ns = nsec_now();
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
         int err = errno;
+        timing.socketpair_end_ns = nsec_now();
         munmap(porter->shared, porter->shared_len);
         free(porter->busy);
         free(porter);
+        timing.start_end_ns = nsec_now();
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return err;
     }
+    timing.socketpair_end_ns = nsec_now();
+    timing.supervisor_fork_begin_ns = nsec_now();
     porter->supervisor_pid = fork();
+    timing.supervisor_fork_return_ns = nsec_now();
     if (porter->supervisor_pid < 0) {
         int err = errno;
         close(sockets[0]);
@@ -691,6 +759,10 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
         munmap(porter->shared, porter->shared_len);
         free(porter->busy);
         free(porter);
+        timing.start_end_ns = nsec_now();
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return err;
     }
     if (porter->supervisor_pid == 0) {
@@ -700,6 +772,7 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
     close(sockets[1]);
     porter->control_fd = sockets[0];
     int err = read_full(porter->control_fd, &reply, sizeof(reply));
+    timing.init_reply_received_ns = nsec_now();
     if (err == 0 && (reply.size != sizeof(reply) ||
                      reply.version != MR_PORTER_PROTOCOL_VERSION ||
                      reply.op != MR_PORTER_OP_INIT)) {
@@ -714,10 +787,33 @@ int mr_porter_start(const mr_porter_config *config, mr_porter **out)
         munmap(porter->shared, porter->shared_len);
         free(porter->busy);
         free(porter);
+        timing.start_end_ns = nsec_now();
+        timing.supervisor_entry_ns = reply.start_trace.supervisor_entry_ns;
+        timing.pool_spawn_begin_ns = reply.start_trace.pool_spawn_begin_ns;
+        timing.first_worker_ready_ns = reply.start_trace.first_worker_ready_ns;
+        timing.pool_ready_ns = reply.start_trace.pool_ready_ns;
+        timing.initial_workers = reply.start_trace.initial_workers;
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return err;
+    }
+    timing.supervisor_entry_ns = reply.start_trace.supervisor_entry_ns;
+    timing.pool_spawn_begin_ns = reply.start_trace.pool_spawn_begin_ns;
+    timing.first_worker_ready_ns = reply.start_trace.first_worker_ready_ns;
+    timing.pool_ready_ns = reply.start_trace.pool_ready_ns;
+    timing.initial_workers = reply.start_trace.initial_workers;
+    timing.start_end_ns = nsec_now();
+    if (trace != NULL) {
+        *trace = timing;
     }
     *out = porter;
     return 0;
+}
+
+int mr_porter_start(const mr_porter_config *config, mr_porter **out)
+{
+    return mr_porter_start_timed(config, out, NULL);
 }
 
 int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
@@ -854,22 +950,45 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
     }
 }
 
-void mr_porter_stop(mr_porter *porter)
+void mr_porter_stop_timed(mr_porter *porter, mr_porter_stop_trace_v1 *trace)
 {
+    mr_porter_stop_trace_v1 timing = {0};
+
     if (porter == NULL) {
+        if (trace != NULL) {
+            *trace = timing;
+        }
         return;
     }
+    timing.stop_begin_ns = nsec_now();
     mr_porter_command command = {
         .size = sizeof(command),
         .version = MR_PORTER_PROTOCOL_VERSION,
         .op = MR_PORTER_OP_STOP,
     };
-    mr_porter_reply reply;
+    mr_porter_reply reply = {0};
     (void)write_full(porter->control_fd, &command, sizeof(command));
+    timing.stop_command_sent_ns = nsec_now();
     (void)read_full(porter->control_fd, &reply, sizeof(reply));
+    timing.stop_reply_received_ns = nsec_now();
+    timing.supervisor_stop_received_ns =
+        reply.stop_trace.supervisor_stop_received_ns;
+    timing.workers_stop_begin_ns = reply.stop_trace.workers_stop_begin_ns;
+    timing.workers_stop_end_ns = reply.stop_trace.workers_stop_end_ns;
     close(porter->control_fd);
+    timing.supervisor_wait_begin_ns = nsec_now();
     (void)waitpid(porter->supervisor_pid, NULL, 0);
+    timing.supervisor_wait_end_ns = nsec_now();
     munmap(porter->shared, porter->shared_len);
     free(porter->busy);
     free(porter);
+    timing.stop_end_ns = nsec_now();
+    if (trace != NULL) {
+        *trace = timing;
+    }
+}
+
+void mr_porter_stop(mr_porter *porter)
+{
+    mr_porter_stop_timed(porter, NULL);
 }

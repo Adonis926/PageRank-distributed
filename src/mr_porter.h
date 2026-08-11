@@ -57,13 +57,29 @@ typedef struct mr_porter_result {
     mr_cxlfork_timing restore_timing;
     mr_template_binding_result binding;
     mr_cxlfork_result restore;
+    mr_worker_spawn_trace_v1 executed_worker;
+    mr_worker_spawn_trace_v1 replacement_worker;
 } mr_porter_result;
+
+typedef struct mr_porter_stop_trace_v1 {
+    uint64_t stop_begin_ns;
+    uint64_t stop_command_sent_ns;
+    uint64_t supervisor_stop_received_ns;
+    uint64_t workers_stop_begin_ns;
+    uint64_t workers_stop_end_ns;
+    uint64_t stop_reply_received_ns;
+    uint64_t supervisor_wait_begin_ns;
+    uint64_t supervisor_wait_end_ns;
+    uint64_t stop_end_ns;
+} mr_porter_stop_trace_v1;
 
 typedef struct mr_porter mr_porter;
 
 const char *mr_launch_mode_name(mr_launch_mode mode);
 int mr_launch_mode_parse(const char *text, mr_launch_mode *mode);
 int mr_porter_start(const mr_porter_config *config, mr_porter **out);
+int mr_porter_start_timed(const mr_porter_config *config, mr_porter **out,
+                          mr_porter_start_trace_v1 *trace);
 int mr_porter_submit(mr_porter *porter, uint32_t worker_id, uint32_t kind,
                      uint64_t task_id, uint64_t partition_id,
                      uint64_t partition_count, const void *payload,
@@ -77,5 +93,6 @@ int mr_porter_call(mr_porter *porter, uint32_t worker_id, uint32_t kind,
                    size_t payload_len, byte_buf *response,
                    mr_porter_result *result);
 void mr_porter_stop(mr_porter *porter);
+void mr_porter_stop_timed(mr_porter *porter, mr_porter_stop_trace_v1 *trace);
 
 #endif

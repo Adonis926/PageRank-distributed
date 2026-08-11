@@ -9,10 +9,11 @@
 #define MR_OP 100U
 #define MR_TASK_RESULT_MAGIC 0x4d525431U
 #define MR_TASK_RESULT_VERSION_V2 2U
-#define MR_TASK_RESULT_VERSION 3U
+#define MR_TASK_RESULT_VERSION 4U
 
 #define MR_TRACE_F_WARMUP (1U << 0)
 #define MR_TRACE_F_ACTIVATION_PROBE (1U << 1)
+#define MR_TRACE_F_LIFECYCLE_COLD (1U << 2)
 #define MR_RESTORE_SETUP_PER_REQUEST 0U
 #define MR_RESTORE_SETUP_PREOPEN 1U
 
@@ -89,6 +90,46 @@ typedef struct mr_task_trace_v3 {
     uint64_t response_publish_begin_ns;
     uint64_t response_publish_end_ns;
 } mr_task_trace_v3;
+
+#define MR_WORKER_SPAWN_F_INITIAL (1U << 0)
+#define MR_WORKER_SPAWN_F_REFILL (1U << 1)
+
+/*
+ * All timestamps in this structure are captured in the target VM's
+ * CLOCK_MONOTONIC domain.  Durations for device/capability/policy setup are
+ * copied from the child before it publishes worker_ready.
+ */
+typedef struct mr_worker_spawn_trace_v1 {
+    int64_t pid;
+    uint32_t worker_id;
+    uint32_t flags;
+    uint64_t fork_begin_ns;
+    uint64_t fork_return_ns;
+    uint64_t child_entry_ns;
+    uint64_t device_open_ns;
+    uint64_t query_caps_ns;
+    uint64_t policy_check_ns;
+    uint64_t ready_ns;
+} mr_worker_spawn_trace_v1;
+
+/* One-time target-side construction of the porter and its initial pool. */
+typedef struct mr_porter_start_trace_v1 {
+    uint64_t start_begin_ns;
+    uint64_t shared_map_begin_ns;
+    uint64_t shared_map_end_ns;
+    uint64_t socketpair_begin_ns;
+    uint64_t socketpair_end_ns;
+    uint64_t supervisor_fork_begin_ns;
+    uint64_t supervisor_fork_return_ns;
+    uint64_t supervisor_entry_ns;
+    uint64_t pool_spawn_begin_ns;
+    uint64_t first_worker_ready_ns;
+    uint64_t pool_ready_ns;
+    uint64_t init_reply_received_ns;
+    uint64_t start_end_ns;
+    uint32_t initial_workers;
+    uint32_t reserved0;
+} mr_porter_start_trace_v1;
 
 typedef struct mr_kernel_restore_stats_v3 {
     uint64_t supported_mask;
@@ -183,7 +224,7 @@ typedef struct mr_task_result_v2 {
     uint64_t reserved[3];
 } mr_task_result_v2;
 
-typedef struct mr_task_result_v3 {
+typedef struct mr_task_result_v4 {
     uint32_t magic;
     uint16_t size;
     uint16_t version;
@@ -221,15 +262,18 @@ typedef struct mr_task_result_v3 {
     uint64_t template_access_count;
     uint64_t template_state_pages;
     uint64_t template_binding_flags;
-    uint64_t reserved[8];
-} mr_task_result_v3;
+    mr_porter_start_trace_v1 cold_start;
+    mr_worker_spawn_trace_v1 executed_worker;
+    mr_worker_spawn_trace_v1 replacement_worker;
+    uint64_t reserved[4];
+} mr_task_result_v4;
 
 _Static_assert(sizeof(ShuffleChunkHeader) == 40,
                "ShuffleChunkHeader wire size must stay stable");
 _Static_assert(sizeof(mr_task_result_v2) == 232,
                "mr_task_result_v2 wire size must stay stable");
-_Static_assert(sizeof(mr_task_result_v3) == 888,
-               "mr_task_result_v3 wire size must stay stable");
+_Static_assert(sizeof(mr_task_result_v4) == 1112,
+               "mr_task_result_v4 wire size must stay stable");
 
 byte_buf mr_wire_make(mr_task_kind kind, uint64_t task_id,
                       uint64_t partition_id, uint64_t partition_count,
