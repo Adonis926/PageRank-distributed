@@ -9,7 +9,7 @@
 
 - `scripts/run-motivation-bench.sh`：build、部署 VM、发布/释放 template、执行 probe 和
   WordCount、收集 raw 日志、调用分析器和 checker；
-- `scripts/analyze-motivation.py`：解析 `task_result_v3`、`hydra_task_v1`、
+- `scripts/analyze-motivation.py`：解析 `task_result_v4`、`hydra_task_v1`、
   `hydra_response_v1` 和 `master_job_v1`，生成逐 task/job CSV 和 summary；
 - `scripts/check-motivation-results.py`：检查样本数、事件顺序、应用状态消费、policy 路径、
   WordCount output、slot release 和 dmesg；

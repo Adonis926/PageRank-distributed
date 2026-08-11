@@ -277,7 +277,7 @@ run_probe_scenario() {
     "$mode" "$bytes" "$POLICY" "$VALIDATION" >> "$RESULT_ROOT/run-manifest.csv"
   ((rc == 0)) || { printf 'scenario failed: %s\n' "$scenario" >&2; return "$rc"; }
   local got
-  got=$(grep -c '^task_result_v3 ' "$scenario_dir/master.log" || true)
+  got=$(grep -c '^task_result_v4 ' "$scenario_dir/master.log" || true)
   [[ "$got" -eq $((block_samples + WARMUPS)) ]] || {
     printf '%s: expected %s task records, got %s\n' "$scenario" "$((block_samples + WARMUPS))" "$got" >&2
     return 1

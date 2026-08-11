@@ -615,7 +615,7 @@ append_task_metrics() {
   local phase=$1 index=$2 log=$3
   [[ -f "$log" ]] || return 0
   awk -v phase="$phase" -v run="$index" '
-    $1 == "task_result_v3" {
+    $1 == "task_result_v4" {
       delete v
       for (i = 2; i <= NF; i++) {
         split($i, kv, "=")

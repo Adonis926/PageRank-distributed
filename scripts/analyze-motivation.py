@@ -12,7 +12,7 @@ import statistics
 from pathlib import Path
 
 
-TASK_PREFIX = "task_result_v3"
+TASK_PREFIX = "task_result_v4"
 HYDRA_PREFIX = "hydra_task_v1"
 RESPONSE_PREFIX = "hydra_response_v1"
 
@@ -343,7 +343,7 @@ def main() -> int:
         rows.extend(load_scenario(scenario))
         jobs.extend(load_jobs(scenario))
     if not rows:
-        parser.error("no task_result_v3 records found")
+        parser.error("no task_result_v4 records found")
 
     errors = [error for row in rows for error in validate_row(row)]
     fixed = ["scenario", "scenario_group", "task", "kind", "warmup",
