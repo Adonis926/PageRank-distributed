@@ -2226,6 +2226,10 @@ static int run_master(const master_args *args)
     mr_partitions final_output = {0};
     bool final_init = false;
     uint64_t workflow_begin_ns = 0;
+    uint64_t input_setup_end_ns = 0;
+    uint64_t map_stage_end_ns = 0;
+    uint64_t reduce_stage_end_ns = 0;
+    uint64_t output_write_end_ns = 0;
     size_t slice_count = 0;
     int rc = 1;
 
@@ -2367,6 +2371,8 @@ static int run_master(const master_args *args)
         fflush(stdout);
     }
 
+    input_setup_end_ns = hydra_now_ns();
+
     if (use_role_static) {
         for (size_t base = 0; base < slice_count;
              base += (size_t)args->workers_per_agent) {
@@ -2479,6 +2485,8 @@ static int run_master(const master_args *args)
         }
         byte_buf_clear(&response);
     }
+
+    map_stage_end_ns = hydra_now_ns();
 
     mr_partitions_init(&final_output, reducer_count);
     final_init = true;
@@ -2622,11 +2630,29 @@ static int run_master(const master_args *args)
         }
     }
 
+    reduce_stage_end_ns = hydra_now_ns();
     rc = mr_partitions_write_text(&final_output, args->output);
+    output_write_end_ns = hydra_now_ns();
 
 cleanup:
     if (workflow_begin_ns != 0) {
         uint64_t workflow_end_ns = hydra_now_ns();
+        uint64_t input_setup_ns = input_setup_end_ns >= workflow_begin_ns ?
+            input_setup_end_ns - workflow_begin_ns : 0;
+        uint64_t map_stage_ns = map_stage_end_ns >= input_setup_end_ns &&
+                                input_setup_end_ns != 0 ?
+            map_stage_end_ns - input_setup_end_ns : 0;
+        uint64_t reduce_stage_ns = reduce_stage_end_ns >= map_stage_end_ns &&
+                                   map_stage_end_ns != 0 ?
+            reduce_stage_end_ns - map_stage_end_ns : 0;
+        uint64_t output_write_ns = output_write_end_ns >= reduce_stage_end_ns &&
+                                   reduce_stage_end_ns != 0 ?
+            output_write_end_ns - reduce_stage_end_ns : 0;
+        uint64_t classified_ns = input_setup_ns + map_stage_ns +
+                                 reduce_stage_ns + output_write_ns;
+        uint64_t total_ns = workflow_end_ns - workflow_begin_ns;
+        uint64_t other_ns = total_ns >= classified_ns ?
+            total_ns - classified_ns : 0;
         fprintf(stderr,
                 "master_job_v1 status=%d begin_ns=%" PRIu64
                 " end_ns=%" PRIu64 " total_ns=%" PRIu64
@@ -2634,6 +2660,14 @@ cleanup:
                 rc, workflow_begin_ns, workflow_end_ns,
                 workflow_end_ns - workflow_begin_ns, slice_count,
                 reducer_count);
+        fprintf(stderr,
+                "master_job_v2 status=%d total_ns=%" PRIu64
+                " input_setup_ns=%" PRIu64 " map_stage_ns=%" PRIu64
+                " reduce_stage_ns=%" PRIu64 " output_write_ns=%" PRIu64
+                " other_ns=%" PRIu64 " map_tasks=%zu reducers=%d\n",
+                rc, total_ns, input_setup_ns, map_stage_ns,
+                reduce_stage_ns, output_write_ns, other_ns,
+                slice_count, reducer_count);
     }
     if (agents != NULL) {
         for (size_t i = 0; i < args->agents.len; i++) {
