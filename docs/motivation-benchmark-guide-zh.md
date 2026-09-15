@@ -14,8 +14,67 @@
 - `scripts/check-motivation-results.py`：检查样本数、事件顺序、应用状态消费、policy 路径、
   WordCount output、slot release 和 dmesg；
 - `scripts/test-state-binding.sh`：独立的 application-state correctness acceptance；
-- `scripts/run-bench.sh`：旧通用 runner，已经兼容 V3 envelope，但不替代 Motivation
-  runner 的排他统计和时钟校验。
+- `scripts/run-bench.sh`：通用 MR 端到端 runner。当前版本支持 master/agent ready
+  barrier、VM0 同钟域作业计时、自动发布/释放 reducer CXLfork template，以及
+  input/map/reduce/output 排他阶段统计；
+- `scripts/prepare-aligned-wordcount.sh`：生成与单机 Motivation MR 完全相同的确定性
+  WordCount token stream、expected output 和 checksum manifest。
+
+## 与单机 MR 对齐的端到端实验
+
+103 上的权威双 VM profile 是：
+
+`/home/xtl/cxlfork/cxlfork-repro/config/real-cxl-103-mr-e2e.env`
+
+它使用 48+48 vCPU、20+20 GiB 私有 DRAM，VM0/VM1 分别绑定 NUMA node 0/1，
+并保持经过验证的 DAX 分区不变。正式 workload 固定为 1 GiB、512 文件、
+65,536 个词、48 mapper worker、48 reducer worker、128 partitions。
+
+先生成正式输入（输入生成不在计时区间）：
+
+```bash
+cd /home/xtl/cxlfork/mr-distributed
+
+scripts/prepare-aligned-wordcount.sh \
+  --output-dir=/home/xtl/start/hpca-cxlfork/workloads/wordcount-1g-aligned \
+  --input-mib=1024 --files=512 --vocab=65536 --line-words=16 --jobs=48
+```
+
+正式运行前必须先用 64 MiB 和 256 MiB 通过容量 gate。正式 runner 的关键参数是：
+
+```text
+mode=ssh
+schedule=role-static
+VM0: role=map, launch=localfork, workers=48
+VM1: role=reduce, launch=cxlfork, workers=48
+reducers=128
+map-chunk=2097152
+payload-max=4194304
+shuffle-connections=48
+queue-policy=shared_pair
+cxlfork-policy=mow
+validation=fast
+warmup=2
+repeat=5
+```
+
+`run-bench.sh` 会让 master 先初始化 HydraRPC layout 并停在 start barrier，等待两个
+agent 连同 porter/worker pool 都发布 ready，随后再开始正式作业。主要指标 `run_ms`
+来自 VM0 的 `master_job_v2`：从 start barrier 释放后开始，覆盖输入读取、Map、跨 VM
+shuffle、CXLfork reducer 执行和输出写入。它不混入 SSH 启动和 agent 冷准备。
+
+以下字段必须分开理解：
+
+- `job_run_ns`：论文端到端对比采用的作业时间；
+- `cold_wrapper_ns`：master 进程启动、Hydra layout、agent/porter/worker 冷准备、作业和
+  master teardown 的完整 wrapper 时间；
+- `orchestrator_ms`：宿主机观察到的控制过程，还会包含 SSH 开销，只作诊断；
+- `stages.csv`：`input_setup + map_stage + reduce_stage + output_write + other = total`；
+- `tasks.csv`：逐 task 的 HydraRPC、porter、CXLfork restore 和业务执行细分。并行 task
+  的 latency 不能相加后当作 job wall time。
+
+作业级只有 5 个正式样本，因此报告 mean、median、min/max 和标准差，不报告 P99。
+Task 级样本数足够时可以另外报告分位数，但必须标注为 task latency。
 
 ## 最小 smoke
 

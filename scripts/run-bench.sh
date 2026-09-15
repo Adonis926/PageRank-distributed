@@ -379,7 +379,7 @@ run_local_once() {
   local master_output=$3
   local run_id="${phase}-${index}-$$"
   local agent_paths
-  local begin_ns end_ns elapsed_ns elapsed_ms
+  local begin_ns end_ns elapsed_ns elapsed_ms job_ns job_ms
   agent_paths=$(make_agent_paths_local "$run_id")
   IFS=, read -r -a path_array <<< "$agent_paths"
 
@@ -438,7 +438,23 @@ run_local_once() {
   rm -f "${path_array[@]}"
   elapsed_ns=$((end_ns - begin_ns))
   elapsed_ms=$(awk -v ns="$elapsed_ns" 'BEGIN {printf "%.3f", ns / 1000000.0}')
-  echo "$elapsed_ms:$rc:$elapsed_ms:$elapsed_ns"
+  job_ns=$(awk '
+    $1 == "master_job_v2" {
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        if (kv[1] == "total_ns") value = kv[2]
+      }
+    }
+    END {print value + 0}
+  ' "$output_dir/logs/${phase}_${index}_master.log")
+  if [[ ! "$job_ns" =~ ^[1-9][0-9]*$ ]]; then
+    rc=1
+    job_ns=0
+    job_ms=0
+  else
+    job_ms=$(awk -v ns="$job_ns" 'BEGIN {printf "%.3f", ns / 1000000.0}')
+  fi
+  echo "$job_ms:$rc:$elapsed_ms:$job_ns:$elapsed_ns"
 }
 
 parse_worker_spec() {
@@ -619,9 +635,19 @@ run_ssh_once() {
   local local_output=$3
   local remote_output="$remote_dir/output/${phase}_${index}.out"
   local remote_timer="$remote_dir/logs/${phase}_${index}_guest_timer.log"
+  local master_ready="$remote_dir/logs/${phase}_${index}_master.ready"
+  local master_start="$remote_dir/logs/${phase}_${index}_master.start"
   local binary=${remote_binary:-${remote_repo:-$repo}/build/mr_hydra}
   local privilege=""
   ((use_sudo)) && privilege="sudo -E "
+
+  remote_cmd "$master_host" \
+    "${privilege}rm -f '$remote_output' '$remote_timer' '$master_ready' '$master_start'"
+  start=$(now_ms)
+  remote_cmd "$master_host" "begin_ns=\$(date +%s%N); ${privilege}'$binary' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --schedule='$master_schedule_arg' --workers-per-agent='$workers_per_agent' --connections='$shuffle_connections' --queue-policy='$queue_policy' --ready-file='$master_ready' --start-file='$master_start' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1; rc=\$?; end_ns=\$(date +%s%N); printf 'guest_run_v1 status=%s begin_ns=%s end_ns=%s total_ns=%s\\n' \"\$rc\" \"\$begin_ns\" \"\$end_ns\" \"\$((end_ns - begin_ns))\" > '$remote_timer'; exit \"\$rc\"" &
+  master_pid=$!
+  wait_remote_file "$master_host" "$master_ready" ||
+    die "master did not initialize the HydraRPC layout"
 
   worker_pids=()
   worker_ready_files=()
@@ -657,11 +683,7 @@ run_ssh_once() {
       die "worker $i did not become ready"
   done
 
-  remote_cmd "$master_host" \
-    "${privilege}rm -f '$remote_output' '$remote_timer'"
-  start=$(now_ms)
-  remote_cmd "$master_host" "begin_ns=\$(date +%s%N); ${privilege}'$binary' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --schedule='$master_schedule_arg' --workers-per-agent='$workers_per_agent' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1; rc=\$?; end_ns=\$(date +%s%N); printf 'guest_run_v1 status=%s begin_ns=%s end_ns=%s total_ns=%s\\n' \"\$rc\" \"\$begin_ns\" \"\$end_ns\" \"\$((end_ns - begin_ns))\" > '$remote_timer'; exit \"\$rc\"" &
-  master_pid=$!
+  remote_cmd "$master_host" "${privilege}touch '$master_start'"
 
   local rc=0
   wait "$master_pid" || rc=$?
@@ -683,9 +705,10 @@ run_ssh_once() {
       "${privilege}rm -rf '${worker_store_dirs[$i]}'" || rc=1
   done
 
-  local guest_run_ns=0
-  local guest_run_ms=0
-  guest_run_ns=$(awk '
+  local cold_wrapper_ns=0
+  local job_run_ns=0
+  local job_run_ms=0
+  cold_wrapper_ns=$(awk '
     $1 == "guest_run_v1" {
       for (i = 2; i <= NF; i++) {
         split($i, kv, "=")
@@ -694,12 +717,26 @@ run_ssh_once() {
     }
     END {print value + 0}
   ' "$output_dir/logs/${phase}_${index}_guest_timer.remote.log")
-  if [[ ! "$guest_run_ns" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ ! "$cold_wrapper_ns" =~ ^[1-9][0-9]*$ ]]; then
     printf 'missing or invalid guest timer for %s %s\n' "$phase" "$index" \
       > "$output_dir/logs/${phase}_${index}_missing_timer.log"
     rc=1
+  fi
+  job_run_ns=$(awk '
+    $1 == "master_job_v2" {
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        if (kv[1] == "total_ns") value = kv[2]
+      }
+    }
+    END {print value + 0}
+  ' "$output_dir/logs/${phase}_${index}_master.remote.log")
+  if [[ ! "$job_run_ns" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'missing or invalid master_job_v2 timer for %s %s\n' "$phase" "$index" \
+      > "$output_dir/logs/${phase}_${index}_missing_job_timer.log"
+    rc=1
   else
-    guest_run_ms=$(awk -v ns="$guest_run_ns" 'BEGIN {printf "%.3f", ns / 1000000.0}')
+    job_run_ms=$(awk -v ns="$job_run_ns" 'BEGIN {printf "%.3f", ns / 1000000.0}')
   fi
 
   if ((rc != 0)) || ! remote_file_exists "$master_host" "$remote_output"; then
@@ -710,7 +747,7 @@ run_ssh_once() {
     remote_copy_from "$master_host" "$remote_output" "$local_output" || rc=$?
   fi
 
-  echo "$guest_run_ms:$rc:$((end - start)):$guest_run_ns"
+  echo "$job_run_ms:$rc:$((end - start)):$job_run_ns:$cold_wrapper_ns"
 }
 
 if [[ "$mode" == ssh && ${#workers[@]} -eq 0 ]]; then
@@ -736,16 +773,16 @@ run_csv="$output_dir/runs.csv"
 warmup_csv="$output_dir/warmups.csv"
 task_csv="$output_dir/tasks.csv"
 stage_csv="$output_dir/stages.csv"
-printf 'index,run_ms,exit_status,orchestrator_ms,guest_run_ns\n' > "$run_csv"
-printf 'index,run_ms,exit_status,orchestrator_ms,guest_run_ns\n' > "$warmup_csv"
-printf 'phase,run_index,task_id,kind,node,worker,pid,status,roundtrip_ns,porter_total_ns,dispatch_ns,fork_ns,wakeup_ns,restore_ioctl_ns,template_validate_ns,task_ns,reap_ns,refill_ns,restore_id,path_mask,kernel_total_ns,shared_leaf_pages,fallback_pages,local_copy_pages,leaf_copy_pages,template_state_checksum,template_access_checksum,template_access_count,template_state_pages,template_binding_flags\n' > "$task_csv"
+printf 'index,run_ms,exit_status,orchestrator_ms,job_run_ns,cold_wrapper_ns\n' > "$run_csv"
+printf 'index,run_ms,exit_status,orchestrator_ms,job_run_ns,cold_wrapper_ns\n' > "$warmup_csv"
+printf 'phase,run_index,task_id,kind,node,worker,pid,status,roundtrip_ns,porter_total_ns,dispatch_ns,fork_ns,wakeup_ns,restore_ioctl_ns,template_validate_ns,task_ns,reap_ns,refill_ns,restore_id,path_mask,kernel_total_ns,shared_data_pages,fallback_pages,local_copy_pages,leaf_copy_pages,template_state_checksum,template_access_checksum,template_access_count,template_state_pages,template_binding_flags\n' > "$task_csv"
 printf 'phase,run_index,status,total_ns,input_setup_ns,map_stage_ns,reduce_stage_ns,output_write_ns,other_ns,map_tasks,reducers\n' > "$stage_csv"
 
 cat > "$output_dir/run-manifest.env" <<EOF
 format=mr-e2e-aligned-v1
 created_utc=$(date -u +%FT%TZ)
 mr_commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf unknown)
-measurement_boundary=guest_master_launch_to_exit
+measurement_boundary=master_start_barrier_to_output_complete
 input_bytes=$input_bytes
 input_files=${#input_files[@]}
 input_sha256=$combined_input_sha256
@@ -825,7 +862,7 @@ for ((i = 0; i < warmup; i++)); do
   else
     result=$(run_ssh_once warmup "$i" "$raw")
   fi
-  IFS=: read -r run_ms rc orchestrator_ms guest_run_ns <<< "$result"
+  IFS=: read -r run_ms rc orchestrator_ms job_run_ns cold_wrapper_ns <<< "$result"
 
   if [[ "$rc" != 0 ]]; then
     status=failed
@@ -833,8 +870,8 @@ for ((i = 0; i < warmup; i++)); do
   else
     exit_status=0
   fi
-  printf '%s,%s,%s,%s,%s\n' "$i" "$run_ms" "$exit_status" \
-    "$orchestrator_ms" "$guest_run_ns" >> "$warmup_csv"
+  printf '%s,%s,%s,%s,%s,%s\n' "$i" "$run_ms" "$exit_status" \
+    "$orchestrator_ms" "$job_run_ns" "$cold_wrapper_ns" >> "$warmup_csv"
   if [[ "$mode" == local ]]; then
     append_task_metrics warmup "$i" "$output_dir/logs/warmup_${i}_master.log"
   else
@@ -854,7 +891,7 @@ for ((i = 0; i < repeat; i++)); do
   else
     result=$(run_ssh_once repeat "$i" "$raw")
   fi
-  IFS=: read -r run_ms rc orchestrator_ms guest_run_ns <<< "$result"
+  IFS=: read -r run_ms rc orchestrator_ms job_run_ns cold_wrapper_ns <<< "$result"
 
   if [[ "$rc" != 0 ]]; then
     status=failed
@@ -862,8 +899,8 @@ for ((i = 0; i < repeat; i++)); do
   else
     exit_status=0
   fi
-  printf '%s,%s,%s,%s,%s\n' "$i" "$run_ms" "$exit_status" \
-    "$orchestrator_ms" "$guest_run_ns" >> "$run_csv"
+  printf '%s,%s,%s,%s,%s,%s\n' "$i" "$run_ms" "$exit_status" \
+    "$orchestrator_ms" "$job_run_ns" "$cold_wrapper_ns" >> "$run_csv"
   if [[ "$mode" == local ]]; then
     append_task_metrics repeat "$i" "$output_dir/logs/repeat_${i}_master.log"
   else
@@ -943,7 +980,7 @@ run_ms_stddev=$run_ms_stddev
 throughput_mib_s=$throughput_mib_s
 input_bytes=$input_bytes
 input_sha256=$combined_input_sha256
-measurement_boundary=guest_master_launch_to_exit
+measurement_boundary=master_start_barrier_to_output_complete
 details='$details'
 EOF
 
@@ -960,7 +997,7 @@ cat > "$output_dir/result.json" <<EOF
   "run_ms_p95": $run_ms_p95,
   "run_ms_stddev": $run_ms_stddev,
   "throughput_mib_s": $throughput_mib_s,
-  "measurement_boundary": "guest_master_launch_to_exit",
+  "measurement_boundary": "master_start_barrier_to_output_complete",
   "input_sha256": "$combined_input_sha256",
   "mode": "$mode",
   "backend": "$backend",
@@ -985,7 +1022,7 @@ EOF
 
 cat > "$output_dir/summary.csv" <<EOF
 impl,mode,status,correctness,run_ms_avg,run_ms_min,run_ms_max,run_ms_median,run_ms_stddev,throughput_mib_s,input_bytes,measurement_boundary,details
-distributed,$mode,$status,$correctness,$run_ms_avg,$run_ms_min,$run_ms_max,$run_ms_median,$run_ms_stddev,$throughput_mib_s,$input_bytes,guest_master_launch_to_exit,"$details"
+distributed,$mode,$status,$correctness,$run_ms_avg,$run_ms_min,$run_ms_max,$run_ms_median,$run_ms_stddev,$throughput_mib_s,$input_bytes,master_start_barrier_to_output_complete,"$details"
 EOF
 
 task_summary_csv="$output_dir/task_summary.csv"
@@ -1049,5 +1086,36 @@ summarize_stage_metric map_stage 6
 summarize_stage_metric reduce_stage 7
 summarize_stage_metric output_write 8
 summarize_stage_metric other 9
+
+lifecycle_summary_csv="$output_dir/lifecycle_summary.csv"
+printf 'metric,count,mean_ns,p50_ns,min_ns,max_ns,stddev_ns\n' > "$lifecycle_summary_csv"
+summarize_lifecycle_metric() {
+  local metric=$1 expression=$2
+  awk -F, -v expression="$expression" '
+    NR > 1 {
+      if (expression == "job") print $5
+      else if (expression == "cold") print $6
+      else if (expression == "cold_minus_job") print $6 - $5
+      else if (expression == "orchestrator") print $4 * 1000000
+    }
+  ' "$run_csv" | LC_ALL=C sort -n |
+    awk -v metric="$metric" '
+      NR == 1 {min = max = $1}
+      {value[NR] = $1; sum += $1; if ($1 < min) min = $1; if ($1 > max) max = $1}
+      END {
+        if (NR > 0) {
+          p50 = int(NR * 0.50); if (p50 < NR * 0.50) p50++; if (p50 < 1) p50 = 1
+          mean = sum / NR
+          for (i = 1; i <= NR; i++) {d = value[i] - mean; ss += d * d}
+          printf "%s,%d,%.3f,%d,%d,%d,%.3f\n", metric, NR, mean,
+                 value[p50], min, max, sqrt(ss / NR)
+        }
+      }
+    ' >> "$lifecycle_summary_csv"
+}
+summarize_lifecycle_metric job_run job
+summarize_lifecycle_metric cold_wrapper cold
+summarize_lifecycle_metric cold_control_overhead cold_minus_job
+summarize_lifecycle_metric host_orchestrator orchestrator
 
 [[ "$status" == ok ]] || exit 1
