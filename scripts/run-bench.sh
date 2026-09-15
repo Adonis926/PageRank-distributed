@@ -11,6 +11,10 @@ now_ms() {
   date +%s%3N
 }
 
+now_ns() {
+  date +%s%N
+}
+
 normalize_wordcount() {
   awk 'NF >= 2 { print $1 "\t" $2 }' "$1" | LC_ALL=C sort > "$2"
 }
@@ -43,6 +47,7 @@ QEMU/SSH control-plane mode:
   --remote-hydrarpc-root=DIR
   --no-remote-build
   --remote-binary=PATH
+  --deploy-binary=LOCAL_PATH
   --sudo
 
 Common distributed options:
@@ -66,8 +71,10 @@ Common distributed options:
   --template-value-scale=N
   --map-template-key=N --map-template-generation=N --map-template-checksum=N
   --reduce-template-key=N --reduce-template-generation=N --reduce-template-checksum=N
+  --prepare-reduce-template-key=N
   --cxlfork-policy=readonly|mow|moa|hybrid
   --validation=fast|full
+  --ready-timeout=N
 
 This script does not start QEMU VMs by default. It uses SSH to start commands
 inside already-running VMs and leaves HydraRPC backend paths as the measured
@@ -110,6 +117,7 @@ remote_repo=""
 remote_hydrarpc_root=""
 remote_build=1
 remote_binary=""
+deploy_binary=""
 use_sudo=0
 template_base=87960930222080
 template_bytes=67108864
@@ -121,8 +129,10 @@ map_template_checksum=0
 reduce_template_key=0
 reduce_template_generation=0
 reduce_template_checksum=0
+prepare_reduce_template_key=0
 cxlfork_policy=mow
 validation=fast
+ready_timeout=120
 
 while (($#)); do
   case "$1" in
@@ -157,6 +167,7 @@ while (($#)); do
     --remote-hydrarpc-root=*) remote_hydrarpc_root=${1#*=} ;;
     --no-remote-build) remote_build=0 ;;
     --remote-binary=*) remote_binary=${1#*=} ;;
+    --deploy-binary=*) deploy_binary=${1#*=} ;;
     --sudo) use_sudo=1 ;;
     --template-base=*) template_base=${1#*=} ;;
     --template-bytes=*) template_bytes=${1#*=} ;;
@@ -168,8 +179,10 @@ while (($#)); do
     --reduce-template-key=*) reduce_template_key=${1#*=} ;;
     --reduce-template-generation=*) reduce_template_generation=${1#*=} ;;
     --reduce-template-checksum=*) reduce_template_checksum=${1#*=} ;;
+    --prepare-reduce-template-key=*) prepare_reduce_template_key=${1#*=} ;;
     --cxlfork-policy=*) cxlfork_policy=${1#*=} ;;
     --validation=*) validation=${1#*=} ;;
+    --ready-timeout=*) ready_timeout=${1#*=} ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -188,6 +201,8 @@ done
 [[ "$map_size" =~ ^[0-9]+$ && "$map_size" -gt 0 ]] || die "--size must be a positive integer"
 [[ "$shuffle_connections" =~ ^[0-9]+$ && "$shuffle_connections" -gt 0 ]] || die "--shuffle-connections must be a positive integer"
 [[ "$input_bytes" =~ ^[0-9]+$ && "$input_bytes" -gt 0 ]] || die "--input-bytes must be a positive integer"
+[[ "$prepare_reduce_template_key" =~ ^[0-9]+$ ]] || die "--prepare-reduce-template-key must be a non-negative integer"
+[[ "$ready_timeout" =~ ^[0-9]+$ && "$ready_timeout" -gt 0 ]] || die "--ready-timeout must be a positive integer"
 [[ "$verify" == last || "$verify" == all || "$verify" == none ]] || die "--verify must be last, all, or none"
 if [[ "$schedule" != static && "$schedule" != role-static && "$schedule" != file:* ]]; then
   die "--schedule must be static, role-static or file:PATH"
@@ -198,6 +213,7 @@ if [[ "$schedule" == file:* ]]; then
 fi
 [[ "$cxlfork_policy" == readonly || "$cxlfork_policy" == mow || "$cxlfork_policy" == moa || "$cxlfork_policy" == hybrid ]] || die "invalid --cxlfork-policy"
 [[ "$validation" == fast || "$validation" == full ]] || die "--validation must be fast or full"
+[[ -z "$deploy_binary" || -x "$deploy_binary" ]] || die "--deploy-binary must name an executable file"
 [[ "$template_value_scale" =~ ^[0-9]+$ && "$template_value_scale" -ge 1 && "$template_value_scale" -le 1024 ]] || die "--template-value-scale must be in [1, 1024]"
 mkdir -p "$output_dir"/logs
 
@@ -205,6 +221,14 @@ mapfile -t input_files < <(find "$input_dir" -maxdepth 1 -type f -name '*.txt' |
 ((${#input_files[@]} > 0)) || die "no input files found in $input_dir"
 combined_input="$output_dir/combined-input.txt"
 cat "${input_files[@]}" > "$combined_input"
+actual_input_bytes=$(stat -c %s "$combined_input")
+[[ "$actual_input_bytes" -eq "$input_bytes" ]] ||
+  die "combined input size mismatch: declared=$input_bytes actual=$actual_input_bytes"
+sha256sum "${input_files[@]}" > "$output_dir/input-files.sha256"
+combined_input_sha256=$(sha256sum "$combined_input" | awk '{print $1}')
+expected_sha256=$(sha256sum "$expected" | awk '{print $1}')
+printf '%s  combined-input.txt\n' "$combined_input_sha256" > "$output_dir/input.sha256"
+printf '%s  expected.txt\n' "$expected_sha256" > "$output_dir/expected.sha256"
 
 ssh_base_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 if [[ -n "$ssh_key" ]]; then
@@ -313,6 +337,12 @@ remote_file_exists() {
   remote_cmd "$host" "test -f '$path'"
 }
 
+wait_remote_file() {
+  local host=$1
+  local path=$2
+  remote_cmd "$host" "for i in \$(seq 1 $((ready_timeout * 10))); do test -f '$path' && exit 0; sleep 0.1; done; echo 'timed out waiting for $path' >&2; exit 1"
+}
+
 copy_remote_log() {
   local host=$1
   local remote_path=$2
@@ -349,6 +379,7 @@ run_local_once() {
   local master_output=$3
   local run_id="${phase}-${index}-$$"
   local agent_paths
+  local begin_ns end_ns elapsed_ns elapsed_ms
   agent_paths=$(make_agent_paths_local "$run_id")
   IFS=, read -r -a path_array <<< "$agent_paths"
 
@@ -380,7 +411,7 @@ run_local_once() {
     agent_pids+=("$!")
   done
 
-  start=$(now_ms)
+  begin_ns=$(now_ns)
   "$repo/build/mr_hydra" master \
     --backend="$backend" \
     --input="$combined_input" \
@@ -400,12 +431,14 @@ run_local_once() {
 
   local rc=0
   wait "$master_pid" || rc=$?
-  end=$(now_ms)
+  end_ns=$(now_ns)
   for pid in "${agent_pids[@]}"; do
     wait "$pid" || rc=$?
   done
   rm -f "${path_array[@]}"
-  echo "$((end - start)):$rc"
+  elapsed_ns=$((end_ns - begin_ns))
+  elapsed_ms=$(awk -v ns="$elapsed_ns" 'BEGIN {printf "%.3f", ns / 1000000.0}')
+  echo "$elapsed_ms:$rc:$elapsed_ms:$elapsed_ns"
 }
 
 parse_worker_spec() {
@@ -453,7 +486,11 @@ prepare_remote_host() {
   {
     printf 'prepare host=%s repo=%s remote_dir=%s\n' "$host" "$repo_on_host" "$remote_dir"
     remote_cmd "$host" "mkdir -p '$remote_dir/input' '$remote_dir/output' '$remote_dir/logs'"
-    if ((remote_build)); then
+    if [[ -n "$deploy_binary" ]]; then
+      remote_binary=${remote_binary:-$remote_dir/mr_hydra}
+      remote_copy_to "$deploy_binary" "$host" "$remote_binary"
+      remote_cmd "$host" "chmod 0755 '$remote_binary'"
+    elif ((remote_build)); then
       remote_cmd "$host" "cmake -S '$repo_on_host' -B '$repo_on_host/build' ${remote_hydrarpc_root:+-DHYDRARPC_ROOT='$remote_hydrarpc_root'} && cmake --build '$repo_on_host/build'"
     fi
   } >> "$log_file" 2>&1
@@ -483,6 +520,7 @@ prepare_ssh_environment() {
 
   start=$(now_ms)
   prepare_remote_host "$master_host" "$repo_on_master"
+  remote_copy_to "$combined_input" "$master_host" "$remote_input"
   if [[ "$schedule" == file:* ]]; then
     remote_copy_to "${schedule#file:}" "$master_host" "$remote_schedule"
     master_schedule_arg="file:$remote_schedule"
@@ -524,23 +562,77 @@ prepare_ssh_environment() {
   fi
 }
 
+auto_template_prepared=0
+auto_template_binary=""
+
+cleanup_auto_template() {
+  if ((auto_template_prepared)); then
+    local privilege=""
+    ((use_sudo)) && privilege="sudo -E "
+    remote_cmd "$master_host" \
+      "${privilege}'$auto_template_binary' cxlfork-release '$reduce_template_key' '$reduce_template_generation'" \
+      >> "$output_dir/logs/reduce_template_release.log" 2>&1 || true
+    auto_template_prepared=0
+  fi
+}
+
+prepare_reduce_template_if_requested() {
+  ((prepare_reduce_template_key != 0)) || return 0
+  if [[ "$mode" != ssh ]]; then
+    die "--prepare-reduce-template-key is only supported in ssh mode"
+  fi
+  if [[ "$reduce_template_key" != 0 || "$reduce_template_generation" != 0 ||
+        "$reduce_template_checksum" != 0 ]]; then
+    die "automatic reduce template preparation cannot be combined with manual key/generation/checksum"
+  fi
+
+  local binary=${remote_binary:-${remote_repo:-$repo}/build/mr_hydra}
+  local privilege=""
+  local log="$output_dir/logs/reduce_template_prepare.log"
+  local line token
+  ((use_sudo)) && privilege="sudo -E "
+  remote_cmd "$master_host" \
+    "${privilege}'$binary' template --role=reduce --key='$prepare_reduce_template_key' --base='$template_base' --bytes='$template_bytes' --seed='$template_seed' --value-scale='$template_value_scale'" \
+    > "$log" 2>&1 || die "reduce CXLfork template preparation failed; see $log"
+
+  line=$(awk '$1 == "mr_template_v2" {last = $0} END {print last}' "$log")
+  [[ -n "$line" ]] || die "template output did not contain mr_template_v2"
+  for token in $line; do
+    case "$token" in
+      key=*) reduce_template_key=${token#*=} ;;
+      generation=*) reduce_template_generation=${token#*=} ;;
+      page_checksum=*) reduce_template_checksum=${token#*=} ;;
+    esac
+  done
+  [[ "$reduce_template_key" == "$prepare_reduce_template_key" &&
+     "$reduce_template_generation" =~ ^[1-9][0-9]*$ &&
+     "$reduce_template_checksum" =~ ^[1-9][0-9]*$ ]] ||
+    die "invalid template identity parsed from $log"
+  auto_template_binary=$binary
+  auto_template_prepared=1
+  trap cleanup_auto_template EXIT
+}
+
 run_ssh_once() {
   local phase=$1
   local index=$2
   local local_output=$3
   local remote_output="$remote_dir/output/${phase}_${index}.out"
+  local remote_timer="$remote_dir/logs/${phase}_${index}_guest_timer.log"
   local binary=${remote_binary:-${remote_repo:-$repo}/build/mr_hydra}
   local privilege=""
   ((use_sudo)) && privilege="sudo -E "
 
-  remote_copy_to "$combined_input" "$master_host" "$remote_input"
-
   worker_pids=()
+  worker_ready_files=()
+  worker_store_dirs=()
   local i global_base=0
   for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
     local role=${worker_roles[$i]}
     local launch=${worker_launches[$i]}
     local count=${worker_counts[$i]}
+    local ready_file="$remote_dir/logs/${phase}_${index}_worker${i}.ready"
+    local store_dir="$remote_dir/store/agent${i}_${phase}_${index}"
     local key=0 generation=0 checksum=0
     if [[ "$role" == map ]]; then
       key=$map_template_key; generation=$map_template_generation; checksum=$map_template_checksum
@@ -551,13 +643,24 @@ run_ssh_once() {
        [[ "$key" == 0 || "$generation" == 0 || "$checksum" == 0 ]]; then
       die "cxlfork worker $i requires role-specific template key/generation/checksum"
     fi
-    remote_cmd "${worker_hosts[$i]}" "${privilege}'$binary' agent --backend='$backend' --path='${worker_paths[$i]}' --node-id='$i' --agent-count='${#worker_hosts[@]}' --workers='$count' --global-worker-base='$global_base' --role='$role' --launch='$launch' --template-base='$template_base' --template-bytes='$template_bytes' --template-seed='$template_seed' --template-value-scale='$template_value_scale' --template-key='$key' --template-generation='$generation' --template-page-checksum='$checksum' --cxlfork-policy='$cxlfork_policy' --validation='$validation' --store-dir='$remote_dir/store/agent${i}_${phase}_${index}' --shuffle-backend='$shuffle_backend' --shuffle-connections='$shuffle_connections' --queue-policy='$queue_policy' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
+    remote_cmd "${worker_hosts[$i]}" \
+      "${privilege}rm -rf '$store_dir'; ${privilege}rm -f '$ready_file'; mkdir -p '$remote_dir/logs' '$remote_dir/store'"
+    remote_cmd "${worker_hosts[$i]}" "${privilege}'$binary' agent --backend='$backend' --path='${worker_paths[$i]}' --node-id='$i' --agent-count='${#worker_hosts[@]}' --workers='$count' --global-worker-base='$global_base' --role='$role' --launch='$launch' --template-base='$template_base' --template-bytes='$template_bytes' --template-seed='$template_seed' --template-value-scale='$template_value_scale' --template-key='$key' --template-generation='$generation' --template-page-checksum='$checksum' --cxlfork-policy='$cxlfork_policy' --validation='$validation' --store-dir='$store_dir' --ready-file='$ready_file' --shuffle-backend='$shuffle_backend' --shuffle-connections='$shuffle_connections' --queue-policy='$queue_policy' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --quiet > '$remote_dir/logs/${phase}_${index}_worker${i}.log' 2>&1" &
     worker_pids+=("$!")
+    worker_ready_files+=("$ready_file")
+    worker_store_dirs+=("$store_dir")
     global_base=$((global_base + count))
   done
 
+  for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
+    wait_remote_file "${worker_hosts[$i]}" "${worker_ready_files[$i]}" ||
+      die "worker $i did not become ready"
+  done
+
+  remote_cmd "$master_host" \
+    "${privilege}rm -f '$remote_output' '$remote_timer'"
   start=$(now_ms)
-  remote_cmd "$master_host" "${privilege}'$binary' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --schedule='$master_schedule_arg' --workers-per-agent='$workers_per_agent' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1" &
+  remote_cmd "$master_host" "begin_ns=\$(date +%s%N); ${privilege}'$binary' master --backend='$backend' --input='$remote_input' --output='$remote_output' --agents='$worker_arg' --payload-max='$payload_max' --queue-capacity='$queue_capacity' --size='$map_size' --schedule='$master_schedule_arg' --workers-per-agent='$workers_per_agent' --connections='$shuffle_connections' --queue-policy='$queue_policy' ${reducers:+--reducers='$reducers'} ${map_chunk:+--map-chunk='$map_chunk'} --quiet > '$remote_dir/logs/${phase}_${index}_master.log' 2>&1; rc=\$?; end_ns=\$(date +%s%N); printf 'guest_run_v1 status=%s begin_ns=%s end_ns=%s total_ns=%s\\n' \"\$rc\" \"\$begin_ns\" \"\$end_ns\" \"\$((end_ns - begin_ns))\" > '$remote_timer'; exit \"\$rc\"" &
   master_pid=$!
 
   local rc=0
@@ -570,11 +673,34 @@ run_ssh_once() {
   copy_remote_log "$master_host" \
     "$remote_dir/logs/${phase}_${index}_master.log" \
     "$output_dir/logs/${phase}_${index}_master.remote.log"
+  copy_remote_log "$master_host" "$remote_timer" \
+    "$output_dir/logs/${phase}_${index}_guest_timer.remote.log"
   for ((i = 0; i < ${#worker_hosts[@]}; i++)); do
     copy_remote_log "${worker_hosts[$i]}" \
       "$remote_dir/logs/${phase}_${index}_worker${i}.log" \
       "$output_dir/logs/${phase}_${index}_worker${i}.remote.log"
+    remote_cmd "${worker_hosts[$i]}" \
+      "${privilege}rm -rf '${worker_store_dirs[$i]}'" || rc=1
   done
+
+  local guest_run_ns=0
+  local guest_run_ms=0
+  guest_run_ns=$(awk '
+    $1 == "guest_run_v1" {
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        if (kv[1] == "total_ns") value = kv[2]
+      }
+    }
+    END {print value + 0}
+  ' "$output_dir/logs/${phase}_${index}_guest_timer.remote.log")
+  if [[ ! "$guest_run_ns" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'missing or invalid guest timer for %s %s\n' "$phase" "$index" \
+      > "$output_dir/logs/${phase}_${index}_missing_timer.log"
+    rc=1
+  else
+    guest_run_ms=$(awk -v ns="$guest_run_ns" 'BEGIN {printf "%.3f", ns / 1000000.0}')
+  fi
 
   if ((rc != 0)) || ! remote_file_exists "$master_host" "$remote_output"; then
     printf 'missing remote output: %s:%s\n' "$master_host" "$remote_output" \
@@ -584,7 +710,7 @@ run_ssh_once() {
     remote_copy_from "$master_host" "$remote_output" "$local_output" || rc=$?
   fi
 
-  echo "$((end - start)):$rc"
+  echo "$guest_run_ms:$rc:$((end - start)):$guest_run_ns"
 }
 
 if [[ "$mode" == ssh && ${#workers[@]} -eq 0 ]]; then
@@ -604,12 +730,39 @@ if [[ "$mode" == local && "$build_ms" == 0 ]]; then
   build_ms=$((build_end - build_start))
 fi
 
+prepare_reduce_template_if_requested
+
 run_csv="$output_dir/runs.csv"
 warmup_csv="$output_dir/warmups.csv"
 task_csv="$output_dir/tasks.csv"
-printf 'index,run_ms,exit_status\n' > "$run_csv"
-printf 'index,run_ms,exit_status\n' > "$warmup_csv"
+stage_csv="$output_dir/stages.csv"
+printf 'index,run_ms,exit_status,orchestrator_ms,guest_run_ns\n' > "$run_csv"
+printf 'index,run_ms,exit_status,orchestrator_ms,guest_run_ns\n' > "$warmup_csv"
 printf 'phase,run_index,task_id,kind,node,worker,pid,status,roundtrip_ns,porter_total_ns,dispatch_ns,fork_ns,wakeup_ns,restore_ioctl_ns,template_validate_ns,task_ns,reap_ns,refill_ns,restore_id,path_mask,kernel_total_ns,shared_leaf_pages,fallback_pages,local_copy_pages,leaf_copy_pages,template_state_checksum,template_access_checksum,template_access_count,template_state_pages,template_binding_flags\n' > "$task_csv"
+printf 'phase,run_index,status,total_ns,input_setup_ns,map_stage_ns,reduce_stage_ns,output_write_ns,other_ns,map_tasks,reducers\n' > "$stage_csv"
+
+cat > "$output_dir/run-manifest.env" <<EOF
+format=mr-e2e-aligned-v1
+created_utc=$(date -u +%FT%TZ)
+mr_commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf unknown)
+measurement_boundary=guest_master_launch_to_exit
+input_bytes=$input_bytes
+input_files=${#input_files[@]}
+input_sha256=$combined_input_sha256
+expected_sha256=$expected_sha256
+warmup=$warmup
+repeat=$repeat
+workers_per_agent=$workers_per_agent
+reducers=${reducers:-0}
+map_chunk=${map_chunk:-0}
+shuffle_connections=$shuffle_connections
+queue_policy=$queue_policy
+cxlfork_policy=$cxlfork_policy
+validation=$validation
+reduce_template_key=$reduce_template_key
+reduce_template_generation=$reduce_template_generation
+reduce_template_checksum=$reduce_template_checksum
+EOF
 
 append_task_metrics() {
   local phase=$1 index=$2 log=$3
@@ -642,6 +795,25 @@ append_task_metrics() {
   ' "$log" >> "$task_csv"
 }
 
+append_job_metrics() {
+  local phase=$1 index=$2 log=$3
+  [[ -f "$log" ]] || return 0
+  awk -v phase="$phase" -v run="$index" '
+    $1 == "master_job_v2" {
+      delete v
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        v[kv[1]] = kv[2]
+      }
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        phase, run, v["status"], v["total_ns"],
+        v["input_setup_ns"], v["map_stage_ns"],
+        v["reduce_stage_ns"], v["output_write_ns"],
+        v["other_ns"], v["map_tasks"], v["reducers"]
+    }
+  ' "$log" >> "$stage_csv"
+}
+
 run_values=()
 status=ok
 correctness=skipped
@@ -653,8 +825,7 @@ for ((i = 0; i < warmup; i++)); do
   else
     result=$(run_ssh_once warmup "$i" "$raw")
   fi
-  run_ms=${result%%:*}
-  rc=${result#*:}
+  IFS=: read -r run_ms rc orchestrator_ms guest_run_ns <<< "$result"
 
   if [[ "$rc" != 0 ]]; then
     status=failed
@@ -662,11 +833,17 @@ for ((i = 0; i < warmup; i++)); do
   else
     exit_status=0
   fi
-  printf '%s,%s,%s\n' "$i" "$run_ms" "$exit_status" >> "$warmup_csv"
+  printf '%s,%s,%s,%s,%s\n' "$i" "$run_ms" "$exit_status" \
+    "$orchestrator_ms" "$guest_run_ns" >> "$warmup_csv"
   if [[ "$mode" == local ]]; then
     append_task_metrics warmup "$i" "$output_dir/logs/warmup_${i}_master.log"
   else
     append_task_metrics warmup "$i" "$output_dir/logs/warmup_${i}_master.remote.log"
+  fi
+  if [[ "$mode" == local ]]; then
+    append_job_metrics warmup "$i" "$output_dir/logs/warmup_${i}_master.log"
+  else
+    append_job_metrics warmup "$i" "$output_dir/logs/warmup_${i}_master.remote.log"
   fi
 done
 
@@ -677,8 +854,7 @@ for ((i = 0; i < repeat; i++)); do
   else
     result=$(run_ssh_once repeat "$i" "$raw")
   fi
-  run_ms=${result%%:*}
-  rc=${result#*:}
+  IFS=: read -r run_ms rc orchestrator_ms guest_run_ns <<< "$result"
 
   if [[ "$rc" != 0 ]]; then
     status=failed
@@ -686,11 +862,17 @@ for ((i = 0; i < repeat; i++)); do
   else
     exit_status=0
   fi
-  printf '%s,%s,%s\n' "$i" "$run_ms" "$exit_status" >> "$run_csv"
+  printf '%s,%s,%s,%s,%s\n' "$i" "$run_ms" "$exit_status" \
+    "$orchestrator_ms" "$guest_run_ns" >> "$run_csv"
   if [[ "$mode" == local ]]; then
     append_task_metrics repeat "$i" "$output_dir/logs/repeat_${i}_master.log"
   else
     append_task_metrics repeat "$i" "$output_dir/logs/repeat_${i}_master.remote.log"
+  fi
+  if [[ "$mode" == local ]]; then
+    append_job_metrics repeat "$i" "$output_dir/logs/repeat_${i}_master.log"
+  else
+    append_job_metrics repeat "$i" "$output_dir/logs/repeat_${i}_master.remote.log"
   fi
   run_values+=("$run_ms")
 done
@@ -727,7 +909,7 @@ fi
 
 read -r run_ms_avg run_ms_min run_ms_max run_ms_stddev < <(
   printf '%s\n' "${run_values[@]}" |
-    awk 'NR == 1 {min = max = $1} {values[NR] = $1; if ($1 < min) min = $1; if ($1 > max) max = $1; sum += $1} END {if (NR == 0) print "0 0 0 0"; else {mean = sum / NR; for (i = 1; i <= NR; i++) {d = values[i] - mean; ss += d * d} printf "%.3f %d %d %.3f\n", mean, min, max, sqrt(ss / NR)}}'
+    awk 'NR == 1 {min = max = $1} {values[NR] = $1; if ($1 < min) min = $1; if ($1 > max) max = $1; sum += $1} END {if (NR == 0) print "0 0 0 0"; else {mean = sum / NR; for (i = 1; i <= NR; i++) {d = values[i] - mean; ss += d * d} printf "%.3f %.3f %.3f %.3f\n", mean, min, max, sqrt(ss / NR)}}'
 )
 
 run_ms_median=$(
@@ -760,6 +942,8 @@ run_ms_p95=$run_ms_p95
 run_ms_stddev=$run_ms_stddev
 throughput_mib_s=$throughput_mib_s
 input_bytes=$input_bytes
+input_sha256=$combined_input_sha256
+measurement_boundary=guest_master_launch_to_exit
 details='$details'
 EOF
 
@@ -776,6 +960,8 @@ cat > "$output_dir/result.json" <<EOF
   "run_ms_p95": $run_ms_p95,
   "run_ms_stddev": $run_ms_stddev,
   "throughput_mib_s": $throughput_mib_s,
+  "measurement_boundary": "guest_master_launch_to_exit",
+  "input_sha256": "$combined_input_sha256",
   "mode": "$mode",
   "backend": "$backend",
   "agents": $agent_count,
@@ -795,6 +981,11 @@ cat > "$output_dir/result.json" <<EOF
   "repeat": $repeat,
   "input_bytes": $input_bytes
 }
+EOF
+
+cat > "$output_dir/summary.csv" <<EOF
+impl,mode,status,correctness,run_ms_avg,run_ms_min,run_ms_max,run_ms_median,run_ms_stddev,throughput_mib_s,input_bytes,measurement_boundary,details
+distributed,$mode,$status,$correctness,$run_ms_avg,$run_ms_min,$run_ms_max,$run_ms_median,$run_ms_stddev,$throughput_mib_s,$input_bytes,guest_master_launch_to_exit,"$details"
 EOF
 
 task_summary_csv="$output_dir/task_summary.csv"
@@ -831,5 +1022,32 @@ for kind in 1 2; do
   summarize_task_metric "$kind" refill 18
   summarize_task_metric "$kind" kernel_total 21
 done
+
+stage_summary_csv="$output_dir/stage_summary.csv"
+printf 'stage,count,mean_ns,p50_ns,min_ns,max_ns,stddev_ns\n' > "$stage_summary_csv"
+summarize_stage_metric() {
+  local stage=$1 column=$2
+  awk -F, -v column="$column" '$1 == "repeat" {print $column}' "$stage_csv" |
+    LC_ALL=C sort -n |
+    awk -v stage="$stage" '
+      NR == 1 {min = max = $1}
+      {value[NR] = $1; sum += $1; if ($1 < min) min = $1; if ($1 > max) max = $1}
+      END {
+        if (NR > 0) {
+          p50 = int(NR * 0.50); if (p50 < NR * 0.50) p50++; if (p50 < 1) p50 = 1
+          mean = sum / NR
+          for (i = 1; i <= NR; i++) {d = value[i] - mean; ss += d * d}
+          printf "%s,%d,%.3f,%d,%d,%d,%.3f\n", stage, NR, mean,
+                 value[p50], min, max, sqrt(ss / NR)
+        }
+      }
+    ' >> "$stage_summary_csv"
+}
+summarize_stage_metric master_internal_total 4
+summarize_stage_metric input_setup 5
+summarize_stage_metric map_stage 6
+summarize_stage_metric reduce_stage 7
+summarize_stage_metric output_write 8
+summarize_stage_metric other 9
 
 [[ "$status" == ok ]] || exit 1
