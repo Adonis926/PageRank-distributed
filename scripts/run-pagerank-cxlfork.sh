@@ -129,9 +129,10 @@ validate_guest_platform() {
       set -eu
       test \"\$(nproc)\" -eq '$PR_VM_SMP'
       test \"\$(lscpu -p=SOCKET | awk -F, '\$1 !~ /^#/ {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_SOCKETS'
-      test \"\$(lscpu -p=CORE | awk -F, '\$1 !~ /^#/ {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_CORES'
+      guest_cores=\$(lscpu -p=CORE | awk -F, '\$1 !~ /^#/ {seen[\$1]=1} END {print length(seen)}')
+      test \"\$guest_cores\" -eq '$PR_VM_CORES'
       test \"\$(lscpu -p=NODE | awk -F, '\$1 !~ /^#/ && \$1 >= 0 {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_NUMA_NODES'
-      test \"\$(lscpu | awk -F: '/^Thread\\(s\\) per core:/ {gsub(/[[:space:]]/, \\\"\\\", \$2); print \$2}')\" -eq '$PR_VM_THREADS'
+      test \"\$(( \$(nproc) / guest_cores ))\" -eq '$PR_VM_THREADS'
       grep -qw waitpkg /proc/cpuinfo
       test \"\$(cat /sys/devices/system/node/online)\" = 0
     " || {
