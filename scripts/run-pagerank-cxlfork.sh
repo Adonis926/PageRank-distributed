@@ -110,6 +110,7 @@ run_once() {
   local label=$1 checksum=$2 full_validate=$3 state=${4:-cxlfork}
   local coordinator_log=$RESULT_DIR/runs/$label.coordinator.log
   local worker_log=$RESULT_DIR/runs/$label.worker.log
+  local host_log=$RESULT_DIR/runs/$label.host.log
   local common
   common=$(common_args)
   local state_args="--state=$state"
@@ -121,6 +122,8 @@ run_once() {
   local validate_arg=
   [[ "$full_validate" == yes ]] && validate_arg=--full-validate
 
+  local host_begin_ns host_end_ns host_elapsed_ns
+  host_begin_ns=$(date +%s%N)
   vm_ssh "$PR_VM0_PORT" "sudo '$PR_GUEST_BINARY' coordinator \
     --tx-path='$PR_ENDPOINT0' --rx-path='$PR_ENDPOINT1' \
     $common $state_args --checksum='$checksum'" >"$coordinator_log" 2>&1 &
@@ -132,6 +135,10 @@ run_once() {
   local coordinator_status=0 worker_status=0
   wait "$coordinator_pid" || coordinator_status=$?
   wait "$worker_pid" || worker_status=$?
+  host_end_ns=$(date +%s%N)
+  host_elapsed_ns=$((host_end_ns - host_begin_ns))
+  printf 'pr_host_v1 label=%s state=%s orchestration_e2e_ns=%s scope=host_ssh_exec_to_both_exit\n' \
+    "$label" "$state" "$host_elapsed_ns" >"$host_log"
   if (( coordinator_status != 0 || worker_status != 0 )); then
     echo "run failed label=$label coordinator=$coordinator_status worker=$worker_status" >&2
     sed -n '1,160p' "$coordinator_log" >&2

@@ -23,6 +23,13 @@ def parse_line(path: Path) -> dict[str, str]:
     raise RuntimeError(f"missing pr_run_v1 line in {path}")
 
 
+def parse_prefix(path: Path, prefix: str) -> dict[str, str]:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix + " "):
+            return dict(TOKEN.findall(line))
+    raise RuntimeError(f"missing {prefix} line in {path}")
+
+
 def write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
@@ -55,6 +62,17 @@ def main() -> int:
     for path in paths:
         row: dict[str, object] = parse_line(path)
         row["sample"] = int(path.name.split("-")[1].split(".")[0])
+        host_path = path.with_name(path.name.replace(".coordinator.log", ".host.log"))
+        if host_path.exists():
+            host = parse_prefix(host_path, "pr_host_v1")
+            row["host_orchestration_e2e_ms"] = (
+                float(host["orchestration_e2e_ns"]) / 1_000_000.0
+            )
+        else:
+            row["host_orchestration_e2e_ms"] = "NA"
+        row["activation_overhead_ms"] = (
+            float(row["job_e2e_ms"]) - float(row["elapsed_ms"])
+        )
         if row.get("status") != "ok" or row.get("verify") != "ok":
             raise RuntimeError(f"failed run in {path}")
         if abs(float(row["checksum"]) - 1.0) > 1e-9:
@@ -65,6 +83,7 @@ def main() -> int:
         "sample", "state", "run_id", "vertices", "degree",
         "remote_degree", "iterations", "chunks", "threads_per_node",
         "total_threads", "elapsed_ms", "medges_per_sec", "job_e2e_ms",
+        "activation_overhead_ms", "host_orchestration_e2e_ms",
         "residual", "checksum", "verify", "source_log",
     ]
     write_csv(root / "runs.csv", rows, common)
@@ -72,6 +91,7 @@ def main() -> int:
     activation = [
         "sample", "run_id", "job_e2e_ms", "arm_ms", "graph_build_ms",
         "local_thread_create_ms", "start_publish_ms", "elapsed_ms",
+        "activation_overhead_ms", "host_orchestration_e2e_ms",
         "source_log",
     ]
     write_csv(root / "activation.csv", rows, activation)
@@ -111,6 +131,51 @@ def main() -> int:
         root / "summary.csv",
         summary_rows,
         ["state", "metric", "samples", "mean", "p50", "p95", "min", "max", "stddev"],
+    )
+
+    breakdown_metrics = [
+        ("job_e2e_ms", "parent_wall", "no"),
+        ("elapsed_ms", "execution_wall_inside_job", "yes"),
+        ("activation_overhead_ms", "job_minus_execution", "yes"),
+        ("arm_ms", "nested_in_activation_overhead", "no"),
+        ("local_thread_create_ms", "nested_in_activation_overhead", "no"),
+        ("start_publish_ms", "nested_in_activation_overhead", "no"),
+        ("restore_wrapper_ms", "nested_in_arm", "no"),
+        ("restore_ioctl_ms", "nested_in_restore_wrapper", "no"),
+        ("restore_kernel_ms", "nested_in_restore_ioctl", "no"),
+        ("restore_leaf_attach_ms", "nested_in_restore_kernel", "no"),
+        ("restore_fallback_ms", "nested_in_restore_kernel", "no"),
+        ("graph_build_ms", "before_job_window", "no"),
+        ("hydra_send_cpu_sum_ms", "sum_across_threads_inside_execution", "no"),
+        ("hydra_recv_wait_sum_ms", "sum_across_threads_inside_execution", "no"),
+        ("hydra_release_sum_ms", "sum_across_threads_inside_execution", "no"),
+        ("host_orchestration_e2e_ms", "host_ssh_exec_to_both_exit", "no"),
+    ]
+    breakdown_rows: list[dict[str, object]] = []
+    for metric, scope, additive in breakdown_metrics:
+        values = [
+            float(row[metric]) for row in rows
+            if row.get(metric) not in (None, "NA")
+        ]
+        if not values:
+            continue
+        breakdown_rows.append(
+            {
+                "metric": metric,
+                "scope": scope,
+                "additive_to_job_e2e": additive,
+                "samples": len(values),
+                "mean": statistics.fmean(values),
+                "p50": statistics.median(values),
+                "p95": percentile(values, 0.95),
+                "stddev": statistics.stdev(values) if len(values) > 1 else 0.0,
+            }
+        )
+    write_csv(
+        root / "breakdown-summary.csv",
+        breakdown_rows,
+        ["metric", "scope", "additive_to_job_e2e", "samples", "mean",
+         "p50", "p95", "stddev"],
     )
     print(f"analyzed={len(rows)} result_dir={root} verify=ok")
     return 0
