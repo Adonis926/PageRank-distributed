@@ -311,6 +311,10 @@ run_once() {
     return 1
   fi
   grep -q 'pr_run_v1 status=ok .* verify=ok' "$coordinator_log"
+  grep -q 'signal_path=hydra-umwait-local-futex' "$coordinator_log"
+  grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
+  grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
+  grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
   grep -q 'pr_worker_v1 status=ok .* verify=ok' "$worker_log"
   if [[ "$state" == cxlfork ]]; then
     vm_ssh "$PR_VM0_PORT" "sudo '$PR_GUEST_BINARY' inspect \
@@ -344,6 +348,8 @@ collect_manifest() {
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
     printf 'notify=%s\n' "$PR_NOTIFY"
+    printf 'signal_path=hydra-umwait-local-futex\n'
+    printf 'relay_threads_per_node=%s\n' "$PR_THREADS"
   } >"$RESULT_DIR/manifest/config.txt"
   uname -a >"$RESULT_DIR/manifest/host-uname.txt"
   lscpu >"$RESULT_DIR/manifest/host-lscpu.txt"

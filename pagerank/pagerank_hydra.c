@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <linux/futex.h>
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -137,7 +139,12 @@ typedef struct pr_node_result_v1 {
     uint64_t residual_syncs;
     uint64_t hydra_wait_ns;
     uint64_t hydra_wait_calls;
-    uint64_t reserved[4];
+    uint64_t local_futex_wait_ns;
+    uint64_t local_futex_wake_ns;
+    uint64_t local_futex_wait_calls;
+    uint64_t local_futex_wake_calls;
+    uint64_t local_futex_handoff_ns;
+    uint64_t local_futex_handoff_calls;
 } pr_node_result_v1;
 
 typedef struct pr_chunk_v1 {
@@ -163,6 +170,15 @@ typedef struct pr_barrier_v1 {
     uint64_t reserved[2];
 } pr_barrier_v1;
 
+typedef struct pr_futex_stats {
+    uint64_t wait_ns;
+    uint64_t wake_ns;
+    uint64_t wait_calls;
+    uint64_t wake_calls;
+    uint64_t handoff_ns;
+    uint64_t handoff_calls;
+} pr_futex_stats;
+
 typedef struct pr_transport_stats {
     uint64_t send_ns;
     uint64_t recv_wait_ns;
@@ -174,6 +190,7 @@ typedef struct pr_transport_stats {
     uint64_t send_retries;
     uint64_t wait_ns;
     uint64_t wait_calls;
+    pr_futex_stats futex;
 } pr_transport_stats;
 
 typedef struct pr_node_ctx pr_node_ctx;
@@ -183,6 +200,20 @@ typedef struct pr_worker_arg {
     uint32_t tid;
 } pr_worker_arg;
 
+typedef struct pr_rx_relay {
+    pr_node_ctx *ctx;
+    uint32_t tid;
+    pthread_t thread;
+    _Alignas(64) atomic_uint delivered;
+    atomic_uint consumed;
+    uint64_t offset;
+    uint64_t delivered_ns;
+    const hydra_msg *message;
+    const uint8_t *payload;
+    int error;
+    pr_futex_stats futex;
+} pr_rx_relay;
+
 struct pr_node_ctx {
     uint32_t node;
     pr_options options;
@@ -191,8 +222,9 @@ struct pr_node_ctx {
     hydra_ctx *rx[PR_MAX_THREADS];
     pthread_t worker[PR_MAX_THREADS];
     pr_worker_arg worker_arg[PR_MAX_THREADS];
+    pr_rx_relay relay[PR_MAX_THREADS];
     pthread_barrier_t barrier;
-    atomic_bool start_gate;
+    atomic_uint start_gate;
     atomic_int worker_error;
     uint64_t run_id;
     double *rank[2];
@@ -219,13 +251,77 @@ typedef struct pr_write_chunk_arg {
 _Static_assert(sizeof(pr_arm_v1) == 160, "arm wire ABI changed");
 _Static_assert(sizeof(pr_arm_result_v1) == 216, "arm result ABI changed");
 _Static_assert(sizeof(pr_start_v1) == 56, "start wire ABI changed");
-_Static_assert(sizeof(pr_node_result_v1) == 184, "node result ABI changed");
+_Static_assert(sizeof(pr_node_result_v1) == 200, "node result ABI changed");
 _Static_assert(sizeof(pr_chunk_v1) == 56, "chunk wire ABI changed");
 _Static_assert(sizeof(pr_barrier_v1) == 56, "barrier wire ABI changed");
 
 static uint64_t now_ns(void)
 {
     return hydra_now_ns();
+}
+
+static int futex_wait_local(atomic_uint *address, uint32_t expected,
+                            pr_futex_stats *stats)
+{
+    uint64_t begin = now_ns();
+    int rc = (int)syscall(SYS_futex, (uint32_t *)address,
+                          FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+    int err = rc == 0 ? 0 : errno;
+
+    if (stats != NULL) {
+        stats->wait_ns += now_ns() - begin;
+        stats->wait_calls++;
+    }
+    return err;
+}
+
+static int futex_wake_local(atomic_uint *address, int count,
+                            pr_futex_stats *stats)
+{
+    uint64_t begin = now_ns();
+    int rc = (int)syscall(SYS_futex, (uint32_t *)address,
+                          FUTEX_WAKE_PRIVATE, count, NULL, NULL, 0);
+    int err = rc >= 0 ? 0 : errno;
+
+    if (stats != NULL) {
+        stats->wake_ns += now_ns() - begin;
+        stats->wake_calls++;
+    }
+    return err;
+}
+
+static int wait_for_local_sequence(atomic_uint *address, uint32_t sequence,
+                                   pr_futex_stats *stats)
+{
+    for (;;) {
+        uint32_t observed = atomic_load_explicit(address,
+                                                 memory_order_acquire);
+        if (observed >= sequence) {
+            return observed == sequence ? 0 : EILSEQ;
+        }
+        int err = futex_wait_local(address, observed, stats);
+        if (err != 0 && err != EAGAIN && err != EINTR) {
+            return err;
+        }
+    }
+}
+
+static int wait_for_start_gate(pr_node_ctx *ctx)
+{
+    while (atomic_load_explicit(&ctx->start_gate,
+                                memory_order_acquire) == 0) {
+        int err = futex_wait_local(&ctx->start_gate, 0, NULL);
+        if (err != 0 && err != EAGAIN && err != EINTR) {
+            return err;
+        }
+    }
+    return 0;
+}
+
+static int open_start_gate(pr_node_ctx *ctx)
+{
+    atomic_store_explicit(&ctx->start_gate, 1, memory_order_release);
+    return futex_wake_local(&ctx->start_gate, INT32_MAX, NULL);
 }
 
 static void print_error(const char *what, int err)
@@ -435,6 +531,102 @@ static int recv_request_wait(hydra_ctx *context, uint64_t *offset,
     return ETIMEDOUT;
 }
 
+static void relay_publish(pr_rx_relay *relay, uint32_t sequence, int error)
+{
+    relay->error = error;
+    relay->delivered_ns = now_ns();
+    atomic_store_explicit(&relay->delivered, sequence,
+                          memory_order_release);
+    /* A valid, process-local futex address makes FUTEX_WAKE infallible in
+     * practice.  Do not rewrite relay->error after publishing delivered:
+     * the worker may already have acquired the mailbox at that point. */
+    (void)futex_wake_local(&relay->delivered, 1, &relay->futex);
+}
+
+static void *rx_relay_main(void *opaque)
+{
+    pr_rx_relay *relay = opaque;
+    pr_node_ctx *ctx = relay->ctx;
+    pr_transport_stats *stats = &ctx->transport[relay->tid];
+    uint64_t message_count = (uint64_t)ctx->options.iterations *
+                             (ctx->options.chunks + 1U);
+    int cpus[PR_MAX_THREADS];
+    int cpu_count = parse_cpu_list(ctx->options.cpu_list, cpus,
+                                   PR_MAX_THREADS);
+
+    if (cpu_count != (int)ctx->options.threads) {
+        relay_publish(relay, 1, EINVAL);
+        return NULL;
+    }
+    int err = pin_thread(cpus[relay->tid]);
+    if (err != 0) {
+        relay_publish(relay, 1, err);
+        return NULL;
+    }
+
+    for (uint32_t sequence = 1; sequence <= message_count; sequence++) {
+        if (sequence > 1) {
+            err = wait_for_local_sequence(&relay->consumed, sequence - 1,
+                                          &relay->futex);
+            if (err != 0) {
+                relay_publish(relay, sequence, err);
+                return NULL;
+            }
+        }
+        err = recv_request_wait(ctx->rx[relay->tid], &relay->offset,
+                                &relay->message, &relay->payload,
+                                ctx->options.timeout_ms,
+                                &stats->recv_wait_ns,
+                                ctx->options.notify_mode, stats);
+        relay_publish(relay, sequence, err);
+        if (err != 0) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int relay_receive(pr_node_ctx *ctx, uint32_t tid, uint32_t sequence,
+                         uint64_t *offset, const hydra_msg **message,
+                         const uint8_t **payload)
+{
+    pr_rx_relay *relay = &ctx->relay[tid];
+    int err = wait_for_local_sequence(&relay->delivered, sequence,
+                                      &ctx->transport[tid].futex);
+    if (err != 0) {
+        return err;
+    }
+    if (relay->error != 0) {
+        return relay->error;
+    }
+    ctx->transport[tid].futex.handoff_ns += now_ns() - relay->delivered_ns;
+    ctx->transport[tid].futex.handoff_calls++;
+    *offset = relay->offset;
+    *message = relay->message;
+    *payload = relay->payload;
+    return 0;
+}
+
+static int relay_consume(pr_node_ctx *ctx, uint32_t tid, uint32_t sequence)
+{
+    pr_rx_relay *relay = &ctx->relay[tid];
+
+    atomic_store_explicit(&relay->consumed, sequence, memory_order_release);
+    return futex_wake_local(&relay->consumed, 1,
+                            &ctx->transport[tid].futex);
+}
+
+static int release_relay_message(pr_node_ctx *ctx, uint32_t tid,
+                                 uint32_t sequence, uint64_t offset)
+{
+    uint64_t begin = now_ns();
+    int err = hydra_release_message(ctx->rx[tid], offset);
+    ctx->transport[tid].release_ns += now_ns() - begin;
+    int consume_error = relay_consume(ctx, tid, sequence);
+
+    return err != 0 ? err : consume_error;
+}
+
 static int recv_response_wait(hydra_ctx *context, uint64_t *offset,
                               const hydra_msg **message,
                               const uint8_t **payload, uint64_t timeout_ms,
@@ -560,14 +752,14 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
     pr_transport_stats *stats = &ctx->transport[tid];
     const hydra_msg *message;
     const uint8_t *payload;
-    int err = recv_request_wait(ctx->rx[tid], message_offset, &message,
-                                &payload, ctx->options.timeout_ms,
-                                &stats->recv_wait_ns,
-                                ctx->options.notify_mode, stats);
+    uint32_t sequence = iteration * (ctx->options.chunks + 1U) + chunk + 1U;
+    int err = relay_receive(ctx, tid, sequence, message_offset, &message,
+                            &payload);
     if (err != 0) {
         return err;
     }
     if (message->op != PR_OP_DATA || message->len < sizeof(pr_chunk_v1)) {
+        (void)release_relay_message(ctx, tid, sequence, *message_offset);
         return EPROTO;
     }
     const pr_chunk_v1 *header = (const pr_chunk_v1 *)payload;
@@ -577,6 +769,7 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
         header->iteration != iteration || header->tid != tid ||
         header->chunk != chunk || header->value_count != expected_count ||
         message->len != sizeof(*header) + expected_count * sizeof(double)) {
+        (void)release_relay_message(ctx, tid, sequence, *message_offset);
         return EILSEQ;
     }
     *values = (const double *)(payload + sizeof(*header));
@@ -618,10 +811,9 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     const hydra_msg *message;
     const uint8_t *payload;
     uint64_t offset;
-    int err = recv_request_wait(ctx->rx[tid], &offset, &message, &payload,
-                                ctx->options.timeout_ms,
-                                &stats->recv_wait_ns,
-                                ctx->options.notify_mode, stats);
+    uint32_t sequence = iteration * (ctx->options.chunks + 1U) +
+                        ctx->options.chunks + 1U;
+    int err = relay_receive(ctx, tid, sequence, &offset, &message, &payload);
     if (err != 0) {
         return err;
     }
@@ -633,6 +825,7 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
         header->iteration != iteration || header->tid != tid ||
         !isfinite(header->local_residual) ||
         (tid != 0 && header->local_residual != 0.0)) {
+        (void)release_relay_message(ctx, tid, sequence, offset);
         return EILSEQ;
     }
     if (tid == 0) {
@@ -641,10 +834,7 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     }
     stats->messages_received++;
     stats->payload_bytes_received += message->len;
-    uint64_t release_begin = now_ns();
-    err = hydra_release_message(ctx->rx[tid], offset);
-    stats->release_ns += now_ns() - release_begin;
-    return err;
+    return release_relay_message(ctx, tid, sequence, offset);
 }
 
 static void remember_worker_error(pr_node_ctx *ctx, int err)
@@ -681,8 +871,9 @@ static void *worker_main(void *opaque)
         ctx->rank[1][vertex] = 0.0;
     }
     pthread_barrier_wait(&ctx->barrier);
-    while (!atomic_load_explicit(&ctx->start_gate, memory_order_acquire)) {
-        hydra_cpu_relax();
+    err = wait_for_start_gate(ctx);
+    if (err != 0) {
+        remember_worker_error(ctx, err);
     }
     pthread_barrier_wait(&ctx->barrier);
     if (tid == 0) {
@@ -743,9 +934,10 @@ static void *worker_main(void *opaque)
                     target[vertex] = base_rank + damping * incoming;
                     local_residual += fabs(target[vertex] - source[vertex]);
                 }
-                uint64_t release_begin = now_ns();
-                err = hydra_release_message(ctx->rx[tid], message_offset);
-                ctx->transport[tid].release_ns += now_ns() - release_begin;
+                err = release_relay_message(
+                    ctx, tid,
+                    iteration * (ctx->options.chunks + 1U) + chunk + 1U,
+                    message_offset);
                 if (err != 0) {
                     remember_worker_error(ctx, err);
                 }
@@ -821,8 +1013,19 @@ static int node_init_compute(pr_node_ctx *ctx)
     if (err != 0) {
         return err;
     }
-    atomic_init(&ctx->start_gate, false);
+    atomic_init(&ctx->start_gate, 0);
     atomic_init(&ctx->worker_error, 0);
+    for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
+        ctx->relay[tid].ctx = ctx;
+        ctx->relay[tid].tid = tid;
+        atomic_init(&ctx->relay[tid].delivered, 0);
+        atomic_init(&ctx->relay[tid].consumed, 0);
+        err = pthread_create(&ctx->relay[tid].thread, NULL, rx_relay_main,
+                             &ctx->relay[tid]);
+        if (err != 0) {
+            return err;
+        }
+    }
     for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
         ctx->worker_arg[tid] = (pr_worker_arg) {.ctx = ctx, .tid = tid};
         err = pthread_create(&ctx->worker[tid], NULL, worker_main,
@@ -839,6 +1042,12 @@ static int node_join_compute(pr_node_ctx *ctx)
     int join_error = 0;
     for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
         int err = pthread_join(ctx->worker[tid], NULL);
+        if (err != 0 && join_error == 0) {
+            join_error = err;
+        }
+    }
+    for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
+        int err = pthread_join(ctx->relay[tid].thread, NULL);
         if (err != 0 && join_error == 0) {
             join_error = err;
         }
@@ -861,6 +1070,16 @@ static void sum_transport(const pr_node_ctx *ctx, pr_node_result_v1 *result)
         result->send_retries += stats->send_retries;
         result->hydra_wait_ns += stats->wait_ns;
         result->hydra_wait_calls += stats->wait_calls;
+        result->local_futex_wait_ns += stats->futex.wait_ns +
+                                       ctx->relay[tid].futex.wait_ns;
+        result->local_futex_wake_ns += stats->futex.wake_ns +
+                                       ctx->relay[tid].futex.wake_ns;
+        result->local_futex_wait_calls += stats->futex.wait_calls +
+                                          ctx->relay[tid].futex.wait_calls;
+        result->local_futex_wake_calls += stats->futex.wake_calls +
+                                          ctx->relay[tid].futex.wake_calls;
+        result->local_futex_handoff_ns += stats->futex.handoff_ns;
+        result->local_futex_handoff_calls += stats->futex.handoff_calls;
     }
 }
 
@@ -1051,8 +1270,11 @@ static int run_coordinator(const pr_options *options)
                             sizeof(start), options->timeout_ms,
                             options->notify_mode, NULL);
     uint64_t start_publish_ns = now_ns() - start_publish_begin;
-    atomic_store_explicit(&ctx.start_gate, true, memory_order_release);
+    int start_gate_error = open_start_gate(&ctx);
     int local_join_error = node_join_compute(&ctx);
+    if (err == 0) {
+        err = start_gate_error;
+    }
     if (err == 0) {
         err = local_join_error;
     }
@@ -1117,6 +1339,20 @@ static int run_coordinator(const pr_options *options)
                              remote_result.hydra_wait_ns;
     uint64_t hydra_wait_calls = local_result.hydra_wait_calls +
                                 remote_result.hydra_wait_calls;
+    uint64_t local_futex_wait_ns = local_result.local_futex_wait_ns +
+                                   remote_result.local_futex_wait_ns;
+    uint64_t local_futex_wake_ns = local_result.local_futex_wake_ns +
+                                   remote_result.local_futex_wake_ns;
+    uint64_t local_futex_wait_calls = local_result.local_futex_wait_calls +
+                                      remote_result.local_futex_wait_calls;
+    uint64_t local_futex_wake_calls = local_result.local_futex_wake_calls +
+                                      remote_result.local_futex_wake_calls;
+    uint64_t local_futex_handoff_ns =
+        local_result.local_futex_handoff_ns +
+        remote_result.local_futex_handoff_ns;
+    uint64_t local_futex_handoff_calls =
+        local_result.local_futex_handoff_calls +
+        remote_result.local_futex_handoff_calls;
     double edges = 2.0 * options->vertices * options->degree *
                    options->iterations;
 
@@ -1124,6 +1360,9 @@ static int run_coordinator(const pr_options *options)
            " effective_notify=%s run_id=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
            " iterations=%u chunks=%u threads_per_node=%u total_threads=%u"
+           " relay_threads_per_node=%u signal_path=hydra-umwait-local-futex"
+           " compute_threads_total=%u relay_threads_total=%u"
+           " runtime_threads_total=%u"
            " elapsed_ms=%.3f medges_per_sec=%.3f job_e2e_ms=%.3f"
            " graph_build_ms=%.3f arm_ms=%.3f"
            " local_thread_create_ms=%.3f start_publish_ms=%.3f"
@@ -1134,6 +1373,12 @@ static int run_coordinator(const pr_options *options)
            " hydra_send_cpu_sum_ms=%.3f hydra_recv_wait_sum_ms=%.3f"
            " hydra_release_sum_ms=%.3f hydra_wait_cpu_sum_ms=%.3f"
            " hydra_wait_calls=%" PRIu64 " messages=%" PRIu64
+           " local_futex_wait_sum_ms=%.3f local_futex_wake_sum_ms=%.3f"
+           " local_futex_wait_calls=%" PRIu64
+           " local_futex_wake_calls=%" PRIu64
+           " local_futex_handoff_sum_ms=%.3f"
+           " local_futex_handoff_calls=%" PRIu64
+           " local_futex_handoff_mean_us=%.3f"
            " payload_bytes=%" PRIu64
            " residual_mode=global-per-iteration"
            " residual_syncs=%" PRIu64 " residual=%.12g"
@@ -1149,6 +1394,9 @@ static int run_coordinator(const pr_options *options)
            ctx.run_id, 2 * options->vertices, options->degree,
            options->remote_degree, options->iterations, options->chunks,
            options->threads, options->threads * 2,
+           options->threads,
+           options->threads * 2, options->threads * 2,
+           options->threads * 4,
            elapsed_ns / 1e6, edges / (elapsed_ns / 1e9) / 1e6,
            (job_end_ns - job_begin_ns) / 1e6, graph_build_ns / 1e6,
            remote_arm.arm_total_ns / 1e6,
@@ -1162,7 +1410,16 @@ static int run_coordinator(const pr_options *options)
            remote_arm.fallback_pages, hydra_send_ns / 1e6,
            hydra_recv_wait_ns / 1e6, hydra_release_ns / 1e6,
            hydra_wait_ns / 1e6, hydra_wait_calls,
-           messages, bytes, local_result.residual_syncs, residual,
+           messages, local_futex_wait_ns / 1e6,
+           local_futex_wake_ns / 1e6, local_futex_wait_calls,
+           local_futex_wake_calls, local_futex_handoff_ns / 1e6,
+           local_futex_handoff_calls,
+           local_futex_handoff_calls == 0
+               ? 0.0
+               : (local_futex_handoff_ns / 1e3) /
+                     local_futex_handoff_calls,
+           bytes,
+           local_result.residual_syncs, residual,
            local_result.residual, remote_result.residual,
            local_result.global_residual, remote_result.global_residual,
            rank_checksum,
@@ -1328,10 +1585,10 @@ static int run_worker(const pr_options *options)
     } else {
         memset(&start_request, 0, sizeof(start_request));
     }
-    atomic_store_explicit(&ctx.start_gate, true, memory_order_release);
+    int start_gate_error = open_start_gate(&ctx);
     int join_error = node_join_compute(&ctx);
     if (err == 0) {
-        err = join_error;
+        err = start_gate_error != 0 ? start_gate_error : join_error;
     }
     if (options->state_mode == PR_STATE_CXLFORK && err == 0) {
         int collect_error = pr_cxlfork_collect(&cxlfork);
@@ -1352,6 +1609,14 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         printf("pr_worker_v1 status=ok state=%s run_id=%" PRIu64
                " elapsed_ms=%.3f restore_wrapper_ms=%.3f"
+               " relay_threads=%u signal_path=hydra-umwait-local-futex"
+               " local_futex_wait_sum_ms=%.3f"
+               " local_futex_wake_sum_ms=%.3f"
+               " local_futex_wait_calls=%" PRIu64
+               " local_futex_wake_calls=%" PRIu64
+               " local_futex_handoff_sum_ms=%.3f"
+               " local_futex_handoff_calls=%" PRIu64
+               " local_futex_handoff_mean_us=%.3f"
                " graph_checksum=%" PRIu64
                " residual_mode=global-per-iteration"
                " residual_syncs=%" PRIu64
@@ -1359,6 +1624,16 @@ static int run_worker(const pr_options *options)
                " checksum=%.12g verify=ok\n",
                state_name(options->state_mode), ctx.run_id,
                ctx.elapsed_ns / 1e6, cxlfork.timing.wrapper_total_ns / 1e6,
+               options->threads, result.local_futex_wait_ns / 1e6,
+               result.local_futex_wake_ns / 1e6,
+               result.local_futex_wait_calls,
+               result.local_futex_wake_calls,
+               result.local_futex_handoff_ns / 1e6,
+               result.local_futex_handoff_calls,
+               result.local_futex_handoff_calls == 0
+                   ? 0.0
+                   : (result.local_futex_handoff_ns / 1e3) /
+                         result.local_futex_handoff_calls,
                result.graph_checksum, result.residual_syncs,
                result.residual, result.global_residual,
                result.rank_checksum);
@@ -1576,6 +1851,8 @@ static int parse_options(int argc, char **argv, pr_options *options)
         options->remote_degree >= options->degree ||
         options->iterations == 0 || options->chunks == 0 ||
         options->threads == 0 || options->threads > PR_MAX_THREADS ||
+        (uint64_t)options->iterations * (options->chunks + 1ULL) >
+            UINT32_MAX ||
         options->payload_max < sizeof(pr_chunk_v1) + sizeof(double) ||
         options->timeout_ms == 0) {
         return EINVAL;

@@ -79,6 +79,18 @@ def main() -> int:
             raise RuntimeError(f"PageRank checksum is not one in {path}")
         if row.get("residual_mode") != "global-per-iteration":
             raise RuntimeError(f"missing per-iteration residual reduction in {path}")
+        if row.get("signal_path") != "hydra-umwait-local-futex":
+            raise RuntimeError(f"unexpected cross-OS signal path in {path}")
+        if row.get("notify") != "umwait" or row.get("effective_notify") != "umwait":
+            raise RuntimeError(f"HydraRPC UMWAIT path is not effective in {path}")
+        if int(row["relay_threads_per_node"]) != int(row["threads_per_node"]):
+            raise RuntimeError(f"relay/worker count mismatch in {path}")
+        if int(row["local_futex_wait_calls"]) == 0:
+            raise RuntimeError(f"local futex wait path was not exercised in {path}")
+        if int(row["local_futex_wake_calls"]) == 0:
+            raise RuntimeError(f"local futex wake path was not exercised in {path}")
+        if int(row["local_futex_handoff_calls"]) == 0:
+            raise RuntimeError(f"local futex handoff was not observed in {path}")
         if int(row["residual_syncs"]) != int(row["iterations"]):
             raise RuntimeError(f"residual synchronization count mismatch in {path}")
         local_sum = (
@@ -101,7 +113,9 @@ def main() -> int:
         "sample", "state", "backend", "notify", "effective_notify",
         "run_id", "vertices", "degree",
         "remote_degree", "iterations", "chunks", "threads_per_node",
-        "total_threads", "elapsed_ms", "medges_per_sec", "job_e2e_ms",
+        "total_threads", "compute_threads_total", "relay_threads_total",
+        "runtime_threads_total", "relay_threads_per_node", "signal_path",
+        "elapsed_ms", "medges_per_sec", "job_e2e_ms",
         "activation_overhead_ms", "host_orchestration_e2e_ms",
         "residual_mode", "residual_syncs", "residual",
         "node0_local_residual", "node1_local_residual",
@@ -119,10 +133,15 @@ def main() -> int:
     write_csv(root / "activation.csv", rows, activation)
 
     transport = [
-        "sample", "run_id", "notify", "effective_notify", "elapsed_ms",
+        "sample", "run_id", "notify", "effective_notify", "signal_path",
+        "relay_threads_per_node", "elapsed_ms",
         "hydra_send_cpu_sum_ms", "hydra_recv_wait_sum_ms",
         "hydra_release_sum_ms", "hydra_wait_cpu_sum_ms",
-        "hydra_wait_calls", "messages", "payload_bytes", "source_log",
+        "hydra_wait_calls", "local_futex_wait_sum_ms",
+        "local_futex_wake_sum_ms", "local_futex_wait_calls",
+        "local_futex_wake_calls", "local_futex_handoff_sum_ms",
+        "local_futex_handoff_calls", "local_futex_handoff_mean_us",
+        "messages", "payload_bytes", "source_log",
     ]
     write_csv(root / "transport.csv", rows, transport)
 
@@ -181,6 +200,9 @@ def main() -> int:
         ("hydra_recv_wait_sum_ms", "sum_across_threads_inside_execution", "no"),
         ("hydra_release_sum_ms", "sum_across_threads_inside_execution", "no"),
         ("hydra_wait_cpu_sum_ms", "nested_in_hydra_recv_wait_sum", "no"),
+        ("local_futex_wait_sum_ms", "sum_across_workers_and_relays_inside_execution", "no"),
+        ("local_futex_wake_sum_ms", "sum_across_workers_and_relays_inside_execution", "no"),
+        ("local_futex_handoff_sum_ms", "sum_of_relay_publish_to_worker_resume_intervals", "no"),
         ("host_orchestration_e2e_ms", "host_ssh_exec_to_both_exit", "no"),
     ]
     breakdown_rows: list[dict[str, object]] = []
