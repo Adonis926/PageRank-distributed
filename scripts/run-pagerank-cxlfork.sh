@@ -122,6 +122,23 @@ install_guest_binary() {
       grep -qw '$PR_GUEST_APPEND_EXTRA' /proc/cmdline; \
       test \"\$(nproc)\" -eq '$PR_VM_SMP'"
   done
+  setup_data_network
+}
+
+configure_data_nic() {
+  local port=$1 mac=$2 address=$3
+  vm_ssh "$port" "iface=\$(for f in /sys/class/net/*/address; do \
+    if [ \"\$(cat \"\$f\")\" = '$mac' ]; then basename \"\$(dirname \"\$f\")\"; break; fi; \
+    done); test -n \"\$iface\"; sudo ip link set \"\$iface\" up; \
+    sudo ip addr replace '$address/24' dev \"\$iface\"; \
+    printf 'data_interface=%s data_address=%s\\n' \"\$iface\" '$address'"
+}
+
+setup_data_network() {
+  configure_data_nic "$PR_VM0_PORT" "$PR_VM0_DATA_MAC" "$PR_VM0_DATA_IP"
+  configure_data_nic "$PR_VM1_PORT" "$PR_VM1_DATA_MAC" "$PR_VM1_DATA_IP"
+  vm_ssh "$PR_VM0_PORT" "ping -c 1 -W 2 '$PR_VM1_DATA_IP' >/dev/null"
+  vm_ssh "$PR_VM1_PORT" "ping -c 1 -W 2 '$PR_VM0_DATA_IP' >/dev/null"
 }
 
 common_args() {
@@ -137,7 +154,11 @@ common_args() {
     "--map-size=$PR_MAP_SIZE" \
     "--queue-capacity=$PR_QUEUE_CAPACITY" \
     "--payload-max=$PR_PAYLOAD_MAX" \
-    "--timeout-ms=$PR_TIMEOUT_MS"
+    "--timeout-ms=$PR_TIMEOUT_MS" \
+    "--notify-channel=$PR_NOTIFY_CHANNEL" \
+    "--notify-host=$PR_VM1_DATA_IP" \
+    "--notify-bind-host=0.0.0.0" \
+    "--notify-port-base=$PR_NOTIFY_PORT_BASE"
 }
 
 prepare_template() {
@@ -232,6 +253,10 @@ collect_manifest() {
     printf 'vm0_host_cpus=%s\nvm1_host_cpus=%s\n' \
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
+    printf 'notify_channel=%s\nnotify_port_base=%s\n' \
+      "$PR_NOTIFY_CHANNEL" "$PR_NOTIFY_PORT_BASE"
+    printf 'vm0_data_ip=%s\nvm1_data_ip=%s\n' \
+      "$PR_VM0_DATA_IP" "$PR_VM1_DATA_IP"
   } >"$RESULT_DIR/manifest/config.txt"
   uname -a >"$RESULT_DIR/manifest/host-uname.txt"
   lscpu >"$RESULT_DIR/manifest/host-lscpu.txt"
