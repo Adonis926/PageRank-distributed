@@ -93,6 +93,12 @@ def main() -> int:
             raise RuntimeError(f"local futex wake path was not exercised in {path}")
         if int(row["local_futex_handoff_calls"]) == 0:
             raise RuntimeError(f"local futex handoff was not observed in {path}")
+        for field in (
+            "cxlfork_faults", "cxlfork_local_copy_pages",
+            "cxlfork_leaf_copy_pages",
+        ):
+            if int(row[field]) != 0:
+                raise RuntimeError(f"unexpected readonly CXLfork CoW in {path}: {field}")
         if int(row["residual_syncs"]) != 1:
             raise RuntimeError(f"residual synchronization count mismatch in {path}")
         local_sum = (
@@ -160,7 +166,10 @@ def main() -> int:
         "sample", "run_id", "restore_wrapper_ms", "restore_ioctl_ms",
         "restore_kernel_ms", "restore_leaf_attach_ms",
         "restore_fallback_ms", "shared_leaf_count", "shared_data_pages",
-        "fallback_pages", "node1_graph_checksum", "source_log",
+        "fallback_pages", "restore_policy", "cxlfork_faults",
+        "cxlfork_local_copy_pages", "cxlfork_leaf_copy_pages",
+        "cxlfork_data_cow_ms", "cxlfork_leaf_materialize_ms",
+        "cxlfork_cxl_to_local_copy_ms", "node1_graph_checksum", "source_log",
     ]
     write_csv(root / "cxlfork.csv", rows, cxlfork)
 

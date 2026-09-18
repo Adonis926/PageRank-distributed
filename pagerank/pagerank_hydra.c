@@ -146,6 +146,12 @@ typedef struct pr_node_result_v1 {
     uint64_t local_futex_wake_calls;
     uint64_t local_futex_handoff_ns;
     uint64_t local_futex_handoff_calls;
+    uint64_t cxlfork_faults;
+    uint64_t cxlfork_local_copy_pages;
+    uint64_t cxlfork_leaf_copy_pages;
+    uint64_t cxlfork_data_cow_ns;
+    uint64_t cxlfork_leaf_materialize_ns;
+    uint64_t cxlfork_cxl_to_local_copy_ns;
 } pr_node_result_v1;
 
 typedef struct pr_chunk_v1 {
@@ -252,7 +258,7 @@ typedef struct pr_write_chunk_arg {
 _Static_assert(sizeof(pr_arm_v1) == 160, "arm wire ABI changed");
 _Static_assert(sizeof(pr_arm_result_v1) == 216, "arm result ABI changed");
 _Static_assert(sizeof(pr_start_v1) == 56, "start wire ABI changed");
-_Static_assert(sizeof(pr_node_result_v1) == 200, "node result ABI changed");
+_Static_assert(sizeof(pr_node_result_v1) == 248, "node result ABI changed");
 _Static_assert(sizeof(pr_chunk_v1) == 56, "chunk wire ABI changed");
 _Static_assert(sizeof(pr_barrier_v1) == 56, "barrier wire ABI changed");
 
@@ -1379,6 +1385,12 @@ static int run_coordinator(const pr_options *options)
            " restore_kernel_ms=%.3f restore_leaf_attach_ms=%.3f"
            " restore_fallback_ms=%.3f shared_leaf_count=%" PRIu64
            " shared_data_pages=%" PRIu64 " fallback_pages=%" PRIu64
+           " restore_policy=readonly cxlfork_faults=%" PRIu64
+           " cxlfork_local_copy_pages=%" PRIu64
+           " cxlfork_leaf_copy_pages=%" PRIu64
+           " cxlfork_data_cow_ms=%.3f"
+           " cxlfork_leaf_materialize_ms=%.3f"
+           " cxlfork_cxl_to_local_copy_ms=%.3f"
            " hydra_send_cpu_sum_ms=%.3f hydra_recv_wait_sum_ms=%.3f"
            " hydra_release_sum_ms=%.3f hydra_wait_cpu_sum_ms=%.3f"
            " hydra_wait_calls=%" PRIu64 " messages=%" PRIu64
@@ -1422,7 +1434,13 @@ static int run_coordinator(const pr_options *options)
            remote_arm.restore_leaf_attach_ns / 1e6,
            remote_arm.restore_fallback_ns / 1e6,
            remote_arm.shared_leaf_count, remote_arm.shared_data_pages,
-           remote_arm.fallback_pages, hydra_send_ns / 1e6,
+           remote_arm.fallback_pages, remote_result.cxlfork_faults,
+           remote_result.cxlfork_local_copy_pages,
+           remote_result.cxlfork_leaf_copy_pages,
+           remote_result.cxlfork_data_cow_ns / 1e6,
+           remote_result.cxlfork_leaf_materialize_ns / 1e6,
+           remote_result.cxlfork_cxl_to_local_copy_ns / 1e6,
+           hydra_send_ns / 1e6,
            hydra_recv_wait_ns / 1e6, hydra_release_ns / 1e6,
            hydra_wait_ns / 1e6, hydra_wait_calls,
            messages, local_futex_wait_ns / 1e6,
@@ -1613,6 +1631,14 @@ static int run_worker(const pr_options *options)
     }
     pr_node_result_v1 result;
     fill_node_result(&ctx, &result);
+    result.cxlfork_faults = cxlfork.result.faults;
+    result.cxlfork_local_copy_pages = cxlfork.result.local_copy_pages;
+    result.cxlfork_leaf_copy_pages = cxlfork.result.leaf_copy_pages;
+    result.cxlfork_data_cow_ns = cxlfork.result.data_cow_ns;
+    result.cxlfork_leaf_materialize_ns =
+        cxlfork.result.leaf_materialize_ns;
+    result.cxlfork_cxl_to_local_copy_ns =
+        cxlfork.result.cxl_to_local_copy_ns;
     if (have_start_request) {
         response_error = send_response_wait(
             control, &start_request, err == 0 ? 0U : (uint32_t)err,
@@ -1632,6 +1658,9 @@ static int run_worker(const pr_options *options)
                " local_futex_handoff_sum_ms=%.3f"
                " local_futex_handoff_calls=%" PRIu64
                " local_futex_handoff_mean_us=%.3f"
+               " restore_policy=readonly cxlfork_faults=%" PRIu64
+               " cxlfork_local_copy_pages=%" PRIu64
+               " cxlfork_leaf_copy_pages=%" PRIu64
                " graph_checksum=%" PRIu64
                " residual_mode=final-only"
                " residual_syncs=%" PRIu64
@@ -1652,6 +1681,8 @@ static int run_worker(const pr_options *options)
                    ? 0.0
                    : (result.local_futex_handoff_ns / 1e3) /
                          result.local_futex_handoff_calls,
+               result.cxlfork_faults, result.cxlfork_local_copy_pages,
+               result.cxlfork_leaf_copy_pages,
                result.graph_checksum, result.residual_syncs,
                result.residual, result.global_residual,
                result.rank_checksum);

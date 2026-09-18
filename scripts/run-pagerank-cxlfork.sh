@@ -317,6 +317,7 @@ run_once() {
   grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
   grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
   grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
+  grep -q 'restore_policy=readonly cxlfork_faults=0 cxlfork_local_copy_pages=0 cxlfork_leaf_copy_pages=0' "$coordinator_log"
   grep -q 'pr_worker_v1 status=ok .* verify=ok' "$worker_log"
   if [[ "$state" == cxlfork ]]; then
     vm_ssh "$PR_VM0_PORT" "sudo '$PR_GUEST_BINARY' inspect \
