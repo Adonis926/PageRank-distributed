@@ -42,6 +42,105 @@ field() {
   }' "$file"
 }
 
+qemu_pid() {
+  local name=$1
+  pgrep -f -o "qemu-system-x86_64 -name $name "
+}
+
+cmdline_has_arg() {
+  local pid=$1 expected=$2
+  tr '\0' '\n' <"/proc/$pid/cmdline" | grep -Fqx -- "$expected"
+}
+
+validate_qemu_platform() {
+  local name cpus pid expected_cpu expected_machine expected_smp
+  local begin end index tid actual_cpu
+  expected_cpu=${PR_CPU_MODEL:?PR_CPU_MODEL is required}
+  expected_machine="${PR_MACHINE:?PR_MACHINE is required},accel=kvm,nvdimm=on"
+  expected_smp="$PR_VM_SMP,sockets=$PR_VM_SOCKETS,cores=$PR_VM_CORES,threads=$PR_VM_THREADS"
+
+  [[ $PR_VM_SMP -eq $((PR_VM_SOCKETS * PR_VM_CORES * PR_VM_THREADS)) ]] || {
+    echo "invalid expected topology: SMP=$PR_VM_SMP but sockets*cores*threads=$((PR_VM_SOCKETS * PR_VM_CORES * PR_VM_THREADS))" >&2
+    return 1
+  }
+
+  for spec in "vm0:$PR_VM0_HOST_CPUS" "vm1:$PR_VM1_HOST_CPUS"; do
+    name=${spec%%:*}
+    cpus=${spec#*:}
+    pid=$(qemu_pid "$name")
+    [[ -n $pid ]] || {
+      echo "cannot find QEMU process for $name" >&2
+      return 1
+    }
+    [[ $(readlink -f "/proc/$pid/exe") == "$PR_QEMU" ]] || {
+      echo "$name uses unexpected QEMU: $(readlink -f "/proc/$pid/exe")" >&2
+      return 1
+    }
+    cmdline_has_arg "$pid" "$expected_machine" || {
+      echo "$name missing exact machine argument: $expected_machine" >&2
+      return 1
+    }
+    cmdline_has_arg "$pid" "$expected_cpu" || {
+      echo "$name missing exact CPU argument: $expected_cpu" >&2
+      return 1
+    }
+    cmdline_has_arg "$pid" "$expected_smp" || {
+      echo "$name missing exact SMP argument: $expected_smp" >&2
+      return 1
+    }
+    tr '\0' '\n' <"/proc/$pid/cmdline" |
+      grep -F "ivshmem-plain," |
+      grep -Fq "bus=$PR_HYDRA_PCI_BUS," || {
+        echo "$name HydraRPC devices are not on $PR_HYDRA_PCI_BUS" >&2
+        return 1
+      }
+
+    [[ $cpus =~ ^([0-9]+)-([0-9]+)$ ]] || {
+      echo "$name expected CPU range is not contiguous: $cpus" >&2
+      return 1
+    }
+    begin=${BASH_REMATCH[1]}
+    end=${BASH_REMATCH[2]}
+    [[ $((end - begin + 1)) -eq $PR_VM_SMP ]] || return 1
+    for ((index = 0; index < PR_VM_SMP; index++)); do
+      tid=$(ps -T -p "$pid" -o tid=,comm= |
+        awk -v wanted="qemu-vcpu$index" '$2 == wanted {print $1; exit}')
+      [[ -n $tid ]] || {
+        echo "missing $name qemu-vcpu$index" >&2
+        return 1
+      }
+      actual_cpu=$(taskset -pc "$tid" | awk -F': ' '{print $2}')
+      [[ $actual_cpu == $((begin + index)) ]] || {
+        echo "$name qemu-vcpu$index affinity=$actual_cpu expected=$((begin + index))" >&2
+        return 1
+      }
+    done
+  done
+  echo "pagerank_qemu_platform=ok machine=$PR_MACHINE cpu=$PR_CPU_MODEL topology=${PR_VM_SOCKETS}x${PR_VM_CORES}x${PR_VM_THREADS} pinning=exact"
+}
+
+validate_guest_platform() {
+  local port name
+  for spec in "vm0:$PR_VM0_PORT" "vm1:$PR_VM1_PORT"; do
+    name=${spec%%:*}
+    port=${spec##*:}
+    vm_ssh "$port" "
+      set -eu
+      test \"\$(nproc)\" -eq '$PR_VM_SMP'
+      test \"\$(lscpu -p=SOCKET | awk -F, '\$1 !~ /^#/ {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_SOCKETS'
+      test \"\$(lscpu -p=CORE | awk -F, '\$1 !~ /^#/ {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_CORES'
+      test \"\$(lscpu -p=NODE | awk -F, '\$1 !~ /^#/ && \$1 >= 0 {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_NUMA_NODES'
+      test \"\$(lscpu | awk -F: '/^Thread\\(s\\) per core:/ {gsub(/[[:space:]]/, \\\"\\\", \$2); print \$2}')\" -eq '$PR_VM_THREADS'
+      grep -qw waitpkg /proc/cpuinfo
+      test \"\$(cat /sys/devices/system/node/online)\" = 0
+    " || {
+      echo "$name guest topology or WAITPKG validation failed" >&2
+      return 1
+    }
+  done
+  echo "pagerank_guest_platform=ok numa_nodes=$PR_VM_NUMA_NODES topology=${PR_VM_SOCKETS}x${PR_VM_CORES}x${PR_VM_THREADS} waitpkg=on"
+}
+
 pin_one_vm() {
   local name=$1 pidfile=$2 cpus=$3
   local begin end pid count tid index
@@ -83,7 +182,7 @@ capture_qemu_topology() {
   local name pid tid comm
   : >"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
   for name in vm0 vm1; do
-    pid=$(pgrep -f -o "qemu-system-x86_64 -name $name ")
+    pid=$(qemu_pid "$name")
     [[ -n $pid ]] || {
       echo "cannot find QEMU process for $name" >&2
       return 1
@@ -111,6 +210,7 @@ build() {
 }
 
 install_guest_binary() {
+  validate_qemu_platform
   for port in "$PR_VM0_PORT" "$PR_VM1_PORT"; do
     vm_ssh "$port" "true"
     vm_scp "$port" "$PR_BINARY" ubuntu@127.0.0.1:"$PR_GUEST_BINARY" >/dev/null
@@ -119,10 +219,11 @@ install_guest_binary() {
       sudo test -r '$PR_ENDPOINT1'; \
       grep -qw 'cxlfork.cxl_phys=$PR_CXL_PHYS' /proc/cmdline; \
       grep -qw 'cxlfork.cxl_size=$PR_CXL_SIZE' /proc/cmdline; \
-      grep -qw '$PR_GUEST_APPEND_EXTRA' /proc/cmdline; \
+      for token in $PR_GUEST_APPEND_EXTRA; do grep -qw \"\$token\" /proc/cmdline; done; \
       test '$PR_NOTIFY' != umwait || grep -qw waitpkg /proc/cpuinfo; \
       test \"\$(nproc)\" -eq '$PR_VM_SMP'"
   done
+  validate_guest_platform
 }
 
 common_args() {
@@ -228,6 +329,10 @@ collect_manifest() {
     printf 'iterations=%s\nchunks=%s\nthreads_per_node=%s\n' \
       "$PR_ITERATIONS" "$PR_CHUNKS" "$PR_THREADS"
     printf 'guest_memory=%s\nguest_vcpus=%s\n' "$PR_VM_MEM" "$PR_VM_SMP"
+    printf 'qemu=%s\nmachine=%s\ncpu_model=%s\nhydra_pci_bus=%s\n' \
+      "$PR_QEMU" "$PR_MACHINE" "$PR_CPU_MODEL" "$PR_HYDRA_PCI_BUS"
+    printf 'guest_sockets=%s\nguest_cores=%s\nguest_threads=%s\nguest_numa_nodes=%s\n' \
+      "$PR_VM_SOCKETS" "$PR_VM_CORES" "$PR_VM_THREADS" "$PR_VM_NUMA_NODES"
     printf 'cxlfork_guest_phys=%s\ncxlfork_guest_size=%s\n' \
       "$PR_CXL_PHYS" "$PR_CXL_SIZE"
     printf 'guest_append_extra=%s\n' "$PR_GUEST_APPEND_EXTRA"
