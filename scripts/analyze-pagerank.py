@@ -49,6 +49,32 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[low] * (high - index) + ordered[high] * (index - low)
 
 
+def summarize_metrics(
+    rows: list[dict[str, object]],
+    metrics: list[tuple[str, str, list[float]]],
+) -> list[dict[str, object]]:
+    """Summarize derived metrics while preserving their measurement scope."""
+    result: list[dict[str, object]] = []
+    for metric, scope, values in metrics:
+        if not values:
+            continue
+        result.append(
+            {
+                "state": rows[0]["state"],
+                "metric": metric,
+                "scope": scope,
+                "samples": len(values),
+                "mean": statistics.fmean(values),
+                "p50": statistics.median(values),
+                "p95": percentile(values, 0.95),
+                "min": min(values),
+                "max": max(values),
+                "stddev": statistics.stdev(values) if len(values) > 1 else 0.0,
+            }
+        )
+    return result
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} RESULT_DIR", file=sys.stderr)
@@ -178,6 +204,99 @@ def main() -> int:
         "node1_graph_checksum", "source_log",
     ]
     write_csv(root / "cxlfork.csv", rows, cxlfork)
+
+    data_cow_pages = [float(row["cxlfork_local_copy_pages"]) for row in rows]
+    leaf_cow_pages = [float(row["cxlfork_leaf_copy_pages"]) for row in rows]
+    data_cow_ms = [float(row["cxlfork_data_cow_ms"]) for row in rows]
+    leaf_materialize_ms = [
+        float(row["cxlfork_leaf_materialize_ms"]) for row in rows
+    ]
+    cow_summary = summarize_metrics(
+        rows,
+        [
+            ("data_cow_pages", "successful_core_mm_cow_events_per_run", data_cow_pages),
+            ("leaf_cow_pages", "shared_pte_leaf_materializations_per_run", leaf_cow_pages),
+            ("data_cow_sum_ms", "sum_across_fault_handlers_not_wall_time", data_cow_ms),
+            (
+                "data_cow_mean_us_per_page",
+                "data_cow_sum_divided_by_successful_pages",
+                [
+                    milliseconds * 1000.0 / pages
+                    for milliseconds, pages in zip(data_cow_ms, data_cow_pages)
+                    if pages > 0
+                ],
+            ),
+            (
+                "leaf_materialize_sum_ms",
+                "sum_across_leaf_materializations_not_wall_time",
+                leaf_materialize_ms,
+            ),
+            (
+                "leaf_materialize_mean_us_per_leaf",
+                "leaf_materialize_sum_divided_by_materialized_leaves",
+                [
+                    milliseconds * 1000.0 / pages
+                    for milliseconds, pages in zip(leaf_materialize_ms, leaf_cow_pages)
+                    if pages > 0
+                ],
+            ),
+        ],
+    )
+    write_csv(
+        root / "cow-summary.csv",
+        cow_summary,
+        ["state", "metric", "scope", "samples", "mean", "p50", "p95",
+         "min", "max", "stddev"],
+    )
+
+    elapsed_seconds = [float(row["elapsed_ms"]) / 1000.0 for row in rows]
+    total_messages = [float(row["messages"]) for row in rows]
+    data_messages = [float(row["data_messages"]) for row in rows]
+    barrier_messages = [float(row["barrier_messages"]) for row in rows]
+    payload_bytes = [float(row["payload_bytes"]) for row in rows]
+    iterations = [float(row["iterations"]) for row in rows]
+    communication_summary = summarize_metrics(
+        rows,
+        [
+            ("messages", "both_directions_send_count_per_run", total_messages),
+            ("data_messages", "both_directions_data_send_count_per_run", data_messages),
+            (
+                "barrier_messages",
+                "both_directions_barrier_send_count_per_run",
+                barrier_messages,
+            ),
+            (
+                "messages_per_iteration",
+                "both_directions_send_count_per_pagerank_iteration",
+                [count / count_iterations for count, count_iterations in zip(total_messages, iterations)],
+            ),
+            (
+                "messages_per_second",
+                "both_directions_send_count_divided_by_execution_wall_time",
+                [count / seconds for count, seconds in zip(total_messages, elapsed_seconds)],
+            ),
+            ("payload_bytes", "both_directions_payload_bytes_per_run", payload_bytes),
+            (
+                "payload_bytes_per_iteration",
+                "both_directions_payload_bytes_per_pagerank_iteration",
+                [count / count_iterations for count, count_iterations in zip(payload_bytes, iterations)],
+            ),
+            (
+                "payload_gib_per_second",
+                "both_directions_payload_divided_by_execution_wall_time",
+                [
+                    count / seconds / (1024.0 ** 3)
+                    for count, seconds in zip(payload_bytes, elapsed_seconds)
+                ],
+            ),
+        ],
+    )
+    write_csv(
+        root / "communication-summary.csv",
+        communication_summary,
+        ["state", "metric", "scope", "samples", "mean", "p50", "p95",
+         "min", "max", "stddev"],
+    )
 
     summary_rows: list[dict[str, object]] = []
     for metric in ("elapsed_ms", "job_e2e_ms"):
