@@ -17,8 +17,8 @@
 
 | 角色 | 资源 | host CPU | 工作 |
 |---|---:|---:|---|
-| VM0 / coordinator | 16 vCPU、4 GiB | 0–15 | 本地构造 node0 图，发送控制请求，参与 PageRank，收集结果 |
-| VM1 / worker | 16 vCPU、4 GiB | 48–63 | 接收 `ARM`，通过 CXLfork 恢复 node1 图，参与 PageRank |
+| VM0 / coordinator | 16 vCPU、4 GiB | 0–15 | 本地构造 node0 图，发送控制请求，参与 PageRank，收集结果；16 个 relay 接收跨 OS 信号并用 futex 唤醒本地 worker |
+| VM1 / worker | 16 vCPU、4 GiB | 48–63 | 接收 `ARM`，通过 CXLfork 恢复 node1 图，参与 PageRank；16 个 relay 接收跨 OS 信号并用 futex 唤醒本地 worker |
 
 两台 VM 合计 32 vCPU、8 GiB，与单机 PageRank 的 32 vCPU、8 GiB 总预算一致。每个 QEMU vCPU 都一对一固定到对应 host CPU。
 
@@ -54,6 +54,8 @@ cmdline、guest 拓扑、WAITPKG 和 32 个 vCPU 的逐线程 affinity，不接�
 - 每顶点 16 条边，其中 14 条本地边、2 条远端边；
 - 100 次迭代；
 - 每个 node 16 个 worker thread，总计 32 个；
+- 每个 worker 配一个本地 relay thread，总计另有 32 个 relay。两台 VM 仍只有
+  32 个 vCPU，因此这是有意保留的目标 OS 调度开销，不是额外增加 vCPU；
 - 每个 thread 每轮拆成 32 个 pipeline chunk；
 - 一次预热/正确性 gate，随后 5 次正式样本；
 - 每次正式样本使用新 coordinator/worker 进程。
@@ -67,13 +69,35 @@ cmdline、guest 拓扑、WAITPKG 和 32 个 vCPU 的逐线程 affinity，不接�
 3. coordinator 构造 node0 本地图，然后通过 HydraRPC control queue 发送 `ARM`。
 4. worker 收到 `ARM` 后调用 `RESUME_V2`，把 node1 图映射到固定地址，检查 generation/checksum，再创建 16 个线程。
 5. coordinator 发送 `START`。两个 node 同时进入计时计算区间。
-6. 每轮中，每个线程把本 chunk 的远端 contribution 作为 HydraRPC payload 发送；对端直接消费收到的 payload，之后 release message。每个 VM 先用本地 `pthread_barrier` 汇总16个线程的 local residual，再由 thread 0 把它搭载在原有 HydraRPC barrier 中。两端在进入下一轮前都计算 `global residual = node0 local + node1 local`。
+6. 每轮中，每个线程把本 chunk 的远端 contribution 作为 HydraRPC payload 发送。
+   对端不是让计算 worker 直接轮询共享队列，而是由同编号 relay 用
+   `UMONITOR/UMWAIT` 收到消息；relay 发布本地 mailbox 并执行
+   `FUTEX_WAKE_PRIVATE`，睡在 `FUTEX_WAIT_PRIVATE` 上的计算 worker 被目标 OS
+   唤醒后才消费 payload。worker 消费完成后确认 mailbox，relay 才接收下一条消息。
+   每个 VM 再用本地 `pthread_barrier` 汇总16个线程的 local residual，由 thread 0
+   把它搭载在原有 HydraRPC barrier 中；两端在下一轮前都计算
+   `global residual = node0 local + node1 local`。
 7. worker 通过 HydraRPC 返回 elapsed、residual、rank checksum、transport 和 restore 统计。
 8. 进程退出后 CXLfork reader 归零。整套测试最后执行 `INSPECT`，确认 checksum 和 `readers=0`，然后 `RELEASE_V2`。
 
 每个正式样本实际发送 105,600 条消息和 844,774,400 bytes payload。这些不是伪造计数，而是两端逐线程统计后汇总的结果。
 
-正式路径不使用 TCP、socket sidecar 或跨 VM futex。接收方在 HydraRPC 共享队列的 head/tail cache line 上执行 `UMONITOR/UMWAIT`；发送方通过 `hydra_send_*()` release-publish 队列时，对该 cache line 的一致性写入就是唤醒事件。醒来后接收方重新检查队列条件，因此它具有 futex-like 的“等待条件变化、唤醒后复查”语义，但实现完全位于 HydraRPC 共享内存数据面。runner 会同时检查两个 guest 的 `waitpkg` CPU flag；程序输出必须是 `notify=umwait effective_notify=umwait`，不允许静默退化为 busy polling。
+正式路径不使用 TCP、socket sidecar，也不尝试把 Linux futex 跨两个 kernel 共享。
+HydraRPC 的 release-publish 和 `UMONITOR/UMWAIT` 只负责把信号跨 VM 送到目标
+relay；relay 随后使用目标 VM 自己的 futex 唤醒本地 worker。可以把它理解为：
+
+```text
+远端 worker 写 HydraRPC 队列
+  -> 目标 VM relay 被 UMWAIT 唤醒
+  -> relay 更新进程内 mailbox
+  -> FUTEX_WAKE_PRIVATE
+  -> 目标 OS 调度本地 PageRank worker
+```
+
+这条路径刻意保留了“消息已经跨 OS 到达，但真正的执行线程仍需经目标 OS 唤醒和
+调度”的成本。runner 会检查 guest 的 `waitpkg`，并要求输出同时满足
+`notify=umwait effective_notify=umwait`、`signal_path=hydra-umwait-local-futex`，
+以及非零 futex wait/wake/handoff 次数，禁止静默回到 busy polling 或直接消费路径。
 
 ## 5. 计时边界
 
@@ -101,19 +125,24 @@ cmdline、guest 拓扑、WAITPKG 和 32 个 vCPU 的逐线程 affinity，不接�
 - `restore_ioctl_ms` 包含 `restore_kernel_ms`；
 - `restore_leaf_attach_ms` 和 fallback 位于 kernel restore 内；
 - `arm_ms` 已包含 worker restore 和 worker thread creation；
-- Hydra send/receive/release 是 32 个线程的时间总和，彼此并行，不能与 wall-clock `elapsed_ms` 相加；
+- Hydra send/release 来自32个 worker，receive/wait 来自32个 relay；这些都是并行线程累计时间，不能与 wall-clock `elapsed_ms` 相加；
 - `hydra_wait_cpu_sum_ms` 是所有线程 UMWAIT 调用的累计时间，已嵌套在 receive wait 中，也不能再次相加；
+- `local_futex_wait_sum_ms` 是 worker 等待消息和 relay 等待消费确认的线程累计阻塞
+  时间；`local_futex_wake_sum_ms` 是这些本地 wake syscall 的线程累计时间。二者
+  都跨 64 个运行线程求和，不能与 wall time 相加；
+- `local_futex_handoff_mean_us` 才是最直观的单消息本地交接指标：从 relay 已经观察
+  到 HydraRPC 消息并发布 mailbox，到计算 worker 恢复执行的平均时间；
 - `graph_build_ms` 位于 `job_e2e_ms` 之前；
 - `host_orchestration_e2e_ms` 从 host 发起两条 SSH/exec 到两个进程退出，包含 SSH、进程启动、图构造、测试和清理，只是辅助诊断值，不能拿它与单机 `elapsed_ms` 直接比较。
 
 ## 6. 代码和脚本
 
-当前加入逐轮全局 residual 汇总后的开发分支为
-`motivation-pagerank-global-residual-103`：
+当前加入 HydraRPC → 本地 futex relay 后的开发分支为
+`motivation-pagerank-hydra-futex-relay-103`：
 
 - CXLfork launcher commit：`690fe42`；
-- PageRank/HydraRPC 实现 commit：`8320fa2`；后续文档提交以当前分支 HEAD
-  为准，结果运行版本仍记录在 manifest 的 `mr_git` 中。
+- PageRank/HydraRPC 实现 commit：`59cf8fa`；后续文档提交以当前分支 HEAD
+  为准，结果运行版本由 manifest 的 `mr_git` 锁定。
 
 - `pagerank/pagerank_hydra.c`：coordinator/worker、HydraRPC 数据与控制消息、计时点。
 - `pagerank/pr_graph.c`：与单机版本一致的图构造、CXL 模板格式和 checksum。
@@ -183,13 +212,13 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 103 上正式结果目录：
 
 ```text
-/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/paper-main-global-residual-20260918/
+/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/paper-main-hydra-futex-relay-20260918/
 ```
 
 跳板机上的逐文件 SHA256 一致备份为：
 
 ```text
-/home/adonis/cxlfork/test/pagerank/cxlfork-hydrarpc-results/paper-main-global-residual-20260918/
+/home/adonis/cxlfork/test/pagerank/cxlfork-hydrarpc-results/paper-main-hydra-futex-relay-20260918/
 ```
 
 最重要的文件：
@@ -199,7 +228,7 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 - `breakdown-summary.csv`：各 breakdown 的均值和层级，明确标记能否作为顶层相加；
 - `activation.csv`：ARM、thread creation、START 等控制路径；
 - `cxlfork.csv`：每次 restore、leaf attach 和 fallback；
-- `transport.csv`：HydraRPC 消息、bytes 和线程累计时间；
+- `transport.csv`：HydraRPC 消息、bytes、UMWAIT、futex 和 relay→worker handoff；
 - `residual.csv`：每次样本两端的 local/global residual 以及逐轮同步次数；
 - `runs/*.coordinator.log`、`runs/*.worker.log`、`runs/*.host.log`：不可丢失的原始记录；
 - `template.log`：CXLfork prepare 与模板 checksum；
@@ -214,29 +243,34 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 
 | 指标 | mean | P50 | P95 | stddev |
 |---|---:|---:|---:|---:|
-| `elapsed_ms` | 179.864 ms | 180.721 ms | 181.321 ms | 1.854 ms |
-| `job_e2e_ms` | 187.627 ms | 188.179 ms | 190.127 ms | 2.364 ms |
-| `activation_overhead_ms` | 7.763 ms | 7.249 ms | 9.132 ms | 1.236 ms |
-| throughput | 4664.263 MEdges/s | — | — | — |
+| `elapsed_ms` | 706.067 ms | 701.906 ms | 739.479 ms | 29.921 ms |
+| `job_e2e_ms` | 721.649 ms | 715.137 ms | 756.846 ms | 29.498 ms |
+| `activation_overhead_ms` | 15.582 ms | 14.167 ms | 19.028 ms | 3.011 ms |
+| throughput | 1189.800 MEdges/s | 1195.118 MEdges/s | — | 50.918 MEdges/s |
 
 平均 breakdown：
 
-- ARM：3.625 ms；
-- VM0 thread creation：2.733 ms；
-- START publish：0.217 ms；
-- CXLfork restore wrapper：0.0526 ms；
-- kernel restore：0.0326 ms；
+- ARM：7.704 ms；
+- VM0 worker + relay thread creation：6.101 ms；
+- START publish：0.168 ms；
+- CXLfork restore wrapper：0.0412 ms；
+- kernel restore：0.0226 ms；
 - shared-leaf attach：0.0040 ms；
 - fallback reconstruction：0；
-- HydraRPC receive wait（线程累计）：361.831 ms；
-- 其中纯 HydraRPC UMWAIT（线程累计）：72.631 ms；
+- HydraRPC receive wait（relay 线程累计）：17,300.210 ms；
+- 其中 HydraRPC UMWAIT（relay 线程累计）：6,564.938 ms；
+- 本地 futex wait（worker + relay 线程累计）：4,002.395 ms；
+- 本地 futex wake syscall（worker + relay 线程累计）：8,544.058 ms；
+- relay 已收到消息到 worker 恢复执行：平均每条 13.824 µs，105,600 次交接的
+  累计值为 1,459.768 ms；
 - shared leaf：32 个；shared data page：16,384 个。
 
-因此，在已经预建 capsule 的稳态 fast path 中，kernel restore 只占 `job_e2e_ms`
-的约 0.017%，主要可见的非计算 wall time 是线程创建、control
-request/response 和调度尾部，而不是页表恢复。`graph_build_ms` 均值约
-866.165 ms，但它发生在正式 job 计时窗口之前；host 从两条 SSH exec 到进程退出的
-辅助时间均值约 1416.833 ms，二者都不能加到 `elapsed_ms` 中冒充同一层级 breakdown。
+因此，在已经预建 capsule 的路径中，kernel restore 只占 `job_e2e_ms` 的约
+0.003%。显著成本来自稳态执行期间反复发生的跨 OS 消息接收、本地 futex 唤醒和
+目标 OS 调度，而不是一次性的页表恢复。线程累计时间大于 721 ms 很正常，因为它们
+是32个 worker和32个 relay 并行区间的求和，并非串行 wall-time breakdown。
+`graph_build_ms` 均值约862.377 ms，发生在正式 job 窗口之前；host SSH/exec 辅助
+时间均值约1,945.301 ms，也不能与单机 `elapsed_ms` 直接比较。
 
 正确性/真实性证据：5 次 checksum 全为 1；每个样本两端都报告
 `residual_mode=global-per-iteration` 和 `residual_syncs=100`，两端 global residual
@@ -245,11 +279,13 @@ shared leaf、16,384个 shared data page、0个 fallback page；最终 page chec
 一致、reader为0、release成功；两台 guest dmesg 未发现
 BUG/Oops/general-protection/panic。
 
-逐轮 global residual 复用了原来56字节 barrier 消息的 reserved 空间：只有 thread 0
+逐轮 global residual 仍复用56字节 barrier 消息的 reserved 空间：只有 thread 0
 携带本 VM 的 local residual，其余线程携带0。因此没有增加跨 VM 往返、消息条数或
-payload 大小；仍为105,600条消息和844,774,400 bytes。与修改前同平台的
-175.799 ms 相比，新 `elapsed_ms` 增加约2.3%。这是一组各5次样本的初步差值，
-可说明语义增强没有数量级代价，但不应把它当作高置信微基准结论。
+payload 大小；仍为105,600条消息和844,774,400 bytes。历史“计算 worker 直接
+UMWAIT 并消费 Hydra 队列”的结果约179.864 ms，只能作为去掉目标 OS 本地唤醒层的
+机制诊断，不再作为正式系统主结果。加入 relay + futex 后为706.067 ms，说明高频
+细粒度消息下，执行上下文唤醒和调度本身就是可观测瓶颈；这不是 CXLfork restore
+变慢，也不是扩大 workload 人为制造的差距。
 
 ## 10. 如何解释与正式 32u 单机数据的关系
 
@@ -263,18 +299,20 @@ payload 大小；仍为105,600条消息和844,774,400 bytes。与修改前同平
 | cohort-cxl | 415.141 ms | 3.752 ms | 2020.826 MEdges/s |
 | cohort | 195.575 ms | 3.763 ms | 4290.757 MEdges/s |
 
-CXLfork+HydraRPC 的对齐后 `elapsed_ms` 为179.864 ms，比 vm-dram 的
-183.855 ms 快约2.2%；若把跨 OS ARM、restore、线程创建和结果
-返回计入，`job_e2e_ms` 为187.627 ms，比 vm-dram 的执行区间慢约2.1%。新数据不再具有旧版19.3%的巨大优势，
-说明 machine/CPU/topology/绑核确实显著影响结论；但它仍不能支撑“分布式路径一定
-更慢”，更不能按预期人为调慢或筛选样本。
+CXLfork+HydraRPC 的正式 `elapsed_ms` 为706.067 ms，是 vm-dram 的约3.84倍、
+vm-cxl 的约1.72倍、starfish 的约1.58倍；仍低于“不超过10倍”这一可解释范围。
+`job_e2e_ms` 为721.649 ms，其中激活开销15.582 ms，绝大部分差距位于反复执行的
+跨 OS contribution/barrier + 本地唤醒路径，而不是一次性的 CXLfork restore。
 
-这一次已经排除了“分布式侧忙轮询、单机侧 futex”这一明显差异：单机程序保持原
-futex 不变，分布式侧为纯 HydraRPC UMWAIT，五次样本都确认
-`effective_notify=umwait`。machine、基础 CPU model、socket/core/thread 总拓扑、
-host CPU 和内存 NUMA 放置也已对齐。仍无法消除的结构差异是：单机是一个
-32-vCPU guest 的两个 guest NUMA 节点，分布式是两个各 16-vCPU、单 guest NUMA
-的独立 OS；图和 rank 数组也随之天然分区。这部分局部性收益可能覆盖 HydraRPC
-同步成本，是目前最符合结果的解释。
+单机程序保持自身 futex 逻辑不变；分布式程序用 HydraRPC 做跨 VM 信号，再由目标
+OS 的本地 futex 唤醒计算线程。machine、基础 CPU model、总 vCPU/内存预算和 host
+放置保持对齐，但执行模型本来就不同：单机是一个32-vCPU guest，分布式是两个
+16-vCPU、单 guest NUMA 的独立 OS，并额外存在32个 relay 软件线程。这正是本实验
+希望显式保留的跨 OS 上下文管理成本，因此不能把 relay 线程累计时间误说成 CXL
+介质延迟，也不能把这组结果解释为 CXLfork kernel restore 很慢。
 
-另外，单机与 CXLfork guest kernel 版本仍不同。故这批结果可用于证明真实 CXLfork restore、纯 HydraRPC 共享内存唤醒及其 breakdown，但若论文要做严格的系统优劣结论，还需要把 guest kernel、NUMA/CPU 放置和内存带宽预算进一步统一。`host_orchestration_e2e_ms` 包含 SSH 和进程启动，绝不能拿来与单机 `elapsed_ms` 比较。
+另外，单机与 CXLfork guest kernel 版本仍不同。故这批结果可用于证明真实 CXLfork
+restore、HydraRPC 跨 VM 信号、目标 OS 本地 futex 唤醒及其 breakdown；若论文要做
+严格的系统优劣结论，还需继续统一 guest kernel 等剩余变量。
+`host_orchestration_e2e_ms` 包含 SSH 和进程启动，绝不能拿来与单机
+`elapsed_ms` 比较。
