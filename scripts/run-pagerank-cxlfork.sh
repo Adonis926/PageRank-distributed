@@ -53,7 +53,7 @@ cmdline_has_arg() {
 }
 
 validate_qemu_platform() {
-  local name cpus pid expected_cpu expected_machine expected_smp
+  local name cpus pid actual_qemu expected_cpu expected_machine expected_smp
   local begin end index tid actual_cpu
   expected_cpu=${PR_CPU_MODEL:?PR_CPU_MODEL is required}
   expected_machine="${PR_MACHINE:?PR_MACHINE is required},accel=kvm,nvdimm=on"
@@ -72,8 +72,10 @@ validate_qemu_platform() {
       echo "cannot find QEMU process for $name" >&2
       return 1
     }
-    [[ $(readlink -f "/proc/$pid/exe") == "$PR_QEMU" ]] || {
-      echo "$name uses unexpected QEMU: $(readlink -f "/proc/$pid/exe")" >&2
+    actual_qemu=
+    IFS= read -r -d '' actual_qemu <"/proc/$pid/cmdline" || true
+    [[ $actual_qemu == "$PR_QEMU" ]] || {
+      echo "$name uses unexpected QEMU: $actual_qemu" >&2
       return 1
     }
     cmdline_has_arg "$pid" "$expected_machine" || {
