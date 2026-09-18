@@ -54,7 +54,9 @@ install_guest_binary() {
   for port in "$PR_VM0_PORT" "$PR_VM1_PORT"; do
     vm_ssh "$port" "true"
     vm_scp "$port" "$PR_BINARY" ubuntu@127.0.0.1:"$PR_GUEST_BINARY" >/dev/null
-    vm_ssh "$port" "chmod 755 '$PR_GUEST_BINARY'; test -e /dev/cxlfork; test -r '$PR_ENDPOINT0'; test -r '$PR_ENDPOINT1'"
+    vm_ssh "$port" "chmod 755 '$PR_GUEST_BINARY'; \
+      sudo test -e /dev/cxlfork; sudo test -r '$PR_ENDPOINT0'; \
+      sudo test -r '$PR_ENDPOINT1'"
   done
 }
 
