@@ -304,7 +304,7 @@ case "$ACTION" in
     install_guest_binary
     load_template
     mkdir -p "$RESULT_DIR/runs"
-    run_once run-1 off no cxlfork
+    run_once "${PR_RUN_LABEL:-run-1}" off no cxlfork
     ;;
   bench)
     bench
