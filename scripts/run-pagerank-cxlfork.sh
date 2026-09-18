@@ -88,10 +88,9 @@ validate_qemu_platform() {
       echo "$name missing exact SMP argument: $expected_smp" >&2
       return 1
     }
-    tr '\0' '\n' <"/proc/$pid/cmdline" |
-      grep -F "ivshmem-plain," |
-      grep -Fq "bus=$PR_HYDRA_PCI_BUS," || {
-        echo "$name HydraRPC devices are not on $PR_HYDRA_PCI_BUS" >&2
+    cmdline_has_arg "$pid" "ivshmem-plain,id=hydra-shm0,memdev=hydra0,bus=$PR_HYDRA_PCI_BUS,addr=$PR_HYDRA0_PCI_ADDR" &&
+      cmdline_has_arg "$pid" "ivshmem-plain,id=hydra-shm1,memdev=hydra1,bus=$PR_HYDRA_PCI_BUS,addr=$PR_HYDRA1_PCI_ADDR" || {
+        echo "$name HydraRPC device bus/BDF does not match the experiment profile" >&2
         return 1
       }
 
@@ -331,6 +330,8 @@ collect_manifest() {
     printf 'guest_memory=%s\nguest_vcpus=%s\n' "$PR_VM_MEM" "$PR_VM_SMP"
     printf 'qemu=%s\nmachine=%s\ncpu_model=%s\nhydra_pci_bus=%s\n' \
       "$PR_QEMU" "$PR_MACHINE" "$PR_CPU_MODEL" "$PR_HYDRA_PCI_BUS"
+    printf 'hydra0_pci_addr=%s\nhydra1_pci_addr=%s\n' \
+      "$PR_HYDRA0_PCI_ADDR" "$PR_HYDRA1_PCI_ADDR"
     printf 'guest_sockets=%s\nguest_cores=%s\nguest_threads=%s\nguest_numa_nodes=%s\n' \
       "$PR_VM_SOCKETS" "$PR_VM_CORES" "$PR_VM_THREADS" "$PR_VM_NUMA_NODES"
     printf 'cxlfork_guest_phys=%s\ncxlfork_guest_size=%s\n' \
