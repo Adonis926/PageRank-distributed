@@ -203,6 +203,21 @@ static void *arena_alloc(pr_arena *arena, uint64_t bytes, uint64_t *offset)
     return arena->base + start;
 }
 
+static void *arena_alloc_aligned(pr_arena *arena, uint64_t bytes,
+                                 uint64_t alignment, uint64_t *offset)
+{
+    uint64_t start = align_up(arena->cursor, alignment);
+
+    if (start > arena->bytes || bytes > arena->bytes - start) {
+        return NULL;
+    }
+    arena->cursor = start + bytes;
+    if (offset != NULL) {
+        *offset = start;
+    }
+    return arena->base + start;
+}
+
 uint64_t pr_graph_config_fingerprint(uint32_t node, uint64_t vertices,
                                      uint32_t degree,
                                      uint32_t remote_degree)
@@ -258,6 +273,8 @@ int pr_graph_build_template(void *mapping, uint64_t mapping_bytes,
     };
     pr_edge *edges;
     uint64_t *offsets;
+    double *rank0;
+    double *rank1;
     int err;
 
     if (mapping == NULL || mapping_bytes < PR_TEMPLATE_HEADER_BYTES ||
@@ -318,6 +335,21 @@ int pr_graph_build_template(void *mapping, uint64_t mapping_bytes,
         return err;
     }
 
+    header->graph_bytes = arena.cursor - PR_TEMPLATE_HEADER_BYTES;
+    uint64_t rank_bytes = vertices * sizeof(double);
+    rank0 = arena_alloc_aligned(&arena, rank_bytes, PR_HUGE_SIZE,
+                                &header->rank0_offset);
+    rank1 = arena_alloc_aligned(&arena, rank_bytes, PR_HUGE_SIZE,
+                                &header->rank1_offset);
+    if (rank0 == NULL || rank1 == NULL) {
+        return ENOSPC;
+    }
+    double initial_rank = 1.0 / (2.0 * vertices);
+    for (uint64_t vertex = 0; vertex < vertices; vertex++) {
+        rank0[vertex] = initial_rank;
+        rank1[vertex] = 0.0;
+    }
+
     header->magic = PR_TEMPLATE_MAGIC;
     header->version = PR_TEMPLATE_VERSION;
     header->header_size = sizeof(*header);
@@ -330,10 +362,14 @@ int pr_graph_build_template(void *mapping, uint64_t mapping_bytes,
     header->local_edges_count = local_count;
     header->remote_in_edges_count = remote_count;
     header->remote_out_edges_count = remote_count;
-    header->graph_bytes = arena.cursor - PR_TEMPLATE_HEADER_BYTES;
+    header->rank_bytes = rank_bytes;
+    header->application_state_bytes = arena.cursor - PR_TEMPLATE_HEADER_BYTES;
     header->config_fingerprint =
         pr_graph_config_fingerprint(node, vertices, degree, remote_degree);
     header->graph_checksum = pr_graph_checksum(graph);
+    uint64_t rank_checksum = UINT64_C(1469598103934665603);
+    rank_checksum = checksum_bytes(rank_checksum, rank0, rank_bytes);
+    header->rank_checksum = checksum_bytes(rank_checksum, rank1, rank_bytes);
     return 0;
 }
 
@@ -428,6 +464,47 @@ int pr_graph_bind_template(void *mapping, uint64_t mapping_bytes,
     if (full_validate && pr_graph_checksum(graph) != header->graph_checksum) {
         memset(graph, 0, sizeof(*graph));
         return EILSEQ;
+    }
+    return 0;
+}
+
+int pr_template_bind_rank_state(void *mapping, uint64_t mapping_bytes,
+                                uint64_t vertices, bool full_validate,
+                                double **rank0, double **rank1)
+{
+    const pr_template_header_v1 *header = mapping;
+    uint64_t rank_bytes;
+
+    if (mapping == NULL || rank0 == NULL || rank1 == NULL ||
+        vertices == 0 || vertices > UINT32_MAX ||
+        vertices > UINT64_MAX / sizeof(double)) {
+        return EINVAL;
+    }
+    rank_bytes = vertices * sizeof(double);
+    if (mapping_bytes < sizeof(*header) ||
+        header->magic != PR_TEMPLATE_MAGIC ||
+        header->version != PR_TEMPLATE_VERSION ||
+        header->header_size != sizeof(*header) ||
+        header->vertices != vertices || header->rank_bytes != rank_bytes ||
+        header->rank0_offset % PR_HUGE_SIZE != 0 ||
+        header->rank1_offset % PR_HUGE_SIZE != 0 ||
+        !range_valid(header->rank0_offset, rank_bytes, mapping_bytes) ||
+        !range_valid(header->rank1_offset, rank_bytes, mapping_bytes) ||
+        header->application_state_bytes >
+            mapping_bytes - PR_TEMPLATE_HEADER_BYTES) {
+        return EILSEQ;
+    }
+    *rank0 = (double *)((unsigned char *)mapping + header->rank0_offset);
+    *rank1 = (double *)((unsigned char *)mapping + header->rank1_offset);
+    if (full_validate) {
+        uint64_t checksum = UINT64_C(1469598103934665603);
+        checksum = checksum_bytes(checksum, *rank0, rank_bytes);
+        checksum = checksum_bytes(checksum, *rank1, rank_bytes);
+        if (checksum != header->rank_checksum) {
+            *rank0 = NULL;
+            *rank1 = NULL;
+            return EILSEQ;
+        }
     }
     return 0;
 }

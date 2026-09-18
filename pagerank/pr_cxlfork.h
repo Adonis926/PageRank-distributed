@@ -25,13 +25,15 @@ typedef struct pr_cxlfork_handle {
     mr_cxlfork_result result;
     mr_cxlfork_timing timing;
     uint64_t graph_checksum;
+    uint64_t rank_checksum;
 } pr_cxlfork_handle;
 
 int pr_cxlfork_publish(const pr_cxlfork_options *options);
 int pr_cxlfork_context_open(const pr_cxlfork_options *options,
                             pr_cxlfork_handle *handle);
 int pr_cxlfork_restore(const pr_cxlfork_options *options,
-                       pr_cxlfork_handle *handle, pr_graph *graph);
+                       pr_cxlfork_handle *handle, pr_graph *graph,
+                       double *rank[2]);
 int pr_cxlfork_collect(pr_cxlfork_handle *handle);
 void pr_cxlfork_close(pr_cxlfork_handle *handle);
 int pr_cxlfork_inspect(uint64_t key, uint64_t expected_generation,

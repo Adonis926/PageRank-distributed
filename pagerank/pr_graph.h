@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define PR_TEMPLATE_MAGIC UINT64_C(0x50524743584c5631)
-#define PR_TEMPLATE_VERSION 1U
+#define PR_TEMPLATE_VERSION 2U
 #define PR_TEMPLATE_BASE_DEFAULT UINT64_C(0x500000000000)
 #define PR_TEMPLATE_BYTES_DEFAULT (64ULL * 1024ULL * 1024ULL)
 #define PR_TEMPLATE_HEADER_BYTES 4096U
@@ -62,7 +62,12 @@ typedef struct pr_template_header_v1 {
     uint64_t graph_checksum;
     uint64_t config_fingerprint;
     uint64_t flags;
-    uint64_t reserved[42];
+    uint64_t rank0_offset;
+    uint64_t rank1_offset;
+    uint64_t rank_bytes;
+    uint64_t rank_checksum;
+    uint64_t application_state_bytes;
+    uint64_t reserved[37];
 } pr_template_header_v1;
 
 uint32_t pr_edge_destination(int src_node, uint32_t src, int edge_index,
@@ -77,6 +82,9 @@ int pr_graph_bind_template(void *mapping, uint64_t mapping_bytes,
                            uint32_t expected_node, uint64_t vertices,
                            uint32_t degree, uint32_t remote_degree,
                            bool full_validate, pr_graph *graph);
+int pr_template_bind_rank_state(void *mapping, uint64_t mapping_bytes,
+                                uint64_t vertices, bool full_validate,
+                                double **rank0, double **rank1);
 void pr_graph_destroy(pr_graph *graph);
 uint64_t pr_graph_checksum(const pr_graph *graph);
 uint64_t pr_graph_config_fingerprint(uint32_t node, uint64_t vertices,

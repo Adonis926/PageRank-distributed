@@ -235,6 +235,7 @@ struct pr_node_ctx {
     atomic_int worker_error;
     uint64_t run_id;
     double *rank[2];
+    bool rank_template_backed;
     double *partials;
     pr_transport_stats *transport;
     uint64_t elapsed_ns;
@@ -880,9 +881,11 @@ static void *worker_main(void *opaque)
         (err = pin_thread(cpus[tid])) != 0) {
         remember_worker_error(ctx, err != 0 ? err : EINVAL);
     }
-    for (uint64_t vertex = vertex_begin; vertex < vertex_end; vertex++) {
-        ctx->rank[0][vertex] = initial_rank;
-        ctx->rank[1][vertex] = 0.0;
+    if (!ctx->rank_template_backed) {
+        for (uint64_t vertex = vertex_begin; vertex < vertex_end; vertex++) {
+            ctx->rank[0][vertex] = initial_rank;
+            ctx->rank[1][vertex] = 0.0;
+        }
     }
     pthread_barrier_wait(&ctx->barrier);
     err = wait_for_start_gate(ctx);
@@ -1014,8 +1017,10 @@ static int node_init_compute(pr_node_ctx *ctx)
 {
     uint64_t rank_bytes = ctx->options.vertices * sizeof(double);
 
-    ctx->rank[0] = alloc_rank(rank_bytes);
-    ctx->rank[1] = alloc_rank(rank_bytes);
+    if (!ctx->rank_template_backed) {
+        ctx->rank[0] = alloc_rank(rank_bytes);
+        ctx->rank[1] = alloc_rank(rank_bytes);
+    }
     ctx->partials = calloc(ctx->options.threads, sizeof(*ctx->partials));
     ctx->transport = calloc(ctx->options.threads, sizeof(*ctx->transport));
     if (ctx->rank[0] == NULL || ctx->rank[1] == NULL ||
@@ -1157,10 +1162,10 @@ static void node_close(pr_node_ctx *ctx)
         hydra_close(ctx->tx[tid]);
         hydra_close(ctx->rx[tid]);
     }
-    if (ctx->rank[0] != NULL) {
+    if (!ctx->rank_template_backed && ctx->rank[0] != NULL) {
         munmap(ctx->rank[0], (size_t)rank_bytes);
     }
-    if (ctx->rank[1] != NULL) {
+    if (!ctx->rank_template_backed && ctx->rank[1] != NULL) {
         munmap(ctx->rank[1], (size_t)rank_bytes);
     }
     free(ctx->partials);
@@ -1385,7 +1390,8 @@ static int run_coordinator(const pr_options *options)
            " restore_kernel_ms=%.3f restore_leaf_attach_ms=%.3f"
            " restore_fallback_ms=%.3f shared_leaf_count=%" PRIu64
            " shared_data_pages=%" PRIu64 " fallback_pages=%" PRIu64
-           " restore_policy=readonly cxlfork_faults=%" PRIu64
+           " restore_policy=%s expected_rank_cow_pages=%" PRIu64
+           " cxlfork_faults=%" PRIu64
            " cxlfork_local_copy_pages=%" PRIu64
            " cxlfork_leaf_copy_pages=%" PRIu64
            " cxlfork_data_cow_ms=%.3f"
@@ -1434,7 +1440,12 @@ static int run_coordinator(const pr_options *options)
            remote_arm.restore_leaf_attach_ns / 1e6,
            remote_arm.restore_fallback_ns / 1e6,
            remote_arm.shared_leaf_count, remote_arm.shared_data_pages,
-           remote_arm.fallback_pages, remote_result.cxlfork_faults,
+           remote_arm.fallback_pages,
+           options->state_mode == PR_STATE_CXLFORK ? "mow" : "none",
+           options->state_mode == PR_STATE_CXLFORK
+               ? 2 * options->vertices * sizeof(double) / 4096
+               : 0,
+           remote_result.cxlfork_faults,
            remote_result.cxlfork_local_copy_pages,
            remote_result.cxlfork_leaf_copy_pages,
            remote_result.cxlfork_data_cow_ns / 1e6,
@@ -1533,8 +1544,9 @@ static int run_worker(const pr_options *options)
         ctx.run_id = arm.run_id;
         if (options->state_mode == PR_STATE_CXLFORK) {
             err = pr_cxlfork_restore(&options->cxlfork, &cxlfork,
-                                     &ctx.graph);
+                                     &ctx.graph, ctx.rank);
             if (err == 0) {
+                ctx.rank_template_backed = true;
                 ctx.graph_checksum = cxlfork.graph_checksum;
                 err = pr_cxlfork_collect(&cxlfork);
             }
@@ -1658,7 +1670,8 @@ static int run_worker(const pr_options *options)
                " local_futex_handoff_sum_ms=%.3f"
                " local_futex_handoff_calls=%" PRIu64
                " local_futex_handoff_mean_us=%.3f"
-               " restore_policy=readonly cxlfork_faults=%" PRIu64
+               " restore_policy=%s expected_rank_cow_pages=%" PRIu64
+               " cxlfork_faults=%" PRIu64
                " cxlfork_local_copy_pages=%" PRIu64
                " cxlfork_leaf_copy_pages=%" PRIu64
                " graph_checksum=%" PRIu64
@@ -1681,6 +1694,10 @@ static int run_worker(const pr_options *options)
                    ? 0.0
                    : (result.local_futex_handoff_ns / 1e3) /
                          result.local_futex_handoff_calls,
+               options->state_mode == PR_STATE_CXLFORK ? "mow" : "none",
+               options->state_mode == PR_STATE_CXLFORK
+                   ? 2 * options->vertices * sizeof(double) / 4096
+                   : 0,
                result.cxlfork_faults, result.cxlfork_local_copy_pages,
                result.cxlfork_leaf_copy_pages,
                result.graph_checksum, result.residual_syncs,
@@ -1749,8 +1766,15 @@ static int run_graph_check(const pr_options *options)
                                options->vertices, options->degree,
                                options->remote_degree, true,
                                &rebound_graph) == 0) {
+        double *rank0 = NULL;
+        double *rank1 = NULL;
         template_match = pr_graph_checksum(&graphs[1]) ==
-                         pr_graph_checksum(&rebound_graph);
+                             pr_graph_checksum(&rebound_graph) &&
+                         pr_template_bind_rank_state(
+                             template_mapping, options->cxlfork.bytes,
+                             options->vertices, true, &rank0, &rank1) == 0 &&
+                         rank0[0] == 1.0 / (2.0 * options->vertices) &&
+                         rank1[0] == 0.0;
     }
     printf("pr_graph_check_v1 status=%s vertices=%" PRIu64
            " degree=%u remote_degree=%u node0_checksum=%" PRIu64

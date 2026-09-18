@@ -65,7 +65,7 @@ static mr_cxlfork_restore_options make_restore_options(
         },
         .generation = options->generation,
         .page_checksum = options->page_checksum,
-        .policy = MR_CXLFORK_POLICY_READONLY,
+        .policy = MR_CXLFORK_POLICY_MOW,
         .validate_full = options->full_validate,
     };
 }
@@ -156,6 +156,9 @@ int pr_cxlfork_publish(const pr_cxlfork_options *options)
            " slot=%" PRIu64 " base=%" PRIu64 " bytes=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
            " graph_bytes=%" PRIu64 " graph_checksum=%" PRIu64
+           " rank_bytes=%" PRIu64 " rank_checksum=%" PRIu64
+           " application_state_bytes=%" PRIu64
+           " expected_rank_cow_pages=%" PRIu64
            " total_pages=%" PRIu64 " page_checksum=%" PRIu64
            " region_count=%u build_ns=%" PRIu64
            " prepare_wrapper_ns=%" PRIu64
@@ -166,6 +169,9 @@ int pr_cxlfork_publish(const pr_cxlfork_options *options)
            (uint64_t)prepare.slot, options->base, options->bytes,
            options->vertices, options->degree, options->remote_degree,
            header->graph_bytes, header->graph_checksum,
+           header->rank_bytes, header->rank_checksum,
+           header->application_state_bytes,
+           2 * header->rank_bytes / 4096,
            (uint64_t)prepare.total_pages,
            (uint64_t)prepare.page_checksum, prepare.region_count,
            build_end_ns - build_begin_ns,
@@ -204,13 +210,15 @@ int pr_cxlfork_context_open(const pr_cxlfork_options *options,
 }
 
 int pr_cxlfork_restore(const pr_cxlfork_options *options,
-                       pr_cxlfork_handle *handle, pr_graph *graph)
+                       pr_cxlfork_handle *handle, pr_graph *graph,
+                       double *rank[2])
 {
 #if MR_ENABLE_CXLFORK
     int err;
     mr_cxlfork_restore_options restore;
 
-    if (handle == NULL || handle->context == NULL || graph == NULL) {
+    if (handle == NULL || handle->context == NULL || graph == NULL ||
+        rank == NULL) {
         return EINVAL;
     }
     restore = make_restore_options(options);
@@ -230,14 +238,28 @@ int pr_cxlfork_restore(const pr_cxlfork_options *options,
         handle->session = NULL;
         return err;
     }
+    err = pr_template_bind_rank_state((void *)(uintptr_t)options->base,
+                                      options->bytes, options->vertices,
+                                      options->full_validate,
+                                      &rank[0], &rank[1]);
+    if (err != 0) {
+        pr_graph_destroy(graph);
+        mr_cxlfork_restore_end(handle->session);
+        handle->session = NULL;
+        return err;
+    }
     handle->graph_checksum =
         ((const pr_template_header_v1 *)(uintptr_t)options->base)
             ->graph_checksum;
+    handle->rank_checksum =
+        ((const pr_template_header_v1 *)(uintptr_t)options->base)
+            ->rank_checksum;
     return 0;
 #else
     (void)options;
     (void)handle;
     (void)graph;
+    (void)rank;
     return EOPNOTSUPP;
 #endif
 }
