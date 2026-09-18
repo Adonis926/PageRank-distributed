@@ -42,6 +42,66 @@ field() {
   }' "$file"
 }
 
+pin_one_vm() {
+  local name=$1 pidfile=$2 cpus=$3
+  local begin end pid count tid index
+  [[ $cpus =~ ^([0-9]+)-([0-9]+)$ ]] || {
+    echo "$name CPU list must be one contiguous range, found: $cpus" >&2
+    return 1
+  }
+  begin=${BASH_REMATCH[1]}
+  end=${BASH_REMATCH[2]}
+  count=$((end - begin + 1))
+  [[ $count -eq $PR_VM_SMP ]] || {
+    echo "$name CPU range has $count CPUs, expected $PR_VM_SMP" >&2
+    return 1
+  }
+  pid=$(<"$pidfile")
+  kill -0 "$pid"
+  for ((index = 0; index < PR_VM_SMP; index++)); do
+    tid=$(ps -T -p "$pid" -o tid=,comm= |
+      awk -v wanted="qemu-vcpu$index" '$2 == wanted {print $1; exit}')
+    [[ -n $tid ]] || {
+      echo "missing $name qemu-vcpu$index below pid $pid" >&2
+      return 1
+    }
+    taskset -pc $((begin + index)) "$tid" >/dev/null
+  done
+}
+
+pin_vcpus() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || {
+    echo "pin-vcpus must be run with sudo" >&2
+    exit 1
+  }
+  pin_one_vm vm0 "$PR_VM_WORKSPACE/pids/vm0.pid" "$PR_VM0_HOST_CPUS"
+  pin_one_vm vm1 "$PR_VM_WORKSPACE/pids/vm1.pid" "$PR_VM1_HOST_CPUS"
+  echo "pagerank_vcpu_pinning=ok vm0=$PR_VM0_HOST_CPUS vm1=$PR_VM1_HOST_CPUS"
+}
+
+capture_qemu_topology() {
+  local name pid tid comm
+  : >"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
+  for name in vm0 vm1; do
+    pid=$(pgrep -f -o "qemu-system-x86_64 -name $name ")
+    [[ -n $pid ]] || {
+      echo "cannot find QEMU process for $name" >&2
+      return 1
+    }
+    printf '%s pid=%s cmdline=' "$name" "$pid" \
+      >>"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
+    tr '\0' ' ' <"/proc/$pid/cmdline" \
+      >>"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
+    printf '\n' >>"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
+    while read -r tid comm; do
+      [[ $comm == qemu-vcpu* ]] || continue
+      printf '%s ' "$name/$comm" \
+        >>"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
+      taskset -pc "$tid" >>"$RESULT_DIR/manifest/qemu-vcpu-affinity.txt"
+    done < <(ps -T -p "$pid" -o tid=,comm=)
+  done
+}
+
 build() {
   cmake -S "$PR_HOST_REPO" -B "$PR_HOST_REPO/build-pagerank" \
     -DHYDRARPC_ROOT="$PR_HYDRA_ROOT" \
@@ -179,6 +239,21 @@ collect_manifest() {
     >"$RESULT_DIR/manifest/vm0.txt"
   vm_ssh "$PR_VM1_PORT" "uname -a; cat /proc/cmdline; lscpu; free -h" \
     >"$RESULT_DIR/manifest/vm1.txt"
+  capture_qemu_topology
+}
+
+collect_final_state() {
+  local port name
+  for spec in "vm0:$PR_VM0_PORT" "vm1:$PR_VM1_PORT"; do
+    name=${spec%%:*}
+    port=${spec##*:}
+    vm_ssh "$port" "sudo dmesg" >"$RESULT_DIR/manifest/$name-dmesg.txt"
+    if grep -Eiq 'BUG:|WARNING: CPU|Oops:|general protection fault|Kernel panic' \
+        "$RESULT_DIR/manifest/$name-dmesg.txt"; then
+      echo "fatal kernel diagnostic found in $name dmesg" >&2
+      return 1
+    fi
+  done
 }
 
 bench() {
@@ -200,15 +275,21 @@ bench() {
   vm_ssh "$PR_VM0_PORT" "sudo '$PR_GUEST_BINARY' inspect \
     --key='$PR_KEY' --generation='$PR_GENERATION'" \
     >"$RESULT_DIR/final-inspect.log"
+  grep -q 'readers=0 .* verify=ok' "$RESULT_DIR/final-inspect.log"
   vm_ssh "$PR_VM0_PORT" "sudo '$PR_GUEST_BINARY' release \
     --key='$PR_KEY' --generation='$PR_GENERATION'" \
     >"$RESULT_DIR/release.log"
+  grep -q 'verify=ok' "$RESULT_DIR/release.log"
+  collect_final_state
   printf 'result_dir=%s\n' "$RESULT_DIR"
 }
 
 case "$ACTION" in
   build)
     build
+    ;;
+  pin-vcpus)
+    pin_vcpus
     ;;
   prepare)
     build
@@ -226,7 +307,7 @@ case "$ACTION" in
     bench
     ;;
   *)
-    echo "usage: $0 build|prepare|run|bench" >&2
+    echo "usage: $0 build|pin-vcpus|prepare|run|bench" >&2
     exit 2
     ;;
 esac
