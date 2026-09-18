@@ -67,7 +67,7 @@ cmdline、guest 拓扑、WAITPKG 和 32 个 vCPU 的逐线程 affinity，不接�
 3. coordinator 构造 node0 本地图，然后通过 HydraRPC control queue 发送 `ARM`。
 4. worker 收到 `ARM` 后调用 `RESUME_V2`，把 node1 图映射到固定地址，检查 generation/checksum，再创建 16 个线程。
 5. coordinator 发送 `START`。两个 node 同时进入计时计算区间。
-6. 每轮中，每个线程把本 chunk 的远端 contribution 作为 HydraRPC payload 发送；对端直接消费收到的 payload，之后 release message。每轮末再交换 barrier message。
+6. 每轮中，每个线程把本 chunk 的远端 contribution 作为 HydraRPC payload 发送；对端直接消费收到的 payload，之后 release message。每个 VM 先用本地 `pthread_barrier` 汇总16个线程的 local residual，再由 thread 0 把它搭载在原有 HydraRPC barrier 中。两端在进入下一轮前都计算 `global residual = node0 local + node1 local`。
 7. worker 通过 HydraRPC 返回 elapsed、residual、rank checksum、transport 和 restore 统计。
 8. 进程退出后 CXLfork reader 归零。整套测试最后执行 `INSPECT`，确认 checksum 和 `readers=0`，然后 `RELEASE_V2`。
 
@@ -108,10 +108,12 @@ cmdline、guest 拓扑、WAITPKG 和 32 个 vCPU 的逐线程 affinity，不接�
 
 ## 6. 代码和脚本
 
-当前对齐后的开发分支为 `motivation-pagerank-qemu-aligned-103`：
+当前加入逐轮全局 residual 汇总后的开发分支为
+`motivation-pagerank-global-residual-103`：
 
 - CXLfork launcher commit：`690fe42`；
-- PageRank/HydraRPC runner commit：以结果 manifest 中的 `mr_git` 为准。
+- PageRank/HydraRPC 实现 commit：`8320fa2`；后续文档提交以当前分支 HEAD
+  为准，结果运行版本仍记录在 manifest 的 `mr_git` 中。
 
 - `pagerank/pagerank_hydra.c`：coordinator/worker、HydraRPC 数据与控制消息、计时点。
 - `pagerank/pr_graph.c`：与单机版本一致的图构造、CXL 模板格式和 checksum。
@@ -181,13 +183,13 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 103 上正式结果目录：
 
 ```text
-/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/paper-main-qemu-aligned-20260918/
+/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/paper-main-global-residual-20260918/
 ```
 
 跳板机上的逐文件 SHA256 一致备份为：
 
 ```text
-/home/adonis/cxlfork/test/pagerank/cxlfork-hydrarpc-results/paper-main-qemu-aligned-20260918/
+/home/adonis/cxlfork/test/pagerank/cxlfork-hydrarpc-results/paper-main-global-residual-20260918/
 ```
 
 最重要的文件：
@@ -198,6 +200,7 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 - `activation.csv`：ARM、thread creation、START 等控制路径；
 - `cxlfork.csv`：每次 restore、leaf attach 和 fallback；
 - `transport.csv`：HydraRPC 消息、bytes 和线程累计时间；
+- `residual.csv`：每次样本两端的 local/global residual 以及逐轮同步次数；
 - `runs/*.coordinator.log`、`runs/*.worker.log`、`runs/*.host.log`：不可丢失的原始记录；
 - `template.log`：CXLfork prepare 与模板 checksum；
 - `final-inspect.log`、`release.log`：reader/checksum/release 证据；
@@ -211,31 +214,42 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 
 | 指标 | mean | P50 | P95 | stddev |
 |---|---:|---:|---:|---:|
-| `elapsed_ms` | 175.799 ms | 176.226 ms | 177.162 ms | 1.339 ms |
-| `job_e2e_ms` | 183.601 ms | 183.416 ms | 186.735 ms | 2.632 ms |
-| `activation_overhead_ms` | 7.801 ms | 7.190 ms | 10.248 ms | 1.837 ms |
-| throughput | 4771.913 MEdges/s | — | — | — |
+| `elapsed_ms` | 179.864 ms | 180.721 ms | 181.321 ms | 1.854 ms |
+| `job_e2e_ms` | 187.627 ms | 188.179 ms | 190.127 ms | 2.364 ms |
+| `activation_overhead_ms` | 7.763 ms | 7.249 ms | 9.132 ms | 1.236 ms |
+| throughput | 4664.263 MEdges/s | — | — | — |
 
 平均 breakdown：
 
-- ARM：3.271 ms；
-- VM0 thread creation：2.578 ms；
-- START publish：0.240 ms；
-- CXLfork restore wrapper：0.0442 ms；
-- kernel restore：0.0256 ms；
+- ARM：3.625 ms；
+- VM0 thread creation：2.733 ms；
+- START publish：0.217 ms；
+- CXLfork restore wrapper：0.0526 ms；
+- kernel restore：0.0326 ms；
 - shared-leaf attach：0.0040 ms；
 - fallback reconstruction：0；
-- HydraRPC receive wait（线程累计）：359.986 ms；
-- 其中纯 HydraRPC UMWAIT（线程累计）：68.099 ms；
+- HydraRPC receive wait（线程累计）：361.831 ms；
+- 其中纯 HydraRPC UMWAIT（线程累计）：72.631 ms；
 - shared leaf：32 个；shared data page：16,384 个。
 
 因此，在已经预建 capsule 的稳态 fast path 中，kernel restore 只占 `job_e2e_ms`
-的约 0.014%，主要可见的非计算 wall time 是线程创建、control
+的约 0.017%，主要可见的非计算 wall time 是线程创建、control
 request/response 和调度尾部，而不是页表恢复。`graph_build_ms` 均值约
-866.025 ms，但它发生在正式 job 计时窗口之前；host 从两条 SSH exec 到进程退出的
-辅助时间均值约 1413.849 ms，二者都不能加到 `elapsed_ms` 中冒充同一层级 breakdown。
+866.165 ms，但它发生在正式 job 计时窗口之前；host 从两条 SSH exec 到进程退出的
+辅助时间均值约 1416.833 ms，二者都不能加到 `elapsed_ms` 中冒充同一层级 breakdown。
 
-正确性/真实性证据：5 次 checksum 全为 1，residual 一致；每次都是 32 个 shared leaf、16,384 个 shared data page、0 个 fallback page；最终 page checksum 一致、reader 为 0、release 成功；两台 guest dmesg 未发现 BUG/Oops/general-protection/panic。
+正确性/真实性证据：5 次 checksum 全为 1；每个样本两端都报告
+`residual_mode=global-per-iteration` 和 `residual_syncs=100`，两端 global residual
+均为 `3.93870320473e-20`，且等于两个 local residual 之和。每次都是32个
+shared leaf、16,384个 shared data page、0个 fallback page；最终 page checksum
+一致、reader为0、release成功；两台 guest dmesg 未发现
+BUG/Oops/general-protection/panic。
+
+逐轮 global residual 复用了原来56字节 barrier 消息的 reserved 空间：只有 thread 0
+携带本 VM 的 local residual，其余线程携带0。因此没有增加跨 VM 往返、消息条数或
+payload 大小；仍为105,600条消息和844,774,400 bytes。与修改前同平台的
+175.799 ms 相比，新 `elapsed_ms` 增加约2.3%。这是一组各5次样本的初步差值，
+可说明语义增强没有数量级代价，但不应把它当作高置信微基准结论。
 
 ## 10. 如何解释与正式 32u 单机数据的关系
 
@@ -249,9 +263,9 @@ request/response 和调度尾部，而不是页表恢复。`graph_build_ms` 均�
 | cohort-cxl | 415.141 ms | 3.752 ms | 2020.826 MEdges/s |
 | cohort | 195.575 ms | 3.763 ms | 4290.757 MEdges/s |
 
-CXLfork+HydraRPC 的对齐后 `elapsed_ms` 为 175.799 ms，比 vm-dram 的
-183.855 ms 快约 4.4%，吞吐高约 4.6%；若把跨 OS ARM、restore、线程创建和结果
-返回计入，`job_e2e_ms` 为 183.601 ms。新数据不再具有旧版 19.3% 的巨大优势，
+CXLfork+HydraRPC 的对齐后 `elapsed_ms` 为179.864 ms，比 vm-dram 的
+183.855 ms 快约2.2%；若把跨 OS ARM、restore、线程创建和结果
+返回计入，`job_e2e_ms` 为187.627 ms，比 vm-dram 的执行区间慢约2.1%。新数据不再具有旧版19.3%的巨大优势，
 说明 machine/CPU/topology/绑核确实显著影响结论；但它仍不能支撑“分布式路径一定
 更慢”，更不能按预期人为调慢或筛选样本。
 
