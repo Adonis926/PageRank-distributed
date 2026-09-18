@@ -120,6 +120,7 @@ install_guest_binary() {
       grep -qw 'cxlfork.cxl_phys=$PR_CXL_PHYS' /proc/cmdline; \
       grep -qw 'cxlfork.cxl_size=$PR_CXL_SIZE' /proc/cmdline; \
       grep -qw '$PR_GUEST_APPEND_EXTRA' /proc/cmdline; \
+      test '$PR_NOTIFY' != umwait || grep -qw waitpkg /proc/cpuinfo; \
       test \"\$(nproc)\" -eq '$PR_VM_SMP'"
   done
 }
@@ -137,7 +138,8 @@ common_args() {
     "--map-size=$PR_MAP_SIZE" \
     "--queue-capacity=$PR_QUEUE_CAPACITY" \
     "--payload-max=$PR_PAYLOAD_MAX" \
-    "--timeout-ms=$PR_TIMEOUT_MS"
+    "--timeout-ms=$PR_TIMEOUT_MS" \
+    "--notify=$PR_NOTIFY"
 }
 
 prepare_template() {
@@ -232,6 +234,7 @@ collect_manifest() {
     printf 'vm0_host_cpus=%s\nvm1_host_cpus=%s\n' \
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
+    printf 'notify=%s\n' "$PR_NOTIFY"
   } >"$RESULT_DIR/manifest/config.txt"
   uname -a >"$RESULT_DIR/manifest/host-uname.txt"
   lscpu >"$RESULT_DIR/manifest/host-lscpu.txt"

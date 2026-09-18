@@ -59,6 +59,7 @@ typedef struct pr_options {
     uint32_t chunks;
     uint32_t threads;
     uint64_t timeout_ms;
+    hydra_notify_mode notify_mode;
     bool checksum;
     pr_cxlfork_options cxlfork;
 } pr_options;
@@ -132,7 +133,9 @@ typedef struct pr_node_result_v1 {
     uint64_t graph_checksum;
     double residual;
     double rank_checksum;
-    uint64_t reserved[8];
+    uint64_t hydra_wait_ns;
+    uint64_t hydra_wait_calls;
+    uint64_t reserved[6];
 } pr_node_result_v1;
 
 typedef struct pr_chunk_v1 {
@@ -156,6 +159,8 @@ typedef struct pr_transport_stats {
     uint64_t payload_bytes_sent;
     uint64_t payload_bytes_received;
     uint64_t send_retries;
+    uint64_t wait_ns;
+    uint64_t wait_calls;
 } pr_transport_stats;
 
 typedef struct pr_node_ctx pr_node_ctx;
@@ -355,9 +360,21 @@ static int open_hydra_retry(hydra_ctx **context, const pr_options *options,
     return err;
 }
 
-static int send_request_poll(hydra_ctx *context, uint64_t req_id,
+static void wait_hydra(hydra_ctx *context, hydra_wait_target target,
+                       hydra_notify_mode mode, pr_transport_stats *stats)
+{
+    uint64_t begin = now_ns();
+    hydra_wait(context, target, mode);
+    if (stats != NULL) {
+        stats->wait_ns += now_ns() - begin;
+        stats->wait_calls++;
+    }
+}
+
+static int send_request_wait(hydra_ctx *context, uint64_t req_id,
                              uint32_t op, const void *payload, uint32_t length,
-                             uint64_t timeout_ms)
+                             uint64_t timeout_ms, hydra_notify_mode notify,
+                             pr_transport_stats *stats)
 {
     uint64_t deadline = now_ns() + timeout_ms * UINT64_C(1000000);
     int err;
@@ -371,15 +388,16 @@ static int send_request_poll(hydra_ctx *context, uint64_t req_id,
         if (err != EAGAIN) {
             return err;
         }
-        hydra_cpu_relax();
+        wait_hydra(context, HYDRA_WAIT_REQUEST_SPACE, notify, stats);
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
 
-static int recv_request_poll(hydra_ctx *context, uint64_t *offset,
+static int recv_request_wait(hydra_ctx *context, uint64_t *offset,
                              const hydra_msg **message,
                              const uint8_t **payload, uint64_t timeout_ms,
-                             uint64_t *wait_ns)
+                             uint64_t *wait_ns, hydra_notify_mode notify,
+                             pr_transport_stats *stats)
 {
     uint64_t begin = now_ns();
     uint64_t deadline = begin + timeout_ms * UINT64_C(1000000);
@@ -396,14 +414,15 @@ static int recv_request_poll(hydra_ctx *context, uint64_t *offset,
         if (err != EAGAIN) {
             return err;
         }
-        hydra_cpu_relax();
+        wait_hydra(context, HYDRA_WAIT_REQUEST, notify, stats);
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
 
-static int recv_response_poll(hydra_ctx *context, uint64_t *offset,
+static int recv_response_wait(hydra_ctx *context, uint64_t *offset,
                               const hydra_msg **message,
-                              const uint8_t **payload, uint64_t timeout_ms)
+                              const uint8_t **payload, uint64_t timeout_ms,
+                              hydra_notify_mode notify)
 {
     uint64_t deadline = now_ns() + timeout_ms * UINT64_C(1000000);
     int err;
@@ -416,14 +435,15 @@ static int recv_response_poll(hydra_ctx *context, uint64_t *offset,
         if (err != EAGAIN) {
             return err;
         }
-        hydra_cpu_relax();
+        wait_hydra(context, HYDRA_WAIT_RESPONSE, notify, NULL);
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
 
-static int send_response_poll(hydra_ctx *context, const hydra_msg *request,
+static int send_response_wait(hydra_ctx *context, const hydra_msg *request,
                               uint32_t status, const void *payload,
-                              uint32_t length, uint64_t timeout_ms)
+                              uint32_t length, uint64_t timeout_ms,
+                              hydra_notify_mode notify)
 {
     uint64_t deadline = now_ns() + timeout_ms * UINT64_C(1000000);
     int err;
@@ -436,7 +456,7 @@ static int send_response_poll(hydra_ctx *context, const hydra_msg *request,
         if (err != EAGAIN) {
             return err;
         }
-        hydra_cpu_relax();
+        wait_hydra(context, HYDRA_WAIT_RESPONSE_SPACE, notify, NULL);
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
@@ -511,7 +531,8 @@ static int send_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
             return err;
         }
         stats->send_retries++;
-        hydra_cpu_relax();
+        wait_hydra(ctx->tx[tid], HYDRA_WAIT_REQUEST_SPACE,
+                   ctx->options.notify_mode, stats);
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
@@ -523,9 +544,10 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
     pr_transport_stats *stats = &ctx->transport[tid];
     const hydra_msg *message;
     const uint8_t *payload;
-    int err = recv_request_poll(ctx->rx[tid], message_offset, &message,
+    int err = recv_request_wait(ctx->rx[tid], message_offset, &message,
                                 &payload, ctx->options.timeout_ms,
-                                &stats->recv_wait_ns);
+                                &stats->recv_wait_ns,
+                                ctx->options.notify_mode, stats);
     if (err != 0) {
         return err;
     }
@@ -563,9 +585,10 @@ static int send_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     uint64_t begin = now_ns();
     uint64_t req_id = ((uint64_t)iteration << 32) |
                       ((uint64_t)tid << 20) | UINT64_C(0xfffff);
-    int err = send_request_poll(ctx->tx[tid], req_id, PR_OP_BARRIER,
+    int err = send_request_wait(ctx->tx[tid], req_id, PR_OP_BARRIER,
                                 &header, sizeof(header),
-                                ctx->options.timeout_ms);
+                                ctx->options.timeout_ms,
+                                ctx->options.notify_mode, stats);
     stats->send_ns += now_ns() - begin;
     if (err == 0) {
         stats->messages_sent++;
@@ -580,9 +603,10 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     const hydra_msg *message;
     const uint8_t *payload;
     uint64_t offset;
-    int err = recv_request_poll(ctx->rx[tid], &offset, &message, &payload,
+    int err = recv_request_wait(ctx->rx[tid], &offset, &message, &payload,
                                 ctx->options.timeout_ms,
-                                &stats->recv_wait_ns);
+                                &stats->recv_wait_ns,
+                                ctx->options.notify_mode, stats);
     if (err != 0) {
         return err;
     }
@@ -815,6 +839,8 @@ static void sum_transport(const pr_node_ctx *ctx, pr_node_result_v1 *result)
         result->payload_bytes_sent += stats->payload_bytes_sent;
         result->payload_bytes_received += stats->payload_bytes_received;
         result->send_retries += stats->send_retries;
+        result->hydra_wait_ns += stats->wait_ns;
+        result->hydra_wait_calls += stats->wait_calls;
     }
 }
 
@@ -952,11 +978,12 @@ static int run_coordinator(const pr_options *options)
         .template_bytes = options->cxlfork.bytes,
     };
     uint64_t job_begin_ns = now_ns();
-    err = send_request_poll(control, ctx.run_id, PR_OP_ARM, &arm,
-                            sizeof(arm), options->timeout_ms);
+    err = send_request_wait(control, ctx.run_id, PR_OP_ARM, &arm,
+                            sizeof(arm), options->timeout_ms,
+                            options->notify_mode, NULL);
     if (err == 0) {
-        err = recv_response_poll(control, &offset, &message, &payload,
-                                 options->timeout_ms);
+        err = recv_response_wait(control, &offset, &message, &payload,
+                                 options->timeout_ms, options->notify_mode);
     }
     pr_arm_result_v1 remote_arm;
     if (err == 0 && (message->status != 0 ||
@@ -998,8 +1025,9 @@ static int run_coordinator(const pr_options *options)
         .run_id = ctx.run_id,
     };
     uint64_t start_publish_begin = now_ns();
-    err = send_request_poll(control, ctx.run_id + 1, PR_OP_START, &start,
-                            sizeof(start), options->timeout_ms);
+    err = send_request_wait(control, ctx.run_id + 1, PR_OP_START, &start,
+                            sizeof(start), options->timeout_ms,
+                            options->notify_mode, NULL);
     uint64_t start_publish_ns = now_ns() - start_publish_begin;
     atomic_store_explicit(&ctx.start_gate, true, memory_order_release);
     int local_join_error = node_join_compute(&ctx);
@@ -1007,8 +1035,8 @@ static int run_coordinator(const pr_options *options)
         err = local_join_error;
     }
     if (err == 0) {
-        err = recv_response_poll(control, &offset, &message, &payload,
-                                 options->timeout_ms);
+        err = recv_response_wait(control, &offset, &message, &payload,
+                                 options->timeout_ms, options->notify_mode);
     }
     pr_node_result_v1 remote_result;
     if (err == 0 && (message->status != 0 ||
@@ -1049,10 +1077,15 @@ static int run_coordinator(const pr_options *options)
                                   remote_result.hydra_recv_wait_ns;
     uint64_t hydra_release_ns = local_result.hydra_release_ns +
                                 remote_result.hydra_release_ns;
+    uint64_t hydra_wait_ns = local_result.hydra_wait_ns +
+                             remote_result.hydra_wait_ns;
+    uint64_t hydra_wait_calls = local_result.hydra_wait_calls +
+                                remote_result.hydra_wait_calls;
     double edges = 2.0 * options->vertices * options->degree *
                    options->iterations;
 
-    printf("pr_run_v1 status=ok backend=%s state=%s run_id=%" PRIu64
+    printf("pr_run_v1 status=ok backend=%s state=%s notify=%s"
+           " effective_notify=%s run_id=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
            " iterations=%u chunks=%u threads_per_node=%u total_threads=%u"
            " elapsed_ms=%.3f medges_per_sec=%.3f job_e2e_ms=%.3f"
@@ -1063,11 +1096,15 @@ static int run_coordinator(const pr_options *options)
            " restore_fallback_ms=%.3f shared_leaf_count=%" PRIu64
            " shared_data_pages=%" PRIu64 " fallback_pages=%" PRIu64
            " hydra_send_cpu_sum_ms=%.3f hydra_recv_wait_sum_ms=%.3f"
-           " hydra_release_sum_ms=%.3f messages=%" PRIu64
+           " hydra_release_sum_ms=%.3f hydra_wait_cpu_sum_ms=%.3f"
+           " hydra_wait_calls=%" PRIu64 " messages=%" PRIu64
            " payload_bytes=%" PRIu64 " residual=%.12g checksum=%.12g"
            " node0_graph_checksum=%" PRIu64
            " node1_graph_checksum=%" PRIu64 " verify=ok\n",
            backend_name(options->backend), state_name(options->state_mode),
+           hydra_notify_mode_name(options->notify_mode),
+           hydra_notify_mode_name(
+               hydra_effective_notify_mode(options->notify_mode)),
            ctx.run_id, 2 * options->vertices, options->degree,
            options->remote_degree, options->iterations, options->chunks,
            options->threads, options->threads * 2,
@@ -1083,6 +1120,7 @@ static int run_coordinator(const pr_options *options)
            remote_arm.shared_leaf_count, remote_arm.shared_data_pages,
            remote_arm.fallback_pages, hydra_send_ns / 1e6,
            hydra_recv_wait_ns / 1e6, hydra_release_ns / 1e6,
+           hydra_wait_ns / 1e6, hydra_wait_calls,
            messages, bytes, residual, rank_checksum,
            local_result.graph_checksum, remote_result.graph_checksum);
 
@@ -1148,8 +1186,9 @@ static int run_worker(const pr_options *options)
         return 1;
     }
 
-    err = recv_request_poll(control, &offset, &message, &payload,
-                            options->timeout_ms, NULL);
+    err = recv_request_wait(control, &offset, &message, &payload,
+                            options->timeout_ms, NULL,
+                            options->notify_mode, NULL);
     pr_arm_v1 arm;
     if (err == 0) {
         err = validate_arm(options, message, payload, &arm);
@@ -1206,11 +1245,10 @@ static int run_worker(const pr_options *options)
         .shared_data_pages = cxlfork.result.shared_data_pages,
         .fallback_pages = cxlfork.result.fallback_pages,
     };
-    int response_error = send_response_poll(control, message,
-                                             err == 0 ? 0U : (uint32_t)err,
-                                             &arm_result,
-                                             sizeof(arm_result),
-                                             options->timeout_ms);
+    int response_error = send_response_wait(
+        control, message, err == 0 ? 0U : (uint32_t)err,
+        &arm_result, sizeof(arm_result), options->timeout_ms,
+        options->notify_mode);
     err = release_control_message(control, offset,
                                   err != 0 ? err : response_error);
     if (err != 0) {
@@ -1222,8 +1260,9 @@ static int run_worker(const pr_options *options)
         return 1;
     }
 
-    err = recv_request_poll(control, &offset, &message, &payload,
-                            options->timeout_ms, NULL);
+    err = recv_request_wait(control, &offset, &message, &payload,
+                            options->timeout_ms, NULL,
+                            options->notify_mode, NULL);
     bool have_start_request = err == 0;
     if (err == 0) {
         if (message->op != PR_OP_START ||
@@ -1259,10 +1298,10 @@ static int run_worker(const pr_options *options)
     pr_node_result_v1 result;
     fill_node_result(&ctx, &result);
     if (have_start_request) {
-        response_error = send_response_poll(control, &start_request,
-                                            err == 0 ? 0U : (uint32_t)err,
-                                            &result, sizeof(result),
-                                            options->timeout_ms);
+        response_error = send_response_wait(
+            control, &start_request, err == 0 ? 0U : (uint32_t)err,
+            &result, sizeof(result), options->timeout_ms,
+            options->notify_mode);
         err = release_control_message(control, offset,
                                       err != 0 ? err : response_error);
     }
@@ -1365,6 +1404,7 @@ static void usage(const char *program)
             "  --vertices-per-node=N --degree=N --remote-degree=N\n"
             "  --iterations=N --chunks=N --threads=N --cpus=LIST\n"
             "  --state=local|cxlfork --checksum=on|off --timeout-ms=N\n"
+            "  --notify=umwait|busy\n"
             "  --map-size=N --queue-capacity=N --payload-max=N\n"
             "  --key=N --generation=N --page-checksum=N\n"
             "  --template-base=N --template-bytes=N --full-validate\n",
@@ -1386,6 +1426,7 @@ static void default_options(pr_options *options)
     options->chunks = 32;
     options->threads = 16;
     options->timeout_ms = 120000;
+    options->notify_mode = HYDRA_NOTIFY_UMWAIT;
     options->cxlfork.base = PR_TEMPLATE_BASE_DEFAULT;
     options->cxlfork.bytes = PR_TEMPLATE_BYTES_DEFAULT;
 }
@@ -1442,6 +1483,14 @@ static int parse_options(int argc, char **argv, pr_options *options)
             options->threads = (uint32_t)parse_u64(value, "threads");
         } else if (option_value(arg, "--timeout-ms=", &value)) {
             options->timeout_ms = parse_u64(value, "timeout");
+        } else if (option_value(arg, "--notify=", &value)) {
+            if (strcmp(value, "umwait") == 0) {
+                options->notify_mode = HYDRA_NOTIFY_UMWAIT;
+            } else if (strcmp(value, "busy") == 0) {
+                options->notify_mode = HYDRA_NOTIFY_BUSY;
+            } else {
+                return EINVAL;
+            }
         } else if (option_value(arg, "--checksum=", &value)) {
             if (strcmp(value, "on") == 0) {
                 options->checksum = true;
@@ -1497,6 +1546,12 @@ int main(int argc, char **argv)
     if (err != 0) {
         usage(argv[0]);
         return 2;
+    }
+    if (options.notify_mode == HYDRA_NOTIFY_UMWAIT &&
+        hydra_effective_notify_mode(options.notify_mode) !=
+            HYDRA_NOTIFY_UMWAIT) {
+        fprintf(stderr, "HydraRPC umwait requested but WAITPKG is unavailable\n");
+        return 1;
     }
     if (strcmp(argv[1], "graph-check") == 0) {
         return run_graph_check(&options);
