@@ -56,7 +56,9 @@ install_guest_binary() {
     vm_scp "$port" "$PR_BINARY" ubuntu@127.0.0.1:"$PR_GUEST_BINARY" >/dev/null
     vm_ssh "$port" "chmod 755 '$PR_GUEST_BINARY'; \
       sudo test -e /dev/cxlfork; sudo test -r '$PR_ENDPOINT0'; \
-      sudo test -r '$PR_ENDPOINT1'"
+      sudo test -r '$PR_ENDPOINT1'; \
+      grep -qw 'cxlfork.cxl_phys=$PR_CXL_PHYS' /proc/cmdline; \
+      grep -qw 'cxlfork.cxl_size=$PR_CXL_SIZE' /proc/cmdline"
   done
 }
 
@@ -155,6 +157,8 @@ collect_manifest() {
     printf 'iterations=%s\nchunks=%s\nthreads_per_node=%s\n' \
       "$PR_ITERATIONS" "$PR_CHUNKS" "$PR_THREADS"
     printf 'guest_memory=%s\nguest_vcpus=%s\n' "$PR_VM_MEM" "$PR_VM_SMP"
+    printf 'cxlfork_guest_phys=%s\ncxlfork_guest_size=%s\n' \
+      "$PR_CXL_PHYS" "$PR_CXL_SIZE"
     printf 'vm0_host_cpus=%s\nvm1_host_cpus=%s\n' \
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
