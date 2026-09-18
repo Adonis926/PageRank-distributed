@@ -42,3 +42,24 @@ else()
 endif()
 target_link_libraries(mr_hydra PRIVATE hydrarpc Threads::Threads)
 target_compile_options(mr_hydra PRIVATE -Wall -Wextra -Wpedantic)
+
+# PageRank is intentionally a separate executable.  It shares the audited
+# HydraRPC and restricted CXLfork wrappers, but none of the old MapReduce
+# task/file-shuffle lifecycle is on its measured path.
+add_executable(pagerank_hydra
+  pagerank/pagerank_hydra.c
+  pagerank/pr_cxlfork.c
+  pagerank/pr_graph.c
+  src/mr_cxlfork.c
+  src/mr_util.c
+)
+target_include_directories(pagerank_hydra PRIVATE include src pagerank)
+if(MR_ENABLE_CXLFORK)
+  target_include_directories(pagerank_hydra SYSTEM PRIVATE
+    "${CXLFORK_UAPI_INCLUDE_DIR}")
+  target_compile_definitions(pagerank_hydra PRIVATE MR_ENABLE_CXLFORK=1)
+else()
+  target_compile_definitions(pagerank_hydra PRIVATE MR_ENABLE_CXLFORK=0)
+endif()
+target_link_libraries(pagerank_hydra PRIVATE hydrarpc Threads::Threads m)
+target_compile_options(pagerank_hydra PRIVATE -O3 -Wall -Wextra -Wpedantic)
