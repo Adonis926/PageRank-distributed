@@ -50,12 +50,10 @@ add_executable(pagerank_hydra
   pagerank/pagerank_hydra.c
   pagerank/pr_cxlfork.c
   pagerank/pr_graph.c
-  "${HYDRARPC_ROOT}/tools/notify_channel.c"
   src/mr_cxlfork.c
   src/mr_util.c
 )
-target_include_directories(pagerank_hydra PRIVATE include src pagerank
-  "${HYDRARPC_ROOT}/tools")
+target_include_directories(pagerank_hydra PRIVATE include src pagerank)
 if(MR_ENABLE_CXLFORK)
   target_include_directories(pagerank_hydra SYSTEM PRIVATE
     "${CXLFORK_UAPI_INCLUDE_DIR}")

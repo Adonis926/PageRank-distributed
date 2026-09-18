@@ -4,7 +4,6 @@
 #include "pr_graph.h"
 
 #include "hydra/hydra.h"
-#include "notify_channel.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -60,10 +59,6 @@ typedef struct pr_options {
     uint32_t chunks;
     uint32_t threads;
     uint64_t timeout_ms;
-    common_notify_channel_mode notify_mode;
-    const char *notify_host;
-    const char *notify_bind_host;
-    uint16_t notify_port_base;
     bool checksum;
     pr_cxlfork_options cxlfork;
 } pr_options;
@@ -137,12 +132,7 @@ typedef struct pr_node_result_v1 {
     uint64_t graph_checksum;
     double residual;
     double rank_checksum;
-    uint64_t notify_signal_ns;
-    uint64_t notify_wait_ns;
-    uint64_t notify_signal_count;
-    uint64_t notify_wait_count;
-    uint64_t notify_spurious_count;
-    uint64_t reserved[3];
+    uint64_t reserved[8];
 } pr_node_result_v1;
 
 typedef struct pr_chunk_v1 {
@@ -166,11 +156,6 @@ typedef struct pr_transport_stats {
     uint64_t payload_bytes_sent;
     uint64_t payload_bytes_received;
     uint64_t send_retries;
-    uint64_t notify_signal_ns;
-    uint64_t notify_wait_ns;
-    uint64_t notify_signal_count;
-    uint64_t notify_wait_count;
-    uint64_t notify_spurious_count;
 } pr_transport_stats;
 
 typedef struct pr_node_ctx pr_node_ctx;
@@ -186,7 +171,6 @@ struct pr_node_ctx {
     pr_graph graph;
     hydra_ctx *tx[PR_MAX_THREADS];
     hydra_ctx *rx[PR_MAX_THREADS];
-    notify_channel *notify[PR_MAX_THREADS];
     pthread_t worker[PR_MAX_THREADS];
     pr_worker_arg worker_arg[PR_MAX_THREADS];
     pthread_barrier_t barrier;
@@ -254,7 +238,7 @@ static uint64_t option_value(const char *arg, const char *prefix,
     return 1;
 }
 
-static const char *pr_backend_name(pr_backend backend)
+static const char *backend_name(pr_backend backend)
 {
     switch (backend) {
     case PR_BACKEND_FILE:
@@ -371,68 +355,18 @@ static int open_hydra_retry(hydra_ctx **context, const pr_options *options,
     return err;
 }
 
-static int open_notify(notify_channel **channel, const pr_options *options,
-                       uint64_t connection_id, bool server)
-{
-    notify_channel_config config = {
-        .mode = options->notify_mode,
-        .role = server ? "server" : "client",
-        .conn_id = connection_id,
-        .create = server,
-        .tcp_host = options->notify_host,
-        .tcp_bind_host = options->notify_bind_host,
-        .tcp_port_base = options->notify_port_base,
-    };
-
-    return notify_channel_open(channel, &config);
-}
-
-static int notify_signal_timed(notify_channel *channel,
-                               hydra_wait_target target,
-                               pr_transport_stats *stats)
-{
-    uint64_t begin = now_ns();
-    int err = notify_channel_signal(channel, target);
-    if (stats != NULL) {
-        stats->notify_signal_ns += now_ns() - begin;
-        stats->notify_signal_count++;
-    }
-    return err;
-}
-
-static int notify_wait_timed(notify_channel *channel,
-                             hydra_wait_target target,
-                             pr_transport_stats *stats)
-{
-    uint64_t begin = now_ns();
-    int err = notify_channel_wait(channel, target);
-    atomic_thread_fence(memory_order_acquire);
-    if (stats != NULL) {
-        stats->notify_wait_ns += now_ns() - begin;
-        stats->notify_wait_count++;
-    }
-    return err;
-}
-
-static int send_request_notified(hydra_ctx *context, notify_channel *notify,
-                                 uint64_t req_id, uint32_t op,
-                                 const void *payload, uint32_t length,
-                                 uint64_t timeout_ms,
-                                 pr_transport_stats *stats)
+static int send_request_poll(hydra_ctx *context, uint64_t req_id,
+                             uint32_t op, const void *payload, uint32_t length,
+                             uint64_t timeout_ms)
 {
     uint64_t deadline = now_ns() + timeout_ms * UINT64_C(1000000);
-    uint64_t begin = now_ns();
     int err;
 
     do {
         err = hydra_send_request(context, req_id, op, payload, length,
                                  now_ns());
         if (err == 0) {
-            if (stats != NULL) {
-                stats->send_ns += now_ns() - begin;
-            }
-            atomic_thread_fence(memory_order_release);
-            return notify_signal_timed(notify, HYDRA_WAIT_REQUEST, stats);
+            return 0;
         }
         if (err != EAGAIN) {
             return err;
@@ -442,22 +376,15 @@ static int send_request_notified(hydra_ctx *context, notify_channel *notify,
     return ETIMEDOUT;
 }
 
-static int recv_request_notified(hydra_ctx *context, notify_channel *notify,
-                                 uint64_t *offset, const hydra_msg **message,
-                                 const uint8_t **payload, uint64_t timeout_ms,
-                                 uint64_t *wait_ns,
-                                 pr_transport_stats *stats)
+static int recv_request_poll(hydra_ctx *context, uint64_t *offset,
+                             const hydra_msg **message,
+                             const uint8_t **payload, uint64_t timeout_ms,
+                             uint64_t *wait_ns)
 {
     uint64_t begin = now_ns();
     uint64_t deadline = begin + timeout_ms * UINT64_C(1000000);
     int err;
 
-    if (notify != NULL) {
-        err = notify_wait_timed(notify, HYDRA_WAIT_REQUEST, stats);
-        if (err != 0) {
-            return err;
-        }
-    }
     do {
         err = hydra_recv_request(context, offset, message, payload);
         if (err == 0) {
@@ -469,36 +396,18 @@ static int recv_request_notified(hydra_ctx *context, notify_channel *notify,
         if (err != EAGAIN) {
             return err;
         }
-        if (notify != NULL) {
-            if (stats != NULL) {
-                stats->notify_spurious_count++;
-            }
-            err = notify_wait_timed(notify, HYDRA_WAIT_REQUEST, stats);
-            if (err != 0) {
-                return err;
-            }
-        } else {
-            hydra_cpu_relax();
-        }
+        hydra_cpu_relax();
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
 
-static int recv_response_notified(hydra_ctx *context, notify_channel *notify,
-                                  uint64_t *offset,
-                                  const hydra_msg **message,
-                                  const uint8_t **payload,
-                                  uint64_t timeout_ms)
+static int recv_response_poll(hydra_ctx *context, uint64_t *offset,
+                              const hydra_msg **message,
+                              const uint8_t **payload, uint64_t timeout_ms)
 {
     uint64_t deadline = now_ns() + timeout_ms * UINT64_C(1000000);
     int err;
 
-    if (notify != NULL) {
-        err = notify_wait_timed(notify, HYDRA_WAIT_RESPONSE, NULL);
-        if (err != 0) {
-            return err;
-        }
-    }
     do {
         err = hydra_recv_response(context, offset, message, payload);
         if (err == 0) {
@@ -507,22 +416,14 @@ static int recv_response_notified(hydra_ctx *context, notify_channel *notify,
         if (err != EAGAIN) {
             return err;
         }
-        if (notify != NULL) {
-            err = notify_wait_timed(notify, HYDRA_WAIT_RESPONSE, NULL);
-            if (err != 0) {
-                return err;
-            }
-        } else {
-            hydra_cpu_relax();
-        }
+        hydra_cpu_relax();
     } while (now_ns() < deadline);
     return ETIMEDOUT;
 }
 
-static int send_response_notified(hydra_ctx *context, notify_channel *notify,
-                                  const hydra_msg *request, uint32_t status,
-                                  const void *payload, uint32_t length,
-                                  uint64_t timeout_ms)
+static int send_response_poll(hydra_ctx *context, const hydra_msg *request,
+                              uint32_t status, const void *payload,
+                              uint32_t length, uint64_t timeout_ms)
 {
     uint64_t deadline = now_ns() + timeout_ms * UINT64_C(1000000);
     int err;
@@ -530,8 +431,7 @@ static int send_response_notified(hydra_ctx *context, notify_channel *notify,
     do {
         err = hydra_send_response(context, request, status, payload, length);
         if (err == 0) {
-            atomic_thread_fence(memory_order_release);
-            return notify_signal_timed(notify, HYDRA_WAIT_RESPONSE, NULL);
+            return 0;
         }
         if (err != EAGAIN) {
             return err;
@@ -605,9 +505,7 @@ static int send_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
             stats->send_ns += now_ns() - begin;
             stats->messages_sent++;
             stats->payload_bytes_sent += length64;
-            atomic_thread_fence(memory_order_release);
-            return notify_signal_timed(ctx->notify[tid],
-                                       HYDRA_WAIT_REQUEST, stats);
+            return 0;
         }
         if (err != EAGAIN) {
             return err;
@@ -625,10 +523,9 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
     pr_transport_stats *stats = &ctx->transport[tid];
     const hydra_msg *message;
     const uint8_t *payload;
-    int err = recv_request_notified(ctx->rx[tid], ctx->notify[tid],
-                                    message_offset, &message, &payload,
-                                    ctx->options.timeout_ms,
-                                    &stats->recv_wait_ns, stats);
+    int err = recv_request_poll(ctx->rx[tid], message_offset, &message,
+                                &payload, ctx->options.timeout_ms,
+                                &stats->recv_wait_ns);
     if (err != 0) {
         return err;
     }
@@ -663,11 +560,13 @@ static int send_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
         .value_count = 0,
     };
     pr_transport_stats *stats = &ctx->transport[tid];
+    uint64_t begin = now_ns();
     uint64_t req_id = ((uint64_t)iteration << 32) |
                       ((uint64_t)tid << 20) | UINT64_C(0xfffff);
-    int err = send_request_notified(ctx->tx[tid], ctx->notify[tid], req_id,
-                                    PR_OP_BARRIER, &header, sizeof(header),
-                                    ctx->options.timeout_ms, stats);
+    int err = send_request_poll(ctx->tx[tid], req_id, PR_OP_BARRIER,
+                                &header, sizeof(header),
+                                ctx->options.timeout_ms);
+    stats->send_ns += now_ns() - begin;
     if (err == 0) {
         stats->messages_sent++;
         stats->payload_bytes_sent += sizeof(header);
@@ -681,10 +580,9 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     const hydra_msg *message;
     const uint8_t *payload;
     uint64_t offset;
-    int err = recv_request_notified(ctx->rx[tid], ctx->notify[tid], &offset,
-                                    &message, &payload,
-                                    ctx->options.timeout_ms,
-                                    &stats->recv_wait_ns, stats);
+    int err = recv_request_poll(ctx->rx[tid], &offset, &message, &payload,
+                                ctx->options.timeout_ms,
+                                &stats->recv_wait_ns);
     if (err != 0) {
         return err;
     }
@@ -917,11 +815,6 @@ static void sum_transport(const pr_node_ctx *ctx, pr_node_result_v1 *result)
         result->payload_bytes_sent += stats->payload_bytes_sent;
         result->payload_bytes_received += stats->payload_bytes_received;
         result->send_retries += stats->send_retries;
-        result->notify_signal_ns += stats->notify_signal_ns;
-        result->notify_wait_ns += stats->notify_wait_ns;
-        result->notify_signal_count += stats->notify_signal_count;
-        result->notify_wait_count += stats->notify_wait_count;
-        result->notify_spurious_count += stats->notify_spurious_count;
     }
 }
 
@@ -975,24 +868,11 @@ static int node_open_data_contexts(pr_node_ctx *ctx, bool create)
     return 0;
 }
 
-static int node_open_notify_channels(pr_node_ctx *ctx, bool server)
-{
-    for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
-        int err = open_notify(&ctx->notify[tid], &ctx->options,
-                              (uint64_t)tid + 1, server);
-        if (err != 0) {
-            return err;
-        }
-    }
-    return 0;
-}
-
 static void node_close(pr_node_ctx *ctx)
 {
     uint64_t rank_bytes = ctx->options.vertices * sizeof(double);
 
     for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
-        notify_channel_close(ctx->notify[tid]);
         hydra_close(ctx->tx[tid]);
         hydra_close(ctx->rx[tid]);
     }
@@ -1019,7 +899,6 @@ static int run_coordinator(const pr_options *options)
     pr_node_ctx ctx = {.node = 0, .options = *options};
     hydra_ctx *control = NULL;
     hydra_ctx *reverse_control = NULL;
-    notify_channel *control_notify = NULL;
     const hydra_msg *message;
     const uint8_t *payload;
     uint64_t offset;
@@ -1046,15 +925,8 @@ static int run_coordinator(const pr_options *options)
         ctx.graph_checksum = pr_graph_checksum(&ctx.graph);
     }
     uint64_t graph_build_ns = now_ns() - build_begin;
-    if (err == 0) {
-        err = open_notify(&control_notify, options, 0, false);
-    }
-    if (err == 0) {
-        err = node_open_notify_channels(&ctx, false);
-    }
     if (err != 0) {
         print_error("coordinator setup", err);
-        notify_channel_close(control_notify);
         hydra_close(control);
         hydra_close(reverse_control);
         node_close(&ctx);
@@ -1080,13 +952,11 @@ static int run_coordinator(const pr_options *options)
         .template_bytes = options->cxlfork.bytes,
     };
     uint64_t job_begin_ns = now_ns();
-    err = send_request_notified(control, control_notify, ctx.run_id,
-                                PR_OP_ARM, &arm, sizeof(arm),
-                                options->timeout_ms, NULL);
+    err = send_request_poll(control, ctx.run_id, PR_OP_ARM, &arm,
+                            sizeof(arm), options->timeout_ms);
     if (err == 0) {
-        err = recv_response_notified(control, control_notify, &offset,
-                                     &message, &payload,
-                                     options->timeout_ms);
+        err = recv_response_poll(control, &offset, &message, &payload,
+                                 options->timeout_ms);
     }
     pr_arm_result_v1 remote_arm;
     if (err == 0 && (message->status != 0 ||
@@ -1105,7 +975,6 @@ static int run_coordinator(const pr_options *options)
     }
     if (err != 0) {
         print_error("ARM worker", err);
-        notify_channel_close(control_notify);
         hydra_close(control);
         hydra_close(reverse_control);
         node_close(&ctx);
@@ -1117,7 +986,6 @@ static int run_coordinator(const pr_options *options)
     uint64_t local_thread_create_ns = now_ns() - local_thread_begin;
     if (err != 0) {
         print_error("create coordinator threads", err);
-        notify_channel_close(control_notify);
         hydra_close(control);
         hydra_close(reverse_control);
         node_close(&ctx);
@@ -1130,9 +998,8 @@ static int run_coordinator(const pr_options *options)
         .run_id = ctx.run_id,
     };
     uint64_t start_publish_begin = now_ns();
-    err = send_request_notified(control, control_notify, ctx.run_id + 1,
-                                PR_OP_START, &start, sizeof(start),
-                                options->timeout_ms, NULL);
+    err = send_request_poll(control, ctx.run_id + 1, PR_OP_START, &start,
+                            sizeof(start), options->timeout_ms);
     uint64_t start_publish_ns = now_ns() - start_publish_begin;
     atomic_store_explicit(&ctx.start_gate, true, memory_order_release);
     int local_join_error = node_join_compute(&ctx);
@@ -1140,9 +1007,8 @@ static int run_coordinator(const pr_options *options)
         err = local_join_error;
     }
     if (err == 0) {
-        err = recv_response_notified(control, control_notify, &offset,
-                                     &message, &payload,
-                                     options->timeout_ms);
+        err = recv_response_poll(control, &offset, &message, &payload,
+                                 options->timeout_ms);
     }
     pr_node_result_v1 remote_result;
     if (err == 0 && (message->status != 0 ||
@@ -1159,7 +1025,6 @@ static int run_coordinator(const pr_options *options)
     uint64_t job_end_ns = now_ns();
     if (err != 0) {
         print_error("execute distributed PageRank", err);
-        notify_channel_close(control_notify);
         hydra_close(control);
         hydra_close(reverse_control);
         node_close(&ctx);
@@ -1184,20 +1049,10 @@ static int run_coordinator(const pr_options *options)
                                   remote_result.hydra_recv_wait_ns;
     uint64_t hydra_release_ns = local_result.hydra_release_ns +
                                 remote_result.hydra_release_ns;
-    uint64_t notify_signal_ns = local_result.notify_signal_ns +
-                                remote_result.notify_signal_ns;
-    uint64_t notify_wait_ns = local_result.notify_wait_ns +
-                              remote_result.notify_wait_ns;
-    uint64_t notify_signal_count = local_result.notify_signal_count +
-                                   remote_result.notify_signal_count;
-    uint64_t notify_wait_count = local_result.notify_wait_count +
-                                 remote_result.notify_wait_count;
-    uint64_t notify_spurious_count = local_result.notify_spurious_count +
-                                     remote_result.notify_spurious_count;
     double edges = 2.0 * options->vertices * options->degree *
                    options->iterations;
 
-    printf("pr_run_v1 status=ok backend=%s state=%s notify=%s run_id=%" PRIu64
+    printf("pr_run_v1 status=ok backend=%s state=%s run_id=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
            " iterations=%u chunks=%u threads_per_node=%u total_threads=%u"
            " elapsed_ms=%.3f medges_per_sec=%.3f job_e2e_ms=%.3f"
@@ -1208,16 +1063,12 @@ static int run_coordinator(const pr_options *options)
            " restore_fallback_ms=%.3f shared_leaf_count=%" PRIu64
            " shared_data_pages=%" PRIu64 " fallback_pages=%" PRIu64
            " hydra_send_cpu_sum_ms=%.3f hydra_recv_wait_sum_ms=%.3f"
-           " hydra_release_sum_ms=%.3f notify_signal_cpu_sum_ms=%.3f"
-           " notify_wait_cpu_sum_ms=%.3f notify_signals=%" PRIu64
-           " notify_waits=%" PRIu64 " notify_spurious=%" PRIu64
-           " messages=%" PRIu64
+           " hydra_release_sum_ms=%.3f messages=%" PRIu64
            " payload_bytes=%" PRIu64 " residual=%.12g checksum=%.12g"
            " node0_graph_checksum=%" PRIu64
            " node1_graph_checksum=%" PRIu64 " verify=ok\n",
-           pr_backend_name(options->backend), state_name(options->state_mode),
-           notify_channel_mode_name(options->notify_mode), ctx.run_id,
-           2 * options->vertices, options->degree,
+           backend_name(options->backend), state_name(options->state_mode),
+           ctx.run_id, 2 * options->vertices, options->degree,
            options->remote_degree, options->iterations, options->chunks,
            options->threads, options->threads * 2,
            elapsed_ns / 1e6, edges / (elapsed_ns / 1e9) / 1e6,
@@ -1232,12 +1083,9 @@ static int run_coordinator(const pr_options *options)
            remote_arm.shared_leaf_count, remote_arm.shared_data_pages,
            remote_arm.fallback_pages, hydra_send_ns / 1e6,
            hydra_recv_wait_ns / 1e6, hydra_release_ns / 1e6,
-           notify_signal_ns / 1e6, notify_wait_ns / 1e6,
-           notify_signal_count, notify_wait_count, notify_spurious_count,
            messages, bytes, residual, rank_checksum,
            local_result.graph_checksum, remote_result.graph_checksum);
 
-    notify_channel_close(control_notify);
     hydra_close(control);
     hydra_close(reverse_control);
     node_close(&ctx);
@@ -1277,7 +1125,6 @@ static int run_worker(const pr_options *options)
     pr_cxlfork_handle cxlfork = {0};
     hydra_ctx *control = NULL;
     hydra_ctx *reverse_control = NULL;
-    notify_channel *control_notify = NULL;
     const hydra_msg *message;
     const uint8_t *payload;
     uint64_t offset;
@@ -1290,26 +1137,19 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         err = node_open_data_contexts(&ctx, false);
     }
-    if (err == 0) {
-        err = open_notify(&control_notify, options, 0, true);
-    }
-    if (err == 0) {
-        err = node_open_notify_channels(&ctx, true);
-    }
     if (err == 0 && options->state_mode == PR_STATE_CXLFORK) {
         err = pr_cxlfork_context_open(&options->cxlfork, &cxlfork);
     }
     if (err != 0) {
         print_error("worker preopen", err);
-        notify_channel_close(control_notify);
         hydra_close(control);
         hydra_close(reverse_control);
         node_close(&ctx);
         return 1;
     }
 
-    err = recv_request_notified(control, control_notify, &offset, &message,
-                                &payload, options->timeout_ms, NULL, NULL);
+    err = recv_request_poll(control, &offset, &message, &payload,
+                            options->timeout_ms, NULL);
     pr_arm_v1 arm;
     if (err == 0) {
         err = validate_arm(options, message, payload, &arm);
@@ -1366,15 +1206,15 @@ static int run_worker(const pr_options *options)
         .shared_data_pages = cxlfork.result.shared_data_pages,
         .fallback_pages = cxlfork.result.fallback_pages,
     };
-    int response_error = send_response_notified(
-        control, control_notify, message,
-        err == 0 ? 0U : (uint32_t)err,
-        &arm_result, sizeof(arm_result), options->timeout_ms);
+    int response_error = send_response_poll(control, message,
+                                             err == 0 ? 0U : (uint32_t)err,
+                                             &arm_result,
+                                             sizeof(arm_result),
+                                             options->timeout_ms);
     err = release_control_message(control, offset,
                                   err != 0 ? err : response_error);
     if (err != 0) {
         print_error("worker ARM", err);
-        notify_channel_close(control_notify);
         pr_cxlfork_close(&cxlfork);
         hydra_close(control);
         hydra_close(reverse_control);
@@ -1382,8 +1222,8 @@ static int run_worker(const pr_options *options)
         return 1;
     }
 
-    err = recv_request_notified(control, control_notify, &offset, &message,
-                                &payload, options->timeout_ms, NULL, NULL);
+    err = recv_request_poll(control, &offset, &message, &payload,
+                            options->timeout_ms, NULL);
     bool have_start_request = err == 0;
     if (err == 0) {
         if (message->op != PR_OP_START ||
@@ -1419,10 +1259,10 @@ static int run_worker(const pr_options *options)
     pr_node_result_v1 result;
     fill_node_result(&ctx, &result);
     if (have_start_request) {
-        response_error = send_response_notified(
-            control, control_notify, &start_request,
-            err == 0 ? 0U : (uint32_t)err,
-            &result, sizeof(result), options->timeout_ms);
+        response_error = send_response_poll(control, &start_request,
+                                            err == 0 ? 0U : (uint32_t)err,
+                                            &result, sizeof(result),
+                                            options->timeout_ms);
         err = release_control_message(control, offset,
                                       err != 0 ? err : response_error);
     }
@@ -1437,7 +1277,6 @@ static int run_worker(const pr_options *options)
         print_error("worker execution", err);
     }
     pr_cxlfork_close(&cxlfork);
-    notify_channel_close(control_notify);
     hydra_close(control);
     hydra_close(reverse_control);
     node_close(&ctx);
@@ -1526,8 +1365,6 @@ static void usage(const char *program)
             "  --vertices-per-node=N --degree=N --remote-degree=N\n"
             "  --iterations=N --chunks=N --threads=N --cpus=LIST\n"
             "  --state=local|cxlfork --checksum=on|off --timeout-ms=N\n"
-            "  --notify-channel=tcp|poll --notify-host=IPv4\n"
-            "  --notify-bind-host=IPv4 --notify-port-base=N\n"
             "  --map-size=N --queue-capacity=N --payload-max=N\n"
             "  --key=N --generation=N --page-checksum=N\n"
             "  --template-base=N --template-bytes=N --full-validate\n",
@@ -1549,10 +1386,6 @@ static void default_options(pr_options *options)
     options->chunks = 32;
     options->threads = 16;
     options->timeout_ms = 120000;
-    options->notify_mode = COMMON_NOTIFY_CHANNEL_POLL;
-    options->notify_host = "127.0.0.1";
-    options->notify_bind_host = "0.0.0.0";
-    options->notify_port_base = 17500;
     options->cxlfork.base = PR_TEMPLATE_BASE_DEFAULT;
     options->cxlfork.bytes = PR_TEMPLATE_BYTES_DEFAULT;
 }
@@ -1609,24 +1442,6 @@ static int parse_options(int argc, char **argv, pr_options *options)
             options->threads = (uint32_t)parse_u64(value, "threads");
         } else if (option_value(arg, "--timeout-ms=", &value)) {
             options->timeout_ms = parse_u64(value, "timeout");
-        } else if (option_value(arg, "--notify-channel=", &value)) {
-            if (strcmp(value, "tcp") == 0) {
-                options->notify_mode = COMMON_NOTIFY_CHANNEL_TCP;
-            } else if (strcmp(value, "poll") == 0) {
-                options->notify_mode = COMMON_NOTIFY_CHANNEL_POLL;
-            } else {
-                return EINVAL;
-            }
-        } else if (option_value(arg, "--notify-host=", &value)) {
-            options->notify_host = value;
-        } else if (option_value(arg, "--notify-bind-host=", &value)) {
-            options->notify_bind_host = value;
-        } else if (option_value(arg, "--notify-port-base=", &value)) {
-            uint64_t port = parse_u64(value, "notify port base");
-            if (port == 0 || port > UINT16_MAX) {
-                return EINVAL;
-            }
-            options->notify_port_base = (uint16_t)port;
         } else if (option_value(arg, "--checksum=", &value)) {
             if (strcmp(value, "on") == 0) {
                 options->checksum = true;
@@ -1662,7 +1477,6 @@ static int parse_options(int argc, char **argv, pr_options *options)
         options->remote_degree >= options->degree ||
         options->iterations == 0 || options->chunks == 0 ||
         options->threads == 0 || options->threads > PR_MAX_THREADS ||
-        (uint64_t)options->notify_port_base + options->threads > UINT16_MAX ||
         options->payload_max < sizeof(pr_chunk_v1) + sizeof(double) ||
         options->timeout_ms == 0) {
         return EINVAL;
