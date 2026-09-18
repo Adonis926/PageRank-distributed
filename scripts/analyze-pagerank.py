@@ -77,12 +77,14 @@ def main() -> int:
             raise RuntimeError(f"failed run in {path}")
         if abs(float(row["checksum"]) - 1.0) > 1e-9:
             raise RuntimeError(f"PageRank checksum is not one in {path}")
-        if row.get("residual_mode") != "global-per-iteration":
-            raise RuntimeError(f"missing per-iteration residual reduction in {path}")
-        if row.get("signal_path") != "hydra-umwait-local-futex":
+        if row.get("residual_mode") != "final-only":
+            raise RuntimeError(f"unexpected residual policy in {path}")
+        if row.get("signal_path") != "hydra-busy-local-futex":
             raise RuntimeError(f"unexpected cross-OS signal path in {path}")
-        if row.get("notify") != "umwait" or row.get("effective_notify") != "umwait":
-            raise RuntimeError(f"HydraRPC UMWAIT path is not effective in {path}")
+        if row.get("notify") != "busy" or row.get("effective_notify") != "busy":
+            raise RuntimeError(f"HydraRPC busy-poll path is not effective in {path}")
+        if row.get("relay_cpu_policy") != "dedicated":
+            raise RuntimeError(f"relay CPUs are not dedicated in {path}")
         if int(row["relay_threads_per_node"]) != int(row["threads_per_node"]):
             raise RuntimeError(f"relay/worker count mismatch in {path}")
         if int(row["local_futex_wait_calls"]) == 0:
@@ -91,7 +93,7 @@ def main() -> int:
             raise RuntimeError(f"local futex wake path was not exercised in {path}")
         if int(row["local_futex_handoff_calls"]) == 0:
             raise RuntimeError(f"local futex handoff was not observed in {path}")
-        if int(row["residual_syncs"]) != int(row["iterations"]):
+        if int(row["residual_syncs"]) != 1:
             raise RuntimeError(f"residual synchronization count mismatch in {path}")
         local_sum = (
             float(row["node0_local_residual"])
@@ -115,6 +117,7 @@ def main() -> int:
         "remote_degree", "iterations", "chunks", "threads_per_node",
         "total_threads", "compute_threads_total", "relay_threads_total",
         "runtime_threads_total", "relay_threads_per_node", "signal_path",
+        "relay_cpu_policy",
         "elapsed_ms", "medges_per_sec", "job_e2e_ms",
         "activation_overhead_ms", "host_orchestration_e2e_ms",
         "residual_mode", "residual_syncs", "residual",

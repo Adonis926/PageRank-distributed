@@ -51,6 +51,7 @@ typedef struct pr_options {
     const char *tx_path;
     const char *rx_path;
     const char *cpu_list;
+    const char *relay_cpu_list;
     uint64_t map_size;
     uint64_t queue_capacity;
     uint64_t payload_max;
@@ -551,7 +552,10 @@ static void *rx_relay_main(void *opaque)
     uint64_t message_count = (uint64_t)ctx->options.iterations *
                              (ctx->options.chunks + 1U);
     int cpus[PR_MAX_THREADS];
-    int cpu_count = parse_cpu_list(ctx->options.cpu_list, cpus,
+    const char *relay_cpu_list = ctx->options.relay_cpu_list != NULL
+                                      ? ctx->options.relay_cpu_list
+                                      : ctx->options.cpu_list;
+    int cpu_count = parse_cpu_list(relay_cpu_list, cpus,
                                    PR_MAX_THREADS);
 
     if (cpu_count != (int)ctx->options.threads) {
@@ -787,7 +791,10 @@ static int send_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
         .run_id = ctx->run_id,
         .iteration = iteration,
         .tid = tid,
-        .local_residual = tid == 0 ? ctx->residual : 0.0,
+        .local_residual =
+            tid == 0 && iteration + 1U == ctx->options.iterations
+                ? ctx->residual
+                : 0.0,
     };
     pr_transport_stats *stats = &ctx->transport[tid];
     uint64_t begin = now_ns();
@@ -824,11 +831,12 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
         header->size != sizeof(*header) || header->run_id != ctx->run_id ||
         header->iteration != iteration || header->tid != tid ||
         !isfinite(header->local_residual) ||
-        (tid != 0 && header->local_residual != 0.0)) {
+        ((tid != 0 || iteration + 1U != ctx->options.iterations) &&
+         header->local_residual != 0.0)) {
         (void)release_relay_message(ctx, tid, sequence, offset);
         return EILSEQ;
     }
-    if (tid == 0) {
+    if (tid == 0 && iteration + 1U == ctx->options.iterations) {
         ctx->global_residual = ctx->residual + header->local_residual;
         ctx->residual_syncs++;
     }
@@ -1309,14 +1317,14 @@ static int run_coordinator(const pr_options *options)
                            remote_result.rank_checksum;
     double residual = local_result.residual + remote_result.residual;
     double residual_tolerance = fmax(1.0, fabs(residual)) * 1e-12;
-    if (local_result.residual_syncs != options->iterations ||
-        remote_result.residual_syncs != options->iterations ||
+    if (local_result.residual_syncs != 1 ||
+        remote_result.residual_syncs != 1 ||
         !isfinite(local_result.global_residual) ||
         !isfinite(remote_result.global_residual) ||
         fabs(local_result.global_residual - residual) > residual_tolerance ||
         fabs(remote_result.global_residual - residual) >
             residual_tolerance) {
-        print_error("validate global residual synchronization", EILSEQ);
+        print_error("validate final residual synchronization", EILSEQ);
         hydra_close(control);
         hydra_close(reverse_control);
         node_close(&ctx);
@@ -1360,7 +1368,8 @@ static int run_coordinator(const pr_options *options)
            " effective_notify=%s run_id=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
            " iterations=%u chunks=%u threads_per_node=%u total_threads=%u"
-           " relay_threads_per_node=%u signal_path=hydra-umwait-local-futex"
+           " relay_threads_per_node=%u signal_path=hydra-%s-local-futex"
+           " relay_cpu_policy=%s"
            " compute_threads_total=%u relay_threads_total=%u"
            " runtime_threads_total=%u"
            " elapsed_ms=%.3f medges_per_sec=%.3f job_e2e_ms=%.3f"
@@ -1380,7 +1389,7 @@ static int run_coordinator(const pr_options *options)
            " local_futex_handoff_calls=%" PRIu64
            " local_futex_handoff_mean_us=%.3f"
            " payload_bytes=%" PRIu64
-           " residual_mode=global-per-iteration"
+           " residual_mode=final-only"
            " residual_syncs=%" PRIu64 " residual=%.12g"
            " node0_local_residual=%.12g node1_local_residual=%.12g"
            " node0_global_residual=%.12g node1_global_residual=%.12g"
@@ -1395,6 +1404,12 @@ static int run_coordinator(const pr_options *options)
            options->remote_degree, options->iterations, options->chunks,
            options->threads, options->threads * 2,
            options->threads,
+           hydra_notify_mode_name(
+               hydra_effective_notify_mode(options->notify_mode)),
+           options->relay_cpu_list != NULL &&
+                   strcmp(options->relay_cpu_list, options->cpu_list) != 0
+               ? "dedicated"
+               : "shared",
            options->threads * 2, options->threads * 2,
            options->threads * 4,
            elapsed_ns / 1e6, edges / (elapsed_ns / 1e9) / 1e6,
@@ -1609,7 +1624,7 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         printf("pr_worker_v1 status=ok state=%s run_id=%" PRIu64
                " elapsed_ms=%.3f restore_wrapper_ms=%.3f"
-               " relay_threads=%u signal_path=hydra-umwait-local-futex"
+               " relay_threads=%u signal_path=hydra-%s-local-futex"
                " local_futex_wait_sum_ms=%.3f"
                " local_futex_wake_sum_ms=%.3f"
                " local_futex_wait_calls=%" PRIu64
@@ -1618,13 +1633,16 @@ static int run_worker(const pr_options *options)
                " local_futex_handoff_calls=%" PRIu64
                " local_futex_handoff_mean_us=%.3f"
                " graph_checksum=%" PRIu64
-               " residual_mode=global-per-iteration"
+               " residual_mode=final-only"
                " residual_syncs=%" PRIu64
                " local_residual=%.12g global_residual=%.12g"
                " checksum=%.12g verify=ok\n",
                state_name(options->state_mode), ctx.run_id,
                ctx.elapsed_ns / 1e6, cxlfork.timing.wrapper_total_ns / 1e6,
-               options->threads, result.local_futex_wait_ns / 1e6,
+               options->threads,
+               hydra_notify_mode_name(
+                   hydra_effective_notify_mode(options->notify_mode)),
+               result.local_futex_wait_ns / 1e6,
                result.local_futex_wake_ns / 1e6,
                result.local_futex_wait_calls,
                result.local_futex_wake_calls,
@@ -1728,6 +1746,7 @@ static void usage(const char *program)
             "  --backend=file|ivshmem|devdax --tx-path=PATH --rx-path=PATH\n"
             "  --vertices-per-node=N --degree=N --remote-degree=N\n"
             "  --iterations=N --chunks=N --threads=N --cpus=LIST\n"
+            "  --relay-cpus=LIST (defaults to --cpus)\n"
             "  --state=local|cxlfork --checksum=on|off --timeout-ms=N\n"
             "  --notify=umwait|busy\n"
             "  --map-size=N --queue-capacity=N --payload-max=N\n"
@@ -1787,6 +1806,8 @@ static int parse_options(int argc, char **argv, pr_options *options)
             options->rx_path = value;
         } else if (option_value(arg, "--cpus=", &value)) {
             options->cpu_list = value;
+        } else if (option_value(arg, "--relay-cpus=", &value)) {
+            options->relay_cpu_list = value;
         } else if (option_value(arg, "--map-size=", &value)) {
             options->map_size = parse_u64(value, "map size");
         } else if (option_value(arg, "--queue-capacity=", &value)) {

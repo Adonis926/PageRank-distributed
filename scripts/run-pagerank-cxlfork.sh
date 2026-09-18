@@ -133,14 +133,14 @@ validate_guest_platform() {
       test \"\$guest_cores\" -eq '$PR_VM_CORES'
       test \"\$(lscpu -p=NODE | awk -F, '\$1 !~ /^#/ && \$1 >= 0 {seen[\$1]=1} END {print length(seen)}')\" -eq '$PR_VM_NUMA_NODES'
       test \"\$(( \$(nproc) / guest_cores ))\" -eq '$PR_VM_THREADS'
-      grep -qw waitpkg /proc/cpuinfo
+      if test '$PR_NOTIFY' = umwait; then grep -qw waitpkg /proc/cpuinfo; fi
       test \"\$(cat /sys/devices/system/node/online)\" = 0
     " || {
       echo "$name guest topology or WAITPKG validation failed" >&2
       return 1
     }
   done
-  echo "pagerank_guest_platform=ok numa_nodes=$PR_VM_NUMA_NODES topology=${PR_VM_SOCKETS}x${PR_VM_CORES}x${PR_VM_THREADS} waitpkg=on"
+  echo "pagerank_guest_platform=ok numa_nodes=$PR_VM_NUMA_NODES topology=${PR_VM_SOCKETS}x${PR_VM_CORES}x${PR_VM_THREADS} notify=$PR_NOTIFY"
 }
 
 pin_one_vm() {
@@ -238,6 +238,7 @@ common_args() {
     "--chunks=$PR_CHUNKS" \
     "--threads=$PR_THREADS" \
     "--cpus=$PR_GUEST_CPUS" \
+    "--relay-cpus=$PR_RELAY_CPUS" \
     "--map-size=$PR_MAP_SIZE" \
     "--queue-capacity=$PR_QUEUE_CAPACITY" \
     "--payload-max=$PR_PAYLOAD_MAX" \
@@ -311,7 +312,8 @@ run_once() {
     return 1
   fi
   grep -q 'pr_run_v1 status=ok .* verify=ok' "$coordinator_log"
-  grep -q 'signal_path=hydra-umwait-local-futex' "$coordinator_log"
+  grep -q 'signal_path=hydra-busy-local-futex' "$coordinator_log"
+  grep -q 'relay_cpu_policy=dedicated' "$coordinator_log"
   grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
   grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
   grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
@@ -334,6 +336,8 @@ collect_manifest() {
       "$PR_VERTICES_PER_NODE" "$PR_DEGREE" "$PR_REMOTE_DEGREE"
     printf 'iterations=%s\nchunks=%s\nthreads_per_node=%s\n' \
       "$PR_ITERATIONS" "$PR_CHUNKS" "$PR_THREADS"
+    printf 'worker_guest_cpus=%s\nrelay_guest_cpus=%s\n' \
+      "$PR_GUEST_CPUS" "$PR_RELAY_CPUS"
     printf 'guest_memory=%s\nguest_vcpus=%s\n' "$PR_VM_MEM" "$PR_VM_SMP"
     printf 'qemu=%s\nmachine=%s\ncpu_model=%s\nhydra_pci_bus=%s\n' \
       "$PR_QEMU" "$PR_MACHINE" "$PR_CPU_MODEL" "$PR_HYDRA_PCI_BUS"
@@ -348,7 +352,7 @@ collect_manifest() {
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
     printf 'notify=%s\n' "$PR_NOTIFY"
-    printf 'signal_path=hydra-umwait-local-futex\n'
+    printf 'signal_path=hydra-busy-local-futex\n'
     printf 'relay_threads_per_node=%s\n' "$PR_THREADS"
   } >"$RESULT_DIR/manifest/config.txt"
   uname -a >"$RESULT_DIR/manifest/host-uname.txt"
