@@ -1895,7 +1895,10 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
-    if (options.notify_mode == HYDRA_NOTIFY_UMWAIT &&
+    bool uses_hydra_transport = strcmp(argv[1], "coordinator") == 0 ||
+                                strcmp(argv[1], "worker") == 0;
+    if (uses_hydra_transport &&
+        options.notify_mode == HYDRA_NOTIFY_UMWAIT &&
         hydra_effective_notify_mode(options.notify_mode) !=
             HYDRA_NOTIFY_UMWAIT) {
         fprintf(stderr, "HydraRPC umwait requested but WAITPKG is unavailable\n");
