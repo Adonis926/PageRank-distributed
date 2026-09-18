@@ -35,6 +35,10 @@ int pr_cxlfork_restore(const pr_cxlfork_options *options,
                        pr_cxlfork_handle *handle, pr_graph *graph,
                        double *rank[2]);
 int pr_cxlfork_collect(pr_cxlfork_handle *handle);
+int pr_cxlfork_verify_rank_cow(const pr_cxlfork_options *options,
+                               double *rank[2], uint64_t *inspected_pages,
+                               uint64_t *local_pages,
+                               uint64_t *local_leaf_count);
 void pr_cxlfork_close(pr_cxlfork_handle *handle);
 int pr_cxlfork_inspect(uint64_t key, uint64_t expected_generation,
                        bool require_no_readers);

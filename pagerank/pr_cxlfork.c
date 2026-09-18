@@ -272,6 +272,70 @@ int pr_cxlfork_collect(pr_cxlfork_handle *handle)
     return mr_cxlfork_restore_collect(handle->session, &handle->result);
 }
 
+int pr_cxlfork_verify_rank_cow(const pr_cxlfork_options *options,
+                               double *rank[2], uint64_t *inspected_pages,
+                               uint64_t *local_pages,
+                               uint64_t *local_leaf_count)
+{
+#if MR_ENABLE_CXLFORK
+    uint64_t pages_per_rank;
+    int fd;
+
+    if (validate_options(options) != 0 || rank == NULL || rank[0] == NULL ||
+        rank[1] == NULL || inspected_pages == NULL || local_pages == NULL ||
+        local_leaf_count == NULL || options->generation == 0) {
+        return EINVAL;
+    }
+    pages_per_rank = options->vertices * sizeof(double) / 4096;
+    fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return errno;
+    }
+    *inspected_pages = 0;
+    *local_pages = 0;
+    *local_leaf_count = 0;
+    for (uint64_t rank_index = 0; rank_index < 2; rank_index++) {
+        for (uint64_t page = 0; page < pages_per_rank; page++) {
+            struct cxlfork_inspect_v2 inspect;
+            init_v2(&inspect, sizeof(inspect));
+            inspect.key = options->key;
+            inspect.address =
+                (uintptr_t)((unsigned char *)rank[rank_index] + page * 4096);
+            if (ioctl(fd, CXLFORK_INSPECT_V2, &inspect) != 0) {
+                int err = errno;
+                close(fd);
+                return err;
+            }
+            if (inspect.generation != options->generation ||
+                !(inspect.flags & CXLFORK_INSPECT_F_CURRENT_PTE_VALID) ||
+                inspect.shared_pfn == 0 || inspect.current_pfn == 0) {
+                close(fd);
+                return EILSEQ;
+            }
+            (*inspected_pages)++;
+            if (inspect.current_pfn != inspect.shared_pfn) {
+                (*local_pages)++;
+            }
+            if (page == 0 &&
+                (inspect.flags & CXLFORK_INSPECT_F_SHARED_LEAF_VALID) &&
+                (inspect.flags & CXLFORK_INSPECT_F_CURRENT_PMD_VALID) &&
+                inspect.current_pmd_pfn != inspect.shared_leaf_pfn) {
+                (*local_leaf_count)++;
+            }
+        }
+    }
+    close(fd);
+    return *local_pages == *inspected_pages ? 0 : EILSEQ;
+#else
+    (void)options;
+    (void)rank;
+    (void)inspected_pages;
+    (void)local_pages;
+    (void)local_leaf_count;
+    return EOPNOTSUPP;
+#endif
+}
+
 void pr_cxlfork_close(pr_cxlfork_handle *handle)
 {
     if (handle == NULL) {

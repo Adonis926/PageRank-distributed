@@ -95,10 +95,11 @@ def main() -> int:
             raise RuntimeError(f"local futex handoff was not observed in {path}")
         if row.get("restore_policy") != "mow":
             raise RuntimeError(f"CXLfork restore is not MoW in {path}")
-        if int(row["rank_pfn_pages"]) != int(row["expected_rank_cow_pages"]):
-            raise RuntimeError(f"rank PFN baseline is incomplete in {path}")
-        if int(row["rank_pfn_changed_pages"]) != int(row["rank_pfn_pages"]):
-            raise RuntimeError(f"not all PageRank rank pages performed CoW in {path}")
+        if int(row["rank_pfn_pages"]) != 0:
+            if int(row["rank_pfn_pages"]) != int(row["expected_rank_cow_pages"]):
+                raise RuntimeError(f"rank PFN inspection is incomplete in {path}")
+            if int(row["rank_pfn_changed_pages"]) != int(row["rank_pfn_pages"]):
+                raise RuntimeError(f"not all PageRank rank pages performed CoW in {path}")
         if int(row["residual_syncs"]) != 1:
             raise RuntimeError(f"residual synchronization count mismatch in {path}")
         local_sum = (
@@ -171,7 +172,8 @@ def main() -> int:
         "cxlfork_local_copy_pages", "cxlfork_leaf_copy_pages",
         "cxlfork_data_cow_ms", "cxlfork_leaf_materialize_ms",
         "cxlfork_cxl_to_local_copy_ms", "rank_pfn_pages",
-        "rank_pfn_changed_pages", "node1_graph_checksum", "source_log",
+        "rank_pfn_changed_pages", "rank_leaf_cow_count",
+        "node1_graph_checksum", "source_log",
     ]
     write_csv(root / "cxlfork.csv", rows, cxlfork)
 

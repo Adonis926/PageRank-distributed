@@ -6,7 +6,6 @@
 #include "hydra/hydra.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <linux/futex.h>
 #include <math.h>
@@ -155,6 +154,7 @@ typedef struct pr_node_result_v1 {
     uint64_t cxlfork_cxl_to_local_copy_ns;
     uint64_t rank_pfn_pages;
     uint64_t rank_pfn_changed_pages;
+    uint64_t rank_leaf_cow_count;
 } pr_node_result_v1;
 
 typedef struct pr_chunk_v1 {
@@ -239,9 +239,9 @@ struct pr_node_ctx {
     uint64_t run_id;
     double *rank[2];
     bool rank_template_backed;
-    uint64_t *rank_initial_pfns;
     uint64_t rank_pfn_pages;
     uint64_t rank_pfn_changed_pages;
+    uint64_t rank_leaf_cow_count;
     double *partials;
     pr_transport_stats *transport;
     uint64_t elapsed_ns;
@@ -265,94 +265,13 @@ typedef struct pr_write_chunk_arg {
 _Static_assert(sizeof(pr_arm_v1) == 160, "arm wire ABI changed");
 _Static_assert(sizeof(pr_arm_result_v1) == 216, "arm result ABI changed");
 _Static_assert(sizeof(pr_start_v1) == 56, "start wire ABI changed");
-_Static_assert(sizeof(pr_node_result_v1) == 264, "node result ABI changed");
+_Static_assert(sizeof(pr_node_result_v1) == 272, "node result ABI changed");
 _Static_assert(sizeof(pr_chunk_v1) == 56, "chunk wire ABI changed");
 _Static_assert(sizeof(pr_barrier_v1) == 56, "barrier wire ABI changed");
 
 static uint64_t now_ns(void)
 {
     return hydra_now_ns();
-}
-
-static int read_pagemap_pfn(int fd, const void *address, uint64_t *pfn)
-{
-    uint64_t entry = 0;
-    uint64_t page = (uintptr_t)address / 4096;
-    ssize_t bytes = pread(fd, &entry, sizeof(entry),
-                          (off_t)(page * sizeof(entry)));
-
-    if (bytes != (ssize_t)sizeof(entry)) {
-        return bytes < 0 ? errno : EIO;
-    }
-    if ((entry & (UINT64_C(1) << 63)) == 0) {
-        return ENOENT;
-    }
-    *pfn = entry & ((UINT64_C(1) << 55) - 1);
-    return *pfn == 0 ? EACCES : 0;
-}
-
-static int capture_rank_pfns(pr_node_ctx *ctx)
-{
-    uint64_t pages_per_rank =
-        ctx->options.vertices * sizeof(double) / 4096;
-    uint64_t total_pages = 2 * pages_per_rank;
-    int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
-
-    if (fd < 0) {
-        return errno;
-    }
-    ctx->rank_initial_pfns = calloc(total_pages,
-                                     sizeof(*ctx->rank_initial_pfns));
-    if (ctx->rank_initial_pfns == NULL) {
-        close(fd);
-        return ENOMEM;
-    }
-    for (uint64_t index = 0; index < total_pages; index++) {
-        uint64_t rank = index / pages_per_rank;
-        uint64_t page = index % pages_per_rank;
-        volatile double value = ctx->rank[rank][page * 4096 /
-                                                  sizeof(double)];
-        (void)value;
-        int err = read_pagemap_pfn(
-            fd, (const unsigned char *)ctx->rank[rank] + page * 4096,
-            &ctx->rank_initial_pfns[index]);
-        if (err != 0) {
-            close(fd);
-            return err;
-        }
-    }
-    close(fd);
-    ctx->rank_pfn_pages = total_pages;
-    return 0;
-}
-
-static int compare_rank_pfns(pr_node_ctx *ctx)
-{
-    uint64_t pages_per_rank =
-        ctx->options.vertices * sizeof(double) / 4096;
-    int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
-
-    if (fd < 0) {
-        return errno;
-    }
-    ctx->rank_pfn_changed_pages = 0;
-    for (uint64_t index = 0; index < ctx->rank_pfn_pages; index++) {
-        uint64_t rank = index / pages_per_rank;
-        uint64_t page = index % pages_per_rank;
-        uint64_t pfn = 0;
-        int err = read_pagemap_pfn(
-            fd, (const unsigned char *)ctx->rank[rank] + page * 4096,
-            &pfn);
-        if (err != 0) {
-            close(fd);
-            return err;
-        }
-        if (pfn != ctx->rank_initial_pfns[index]) {
-            ctx->rank_pfn_changed_pages++;
-        }
-    }
-    close(fd);
-    return 0;
 }
 
 static int futex_wait_local(atomic_uint *address, uint32_t expected,
@@ -1204,6 +1123,7 @@ static void fill_node_result(const pr_node_ctx *ctx, pr_node_result_v1 *result)
     result->residual_syncs = ctx->residual_syncs;
     result->rank_pfn_pages = ctx->rank_pfn_pages;
     result->rank_pfn_changed_pages = ctx->rank_pfn_changed_pages;
+    result->rank_leaf_cow_count = ctx->rank_leaf_cow_count;
     sum_transport(ctx, result);
 }
 
@@ -1259,7 +1179,6 @@ static void node_close(pr_node_ctx *ctx)
     }
     free(ctx->partials);
     free(ctx->transport);
-    free(ctx->rank_initial_pfns);
     pr_graph_destroy(&ctx->graph);
 }
 
@@ -1486,6 +1405,7 @@ static int run_coordinator(const pr_options *options)
            " cxlfork_leaf_copy_pages=%" PRIu64
            " rank_pfn_pages=%" PRIu64
            " rank_pfn_changed_pages=%" PRIu64
+           " rank_leaf_cow_count=%" PRIu64
            " cxlfork_data_cow_ms=%.3f"
            " cxlfork_leaf_materialize_ms=%.3f"
            " cxlfork_cxl_to_local_copy_ms=%.3f"
@@ -1542,6 +1462,7 @@ static int run_coordinator(const pr_options *options)
            remote_result.cxlfork_leaf_copy_pages,
            remote_result.rank_pfn_pages,
            remote_result.rank_pfn_changed_pages,
+           remote_result.rank_leaf_cow_count,
            remote_result.cxlfork_data_cow_ns / 1e6,
            remote_result.cxlfork_leaf_materialize_ns / 1e6,
            remote_result.cxlfork_cxl_to_local_copy_ns / 1e6,
@@ -1644,9 +1565,6 @@ static int run_worker(const pr_options *options)
                 ctx.graph_checksum = cxlfork.graph_checksum;
                 err = pr_cxlfork_collect(&cxlfork);
             }
-            if (err == 0) {
-                err = capture_rank_pfns(&ctx);
-            }
         } else {
             err = pr_graph_build_local(&ctx.graph, 1, options->vertices,
                                        options->degree,
@@ -1732,8 +1650,11 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         err = start_gate_error != 0 ? start_gate_error : join_error;
     }
-    if (options->state_mode == PR_STATE_CXLFORK && err == 0) {
-        err = compare_rank_pfns(&ctx);
+    if (options->state_mode == PR_STATE_CXLFORK &&
+        options->cxlfork.full_validate && err == 0) {
+        err = pr_cxlfork_verify_rank_cow(
+            &options->cxlfork, ctx.rank, &ctx.rank_pfn_pages,
+            &ctx.rank_pfn_changed_pages, &ctx.rank_leaf_cow_count);
     }
     if (options->state_mode == PR_STATE_CXLFORK && err == 0) {
         int collect_error = pr_cxlfork_collect(&cxlfork);
@@ -1776,6 +1697,7 @@ static int run_worker(const pr_options *options)
                " cxlfork_leaf_copy_pages=%" PRIu64
                " rank_pfn_pages=%" PRIu64
                " rank_pfn_changed_pages=%" PRIu64
+               " rank_leaf_cow_count=%" PRIu64
                " graph_checksum=%" PRIu64
                " residual_mode=final-only"
                " residual_syncs=%" PRIu64
@@ -1803,6 +1725,7 @@ static int run_worker(const pr_options *options)
                result.cxlfork_faults, result.cxlfork_local_copy_pages,
                result.cxlfork_leaf_copy_pages,
                result.rank_pfn_pages, result.rank_pfn_changed_pages,
+               result.rank_leaf_cow_count,
                result.graph_checksum, result.residual_syncs,
                result.residual, result.global_residual,
                result.rank_checksum);
