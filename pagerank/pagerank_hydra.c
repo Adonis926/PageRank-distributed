@@ -133,9 +133,11 @@ typedef struct pr_node_result_v1 {
     uint64_t graph_checksum;
     double residual;
     double rank_checksum;
+    double global_residual;
+    uint64_t residual_syncs;
     uint64_t hydra_wait_ns;
     uint64_t hydra_wait_calls;
-    uint64_t reserved[6];
+    uint64_t reserved[4];
 } pr_node_result_v1;
 
 typedef struct pr_chunk_v1 {
@@ -149,6 +151,17 @@ typedef struct pr_chunk_v1 {
     uint32_t value_count;
     uint64_t reserved[2];
 } pr_chunk_v1;
+
+typedef struct pr_barrier_v1 {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint64_t run_id;
+    uint32_t iteration;
+    uint32_t tid;
+    double local_residual;
+    uint64_t reserved[2];
+} pr_barrier_v1;
 
 typedef struct pr_transport_stats {
     uint64_t send_ns;
@@ -188,6 +201,8 @@ struct pr_node_ctx {
     uint64_t elapsed_ns;
     uint64_t graph_checksum;
     double residual;
+    double global_residual;
+    uint64_t residual_syncs;
     double rank_checksum;
 };
 
@@ -206,6 +221,7 @@ _Static_assert(sizeof(pr_arm_result_v1) == 216, "arm result ABI changed");
 _Static_assert(sizeof(pr_start_v1) == 56, "start wire ABI changed");
 _Static_assert(sizeof(pr_node_result_v1) == 184, "node result ABI changed");
 _Static_assert(sizeof(pr_chunk_v1) == 56, "chunk wire ABI changed");
+_Static_assert(sizeof(pr_barrier_v1) == 56, "barrier wire ABI changed");
 
 static uint64_t now_ns(void)
 {
@@ -571,15 +587,14 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
 
 static int send_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
 {
-    pr_chunk_v1 header = {
+    pr_barrier_v1 header = {
         .magic = PR_WIRE_MAGIC,
         .version = PR_WIRE_VERSION,
         .size = sizeof(header),
         .run_id = ctx->run_id,
         .iteration = iteration,
         .tid = tid,
-        .chunk = ctx->options.chunks,
-        .value_count = 0,
+        .local_residual = tid == 0 ? ctx->residual : 0.0,
     };
     pr_transport_stats *stats = &ctx->transport[tid];
     uint64_t begin = now_ns();
@@ -610,14 +625,19 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     if (err != 0) {
         return err;
     }
-    const pr_chunk_v1 *header = (const pr_chunk_v1 *)payload;
+    const pr_barrier_v1 *header = (const pr_barrier_v1 *)payload;
     if (message->op != PR_OP_BARRIER || message->len != sizeof(*header) ||
         header->magic != PR_WIRE_MAGIC ||
         header->version != PR_WIRE_VERSION ||
-        header->run_id != ctx->run_id || header->iteration != iteration ||
-        header->tid != tid || header->chunk != ctx->options.chunks ||
-        header->value_count != 0) {
+        header->size != sizeof(*header) || header->run_id != ctx->run_id ||
+        header->iteration != iteration || header->tid != tid ||
+        !isfinite(header->local_residual) ||
+        (tid != 0 && header->local_residual != 0.0)) {
         return EILSEQ;
+    }
+    if (tid == 0) {
+        ctx->global_residual = ctx->residual + header->local_residual;
+        ctx->residual_syncs++;
     }
     stats->messages_received++;
     stats->payload_bytes_received += message->len;
@@ -855,6 +875,8 @@ static void fill_node_result(const pr_node_ctx *ctx, pr_node_result_v1 *result)
     result->graph_checksum = ctx->graph_checksum;
     result->residual = ctx->residual;
     result->rank_checksum = ctx->rank_checksum;
+    result->global_residual = ctx->global_residual;
+    result->residual_syncs = ctx->residual_syncs;
     sum_transport(ctx, result);
 }
 
@@ -1064,6 +1086,20 @@ static int run_coordinator(const pr_options *options)
     double rank_checksum = local_result.rank_checksum +
                            remote_result.rank_checksum;
     double residual = local_result.residual + remote_result.residual;
+    double residual_tolerance = fmax(1.0, fabs(residual)) * 1e-12;
+    if (local_result.residual_syncs != options->iterations ||
+        remote_result.residual_syncs != options->iterations ||
+        !isfinite(local_result.global_residual) ||
+        !isfinite(remote_result.global_residual) ||
+        fabs(local_result.global_residual - residual) > residual_tolerance ||
+        fabs(remote_result.global_residual - residual) >
+            residual_tolerance) {
+        print_error("validate global residual synchronization", EILSEQ);
+        hydra_close(control);
+        hydra_close(reverse_control);
+        node_close(&ctx);
+        return 1;
+    }
     uint64_t elapsed_ns = local_result.elapsed_ns > remote_result.elapsed_ns
                             ? local_result.elapsed_ns
                             : remote_result.elapsed_ns;
@@ -1098,7 +1134,12 @@ static int run_coordinator(const pr_options *options)
            " hydra_send_cpu_sum_ms=%.3f hydra_recv_wait_sum_ms=%.3f"
            " hydra_release_sum_ms=%.3f hydra_wait_cpu_sum_ms=%.3f"
            " hydra_wait_calls=%" PRIu64 " messages=%" PRIu64
-           " payload_bytes=%" PRIu64 " residual=%.12g checksum=%.12g"
+           " payload_bytes=%" PRIu64
+           " residual_mode=global-per-iteration"
+           " residual_syncs=%" PRIu64 " residual=%.12g"
+           " node0_local_residual=%.12g node1_local_residual=%.12g"
+           " node0_global_residual=%.12g node1_global_residual=%.12g"
+           " checksum=%.12g"
            " node0_graph_checksum=%" PRIu64
            " node1_graph_checksum=%" PRIu64 " verify=ok\n",
            backend_name(options->backend), state_name(options->state_mode),
@@ -1121,7 +1162,10 @@ static int run_coordinator(const pr_options *options)
            remote_arm.fallback_pages, hydra_send_ns / 1e6,
            hydra_recv_wait_ns / 1e6, hydra_release_ns / 1e6,
            hydra_wait_ns / 1e6, hydra_wait_calls,
-           messages, bytes, residual, rank_checksum,
+           messages, bytes, local_result.residual_syncs, residual,
+           local_result.residual, remote_result.residual,
+           local_result.global_residual, remote_result.global_residual,
+           rank_checksum,
            local_result.graph_checksum, remote_result.graph_checksum);
 
     hydra_close(control);
@@ -1308,10 +1352,16 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         printf("pr_worker_v1 status=ok state=%s run_id=%" PRIu64
                " elapsed_ms=%.3f restore_wrapper_ms=%.3f"
-               " graph_checksum=%" PRIu64 " checksum=%.12g verify=ok\n",
+               " graph_checksum=%" PRIu64
+               " residual_mode=global-per-iteration"
+               " residual_syncs=%" PRIu64
+               " local_residual=%.12g global_residual=%.12g"
+               " checksum=%.12g verify=ok\n",
                state_name(options->state_mode), ctx.run_id,
                ctx.elapsed_ns / 1e6, cxlfork.timing.wrapper_total_ns / 1e6,
-               result.graph_checksum, result.rank_checksum);
+               result.graph_checksum, result.residual_syncs,
+               result.residual, result.global_residual,
+               result.rank_checksum);
     } else {
         print_error("worker execution", err);
     }

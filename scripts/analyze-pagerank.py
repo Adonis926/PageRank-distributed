@@ -77,6 +77,24 @@ def main() -> int:
             raise RuntimeError(f"failed run in {path}")
         if abs(float(row["checksum"]) - 1.0) > 1e-9:
             raise RuntimeError(f"PageRank checksum is not one in {path}")
+        if row.get("residual_mode") != "global-per-iteration":
+            raise RuntimeError(f"missing per-iteration residual reduction in {path}")
+        if int(row["residual_syncs"]) != int(row["iterations"]):
+            raise RuntimeError(f"residual synchronization count mismatch in {path}")
+        local_sum = (
+            float(row["node0_local_residual"])
+            + float(row["node1_local_residual"])
+        )
+        global_residual = float(row["residual"])
+        for field in ("node0_global_residual", "node1_global_residual"):
+            if not math.isclose(
+                float(row[field]), global_residual, rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise RuntimeError(f"{field} disagrees with global residual in {path}")
+        if not math.isclose(
+            local_sum, global_residual, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise RuntimeError(f"local residual sum mismatch in {path}")
         rows.append(row)
 
     common = [
@@ -85,7 +103,10 @@ def main() -> int:
         "remote_degree", "iterations", "chunks", "threads_per_node",
         "total_threads", "elapsed_ms", "medges_per_sec", "job_e2e_ms",
         "activation_overhead_ms", "host_orchestration_e2e_ms",
-        "residual", "checksum", "verify", "source_log",
+        "residual_mode", "residual_syncs", "residual",
+        "node0_local_residual", "node1_local_residual",
+        "node0_global_residual", "node1_global_residual",
+        "checksum", "verify", "source_log",
     ]
     write_csv(root / "runs.csv", rows, common)
 
@@ -104,6 +125,14 @@ def main() -> int:
         "hydra_wait_calls", "messages", "payload_bytes", "source_log",
     ]
     write_csv(root / "transport.csv", rows, transport)
+
+    residual = [
+        "sample", "run_id", "iterations", "residual_mode",
+        "residual_syncs", "node0_local_residual", "node1_local_residual",
+        "node0_global_residual", "node1_global_residual", "residual",
+        "source_log",
+    ]
+    write_csv(root / "residual.csv", rows, residual)
 
     cxlfork = [
         "sample", "run_id", "restore_wrapper_ms", "restore_ioctl_ms",
