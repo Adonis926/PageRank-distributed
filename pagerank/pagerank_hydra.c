@@ -1360,7 +1360,7 @@ static int run_graph_check(const pr_options *options)
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s graph-check|template|coordinator|worker [options]\n"
+            "usage: %s graph-check|template|inspect|release|coordinator|worker [options]\n"
             "  --backend=file|ivshmem|devdax --tx-path=PATH --rx-path=PATH\n"
             "  --vertices-per-node=N --degree=N --remote-degree=N\n"
             "  --iterations=N --chunks=N --threads=N --cpus=LIST\n"
@@ -1507,6 +1507,32 @@ int main(int argc, char **argv)
             return 2;
         }
         return run_template(&options);
+    }
+    if (strcmp(argv[1], "inspect") == 0) {
+        if (options.cxlfork.key == 0) {
+            fprintf(stderr, "inspect requires --key=N\n");
+            return 2;
+        }
+        err = pr_cxlfork_inspect(options.cxlfork.key,
+                                 options.cxlfork.generation, true);
+        if (err != 0) {
+            print_error("inspect PageRank CXLfork template", err);
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "release") == 0) {
+        if (options.cxlfork.key == 0 || options.cxlfork.generation == 0) {
+            fprintf(stderr, "release requires --key=N --generation=N\n");
+            return 2;
+        }
+        err = pr_cxlfork_release(options.cxlfork.key,
+                                 options.cxlfork.generation);
+        if (err != 0) {
+            print_error("release PageRank CXLfork template", err);
+            return 1;
+        }
+        return 0;
     }
     if (strcmp(argv[1], "coordinator") == 0) {
         if (options.tx_path == NULL || options.rx_path == NULL ||

@@ -263,3 +263,87 @@ void pr_cxlfork_close(pr_cxlfork_handle *handle)
     }
     memset(handle, 0, sizeof(*handle));
 }
+
+int pr_cxlfork_inspect(uint64_t key, uint64_t expected_generation,
+                       bool require_no_readers)
+{
+#if MR_ENABLE_CXLFORK
+    struct cxlfork_inspect_v2 inspect;
+    int fd;
+    int err = 0;
+
+    if (key == 0) {
+        return EINVAL;
+    }
+    fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return errno;
+    }
+    init_v2(&inspect, sizeof(inspect));
+    inspect.key = key;
+    if (ioctl(fd, CXLFORK_INSPECT_V2, &inspect) != 0) {
+        err = errno;
+    }
+    close(fd);
+    if (err == 0 && expected_generation != 0 &&
+        inspect.generation != expected_generation) {
+        err = ESTALE;
+    }
+    if (err == 0 && require_no_readers && inspect.reader_count != 0) {
+        err = EBUSY;
+    }
+    if (err == 0 &&
+        (inspect.page_checksum != inspect.observed_page_checksum ||
+         (inspect.flags & CXLFORK_INSPECT_F_CHECKSUM_MISMATCH) != 0)) {
+        err = EILSEQ;
+    }
+    printf("pr_inspect_v1 key=%" PRIu64 " generation=%" PRIu64
+           " slot=%u state=%u readers=%u pages=%" PRIu64
+           " page_checksum=%" PRIu64 " observed_checksum=%" PRIu64
+           " verify=%s\n",
+           key, (uint64_t)inspect.generation, inspect.slot, inspect.state,
+           inspect.reader_count, (uint64_t)inspect.total_pages,
+           (uint64_t)inspect.page_checksum,
+           (uint64_t)inspect.observed_page_checksum,
+           err == 0 ? "ok" : "fail");
+    return err;
+#else
+    (void)key;
+    (void)expected_generation;
+    (void)require_no_readers;
+    return EOPNOTSUPP;
+#endif
+}
+
+int pr_cxlfork_release(uint64_t key, uint64_t generation)
+{
+#if MR_ENABLE_CXLFORK
+    struct cxlfork_release_v2 release;
+    int fd;
+    int err = 0;
+
+    if (key == 0 || generation == 0) {
+        return EINVAL;
+    }
+    init_v2(&release, sizeof(release));
+    release.key = key;
+    release.generation = generation;
+    fd = open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return errno;
+    }
+    if (ioctl(fd, CXLFORK_RELEASE_V2, &release) != 0) {
+        err = errno;
+    }
+    close(fd);
+    if (err == 0) {
+        printf("pr_release_v1 key=%" PRIu64 " generation=%" PRIu64
+               " verify=ok\n", key, generation);
+    }
+    return err;
+#else
+    (void)key;
+    (void)generation;
+    return EOPNOTSUPP;
+#endif
+}

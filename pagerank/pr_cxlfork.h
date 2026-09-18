@@ -34,5 +34,8 @@ int pr_cxlfork_restore(const pr_cxlfork_options *options,
                        pr_cxlfork_handle *handle, pr_graph *graph);
 int pr_cxlfork_collect(pr_cxlfork_handle *handle);
 void pr_cxlfork_close(pr_cxlfork_handle *handle);
+int pr_cxlfork_inspect(uint64_t key, uint64_t expected_generation,
+                       bool require_no_readers);
+int pr_cxlfork_release(uint64_t key, uint64_t generation);
 
 #endif
