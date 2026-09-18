@@ -22,6 +22,15 @@
 
 两台 VM 合计 32 vCPU、8 GiB，与单机 PageRank 的 32 vCPU、8 GiB 总预算一致。每个 QEMU vCPU 都一对一固定到对应 host CPU。
 
+本轮还把虚拟平台参数与 `/home/xtl/start/hpca/start-native-vm.sh 32 8 0`
+对齐：两边都使用 QEMU 9.0.90、`pc-i440fx-9.1`、split irqchip、关闭
+memory merge 和 `qemu64` CPU model。单机是 `2 socket × 16 core × 1 thread`；
+分布式侧将它拆成两台各 `1 socket × 16 core × 1 thread`、单 guest NUMA 的 VM。
+分布式 CPU model 只额外开放 `+waitpkg`，这是 HydraRPC 纯共享内存
+`UMONITOR/UMWAIT` 唤醒的必要条件。runner 会在每轮正式测试前核查实际 QEMU
+cmdline、guest 拓扑、WAITPKG 和 32 个 vCPU 的逐线程 affinity，不接受仅配置文件
+“看起来一致”但运行时没有生效的情况。
+
 真实 `/dev/dax0.0` 使用互不重叠的三段：
 
 | host DAX 范围 | 用途 |
@@ -30,7 +39,12 @@
 | 8–10 GiB | HydraRPC endpoint 0 |
 | 10–12 GiB | HydraRPC endpoint 1 |
 
-4 GiB guest 下，QEMU 实际把 NVDIMM 放在 guest physical `0x180000000–0x27effffff`。CXLfork 保留前 64 MiB 后使用 `0x184000000`，长度为 `0xfb000000`。不能继续沿用 16 GiB guest 的 `0x484000000`，否则驱动会映射到不存在的 guest physical hole，`PREPARE_V2` 会返回 `EILSEQ`。
+在 `pc-i440fx-9.1` 和 4 GiB guest DRAM 下，QEMU HMP
+`info memory-devices` 实测 NVDIMM 起点为 `0x140000000`、可见长度为
+`0xff000000`。CXLfork 保留前 64 MiB 后使用 `0x144000000`，长度为
+`0xfb000000`。HydraRPC 的两个 ivshmem BAR 固定为 `00:03.0` 和 `00:04.0`；
+`00:02.0` 是 i440fx 默认 VGA，不能沿用旧 Q35 配置。物理地址或 BDF 配错时，
+不得继续跑 benchmark。
 
 ## 3. Workload 对齐
 
@@ -94,7 +108,10 @@
 
 ## 6. 代码和脚本
 
-开发分支为 `motivation-pagerank-cxlfork-hydrarpc-103`。
+当前对齐后的开发分支为 `motivation-pagerank-qemu-aligned-103`：
+
+- CXLfork launcher commit：`690fe42`；
+- PageRank/HydraRPC runner commit：以结果 manifest 中的 `mr_git` 为准。
 
 - `pagerank/pagerank_hydra.c`：coordinator/worker、HydraRPC 数据与控制消息、计时点。
 - `pagerank/pr_graph.c`：与单机版本一致的图构造、CXL 模板格式和 checksum。
@@ -109,10 +126,18 @@
 
 下列命令均在 103 host 上执行。DAX 必须已经处于 devdax 模式，且必须确认没有其他实验占用。清零只能使用仓库现有的安全工具处理 4–12 GiB，禁止运行全盘 `dax_zero`。
 
-加载当前 native-capable KVM：
+先关闭可能残留的 Native/GVM VM，再加载当前 native-capable KVM：
 
 ```bash
+sudo /home/xtl/start/hpca/kill-gvm.sh
 sudo /home/xtl/start/hpca/load-native-kvm.sh
+```
+
+仅清零本实验独占的 DAX 4–12 GiB，不能运行全盘 `dax_zero`：
+
+```bash
+sudo /home/xtl/start/hpca-cxlfork/bin/dax_range_zero \
+  /dev/dax0.0 4294967296 8589934592 ZERO-CXLFORK-MR-4G-12G
 ```
 
 用现有 launcher 启动两个 VM：
@@ -121,25 +146,26 @@ sudo /home/xtl/start/hpca/load-native-kvm.sh
 sudo env \
   WS=/home/xtl/cxlfork/cxlfork-repro \
   QEMU=/home/xtl/qemu-9.0.90-clean/build/qemu-system-x86_64 \
-  MACHINE=pc-q35-8.2,kernel-irqchip=split,mem-merge=off \
+  MACHINE=pc-i440fx-9.1,kernel-irqchip=split,mem-merge=off \
+  CPU_MODEL=qemu64,+waitpkg,kvmclock-stable-bit=off \
+  HYDRA_PCI_BUS=pci.0 VM_PIN_VCPUS=1 \
   KERNEL=/home/xtl/cxlfork/cxlfork-repro/kernel/build-6.6.32/arch/x86/boot/bzImage \
-  GUEST_APPEND_EXTRA=nox2apic \
+  GUEST_APPEND_EXTRA='nox2apic clocksource=kvm-clock nmi_watchdog=0 irqaffinity=0' \
   CXL_FILE=/dev/dax0.0 CXL_BACKEND_SIZE=4G CXL_BACKEND_OFFSET=4G CXL_BACKEND_ALIGN=2M \
-  CXL_PHYS=0x184000000 CXL_SIZE=0xfb000000 \
+  CXL_PHYS=0x144000000 CXL_SIZE=0xfb000000 \
   HYDRA_SHM_FILE=/dev/dax0.0 HYDRA_SHM_SIZE=4G HYDRA_BACKEND_OFFSET=8G \
   HYDRA_ENDPOINT_SIZE=2G HYDRA_ENDPOINT1_OFFSET=2G HYDRA_BACKEND_ALIGN=2M \
   BACKEND_RESET=none MEM=4G SMP=16 VM_MAXMEM=20G \
   VM0_HOST_CPUS=0-15 VM1_HOST_CPUS=48-63 \
   VM0_MEMORY_NODE=0 VM1_MEMORY_NODE=1 \
-  HYDRA0_PCI_ADDR=0x2 HYDRA1_PCI_ADDR=0x3 \
+  HYDRA0_PCI_ADDR=0x3 HYDRA1_PCI_ADDR=0x4 \
   /home/xtl/cxlfork/cxlfork-repro/scripts/start-cxlfork-vms.sh cxl
 ```
 
-固定 vCPU，并执行正式测试：
+启动器已逐 vCPU 绑核。执行正式测试时，runner 会再次验证，而不是再次修改：
 
 ```bash
 cd /home/xtl/cxlfork/mr-pagerank
-sudo ./scripts/run-pagerank-cxlfork.sh pin-vcpus
 PR_STAMP=manual-$(date +%Y%m%d-%H%M%S) \
   PR_LOCAL_DIAGNOSTIC=0 ./scripts/run-pagerank-cxlfork.sh bench
 ```
@@ -155,13 +181,13 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 103 上正式结果目录：
 
 ```text
-/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/paper-main-pure-hydra-20260918/
+/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/paper-main-qemu-aligned-20260918/
 ```
 
 跳板机上的逐文件 SHA256 一致备份为：
 
 ```text
-/home/adonis/cxlfork/test/pagerank/cxlfork-hydrarpc-results/paper-main-pure-hydra-20260918/
+/home/adonis/cxlfork/test/pagerank/cxlfork-hydrarpc-results/paper-main-qemu-aligned-20260918/
 ```
 
 最重要的文件：
@@ -176,6 +202,7 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 - `template.log`：CXLfork prepare 与模板 checksum；
 - `final-inspect.log`、`release.log`：reader/checksum/release 证据；
 - `manifest/qemu-vcpu-affinity.txt`：QEMU 完整命令和每个 vCPU 的实际 affinity；
+- `manifest/hmp-memory-devices.txt`：两台 VM 的实际 NVDIMM guest physical 起点和大小；
 - `manifest/vm*-dmesg.txt`：测试结束后的完整 guest dmesg。
 
 ## 9. 本次正式结果
@@ -184,25 +211,29 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 
 | 指标 | mean | P50 | P95 | stddev |
 |---|---:|---:|---:|---:|
-| `elapsed_ms` | 148.402 ms | 148.241 ms | 149.686 ms | 1.254 ms |
-| `job_e2e_ms` | 155.182 ms | 154.544 ms | 157.380 ms | 1.754 ms |
-| `activation_overhead_ms` | 6.780 ms | 6.610 ms | 7.694 ms | 0.671 ms |
-| throughput | 5652.951 MEdges/s | — | — | — |
+| `elapsed_ms` | 175.799 ms | 176.226 ms | 177.162 ms | 1.339 ms |
+| `job_e2e_ms` | 183.601 ms | 183.416 ms | 186.735 ms | 2.632 ms |
+| `activation_overhead_ms` | 7.801 ms | 7.190 ms | 10.248 ms | 1.837 ms |
+| throughput | 4771.913 MEdges/s | — | — | — |
 
 平均 breakdown：
 
-- ARM：2.990 ms；
-- VM0 thread creation：2.517 ms；
-- START publish：0.209 ms；
-- CXLfork restore wrapper：0.0344 ms；
-- kernel restore：0.0236 ms；
-- shared-leaf attach：0.0030 ms；
+- ARM：3.271 ms；
+- VM0 thread creation：2.578 ms；
+- START publish：0.240 ms；
+- CXLfork restore wrapper：0.0442 ms；
+- kernel restore：0.0256 ms；
+- shared-leaf attach：0.0040 ms；
 - fallback reconstruction：0；
-- HydraRPC receive wait（线程累计）：267.602 ms；
-- 其中纯 HydraRPC UMWAIT（线程累计）：133.808 ms；
+- HydraRPC receive wait（线程累计）：359.986 ms；
+- 其中纯 HydraRPC UMWAIT（线程累计）：68.099 ms；
 - shared leaf：32 个；shared data page：16,384 个。
 
-因此，在已经预建 capsule 的稳态 fast path 中，kernel restore 只占 `job_e2e_ms` 的约 0.015%，主要可见的非计算 wall time是线程创建、control request/response 和调度尾部，而不是页表恢复。
+因此，在已经预建 capsule 的稳态 fast path 中，kernel restore 只占 `job_e2e_ms`
+的约 0.014%，主要可见的非计算 wall time 是线程创建、control
+request/response 和调度尾部，而不是页表恢复。`graph_build_ms` 均值约
+866.025 ms，但它发生在正式 job 计时窗口之前；host 从两条 SSH exec 到进程退出的
+辅助时间均值约 1413.849 ms，二者都不能加到 `elapsed_ms` 中冒充同一层级 breakdown。
 
 正确性/真实性证据：5 次 checksum 全为 1，residual 一致；每次都是 32 个 shared leaf、16,384 个 shared data page、0 个 fallback page；最终 page checksum 一致、reader 为 0、release 成功；两台 guest dmesg 未发现 BUG/Oops/general-protection/panic。
 
@@ -218,8 +249,18 @@ sudo /home/xtl/cxlfork/cxlfork-repro/scripts/stop-cxlfork-vms.sh cxl
 | cohort-cxl | 415.141 ms | 3.752 ms | 2020.826 MEdges/s |
 | cohort | 195.575 ms | 3.763 ms | 4290.757 MEdges/s |
 
-CXLfork+HydraRPC 的 148.402 ms 仍比 vm-dram 快 19.3%，吞吐高 23.9%；它也快于其余四个单机系统。因此当前数据不能支撑“分布式路径一定更慢”，更不能按预期人为调慢或筛选样本。
+CXLfork+HydraRPC 的对齐后 `elapsed_ms` 为 175.799 ms，比 vm-dram 的
+183.855 ms 快约 4.4%，吞吐高约 4.6%；若把跨 OS ARM、restore、线程创建和结果
+返回计入，`job_e2e_ms` 为 183.601 ms。新数据不再具有旧版 19.3% 的巨大优势，
+说明 machine/CPU/topology/绑核确实显著影响结论；但它仍不能支撑“分布式路径一定
+更慢”，更不能按预期人为调慢或筛选样本。
 
-这一次已经排除了“分布式侧忙轮询、单机侧 futex”这一明显差异：单机程序保持原 futex 不变，分布式侧改为纯 HydraRPC UMWAIT，并且五次样本都确认 `effective_notify=umwait`。剩余最重要的系统差异是资源拓扑：单机在一个 32-vCPU guest 中执行，而分布式实验把 32 个 worker 分到两个 16-vCPU guest，并分别固定在 host 的两个 NUMA 节点；图、rank 数组和内存带宽也随之分区。这个双 socket 并行收益足以覆盖跨 OS 同步开销，是目前最符合证据的解释。
+这一次已经排除了“分布式侧忙轮询、单机侧 futex”这一明显差异：单机程序保持原
+futex 不变，分布式侧为纯 HydraRPC UMWAIT，五次样本都确认
+`effective_notify=umwait`。machine、基础 CPU model、socket/core/thread 总拓扑、
+host CPU 和内存 NUMA 放置也已对齐。仍无法消除的结构差异是：单机是一个
+32-vCPU guest 的两个 guest NUMA 节点，分布式是两个各 16-vCPU、单 guest NUMA
+的独立 OS；图和 rank 数组也随之天然分区。这部分局部性收益可能覆盖 HydraRPC
+同步成本，是目前最符合结果的解释。
 
 另外，单机与 CXLfork guest kernel 版本仍不同。故这批结果可用于证明真实 CXLfork restore、纯 HydraRPC 共享内存唤醒及其 breakdown，但若论文要做严格的系统优劣结论，还需要把 guest kernel、NUMA/CPU 放置和内存带宽预算进一步统一。`host_orchestration_e2e_ms` 包含 SSH 和进程启动，绝不能拿来与单机 `elapsed_ms` 比较。
