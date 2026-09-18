@@ -310,6 +310,9 @@ static int capture_rank_pfns(pr_node_ctx *ctx)
     for (uint64_t index = 0; index < total_pages; index++) {
         uint64_t rank = index / pages_per_rank;
         uint64_t page = index % pages_per_rank;
+        volatile double value = ctx->rank[rank][page * 4096 /
+                                                  sizeof(double)];
+        (void)value;
         int err = read_pagemap_pfn(
             fd, (const unsigned char *)ctx->rank[rank] + page * 4096,
             &ctx->rank_initial_pfns[index]);
