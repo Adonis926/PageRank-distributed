@@ -130,6 +130,8 @@ typedef struct pr_node_result_v1 {
     uint64_t hydra_release_ns;
     uint64_t messages_sent;
     uint64_t messages_received;
+    uint64_t data_messages_sent;
+    uint64_t barrier_messages_sent;
     uint64_t payload_bytes_sent;
     uint64_t payload_bytes_received;
     uint64_t send_retries;
@@ -195,6 +197,8 @@ typedef struct pr_transport_stats {
     uint64_t release_ns;
     uint64_t messages_sent;
     uint64_t messages_received;
+    uint64_t data_messages_sent;
+    uint64_t barrier_messages_sent;
     uint64_t payload_bytes_sent;
     uint64_t payload_bytes_received;
     uint64_t send_retries;
@@ -265,7 +269,7 @@ typedef struct pr_write_chunk_arg {
 _Static_assert(sizeof(pr_arm_v1) == 160, "arm wire ABI changed");
 _Static_assert(sizeof(pr_arm_result_v1) == 216, "arm result ABI changed");
 _Static_assert(sizeof(pr_start_v1) == 56, "start wire ABI changed");
-_Static_assert(sizeof(pr_node_result_v1) == 272, "node result ABI changed");
+_Static_assert(sizeof(pr_node_result_v1) == 288, "node result ABI changed");
 _Static_assert(sizeof(pr_chunk_v1) == 56, "chunk wire ABI changed");
 _Static_assert(sizeof(pr_barrier_v1) == 56, "barrier wire ABI changed");
 
@@ -749,6 +753,7 @@ static int send_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
         if (err == 0) {
             stats->send_ns += now_ns() - begin;
             stats->messages_sent++;
+            stats->data_messages_sent++;
             stats->payload_bytes_sent += length64;
             return 0;
         }
@@ -820,6 +825,7 @@ static int send_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     stats->send_ns += now_ns() - begin;
     if (err == 0) {
         stats->messages_sent++;
+        stats->barrier_messages_sent++;
         stats->payload_bytes_sent += sizeof(header);
     }
     return err;
@@ -1090,6 +1096,8 @@ static void sum_transport(const pr_node_ctx *ctx, pr_node_result_v1 *result)
         result->hydra_release_ns += stats->release_ns;
         result->messages_sent += stats->messages_sent;
         result->messages_received += stats->messages_received;
+        result->data_messages_sent += stats->data_messages_sent;
+        result->barrier_messages_sent += stats->barrier_messages_sent;
         result->payload_bytes_sent += stats->payload_bytes_sent;
         result->payload_bytes_received += stats->payload_bytes_received;
         result->send_retries += stats->send_retries;
@@ -1355,6 +1363,10 @@ static int run_coordinator(const pr_options *options)
                             : remote_result.elapsed_ns;
     uint64_t messages = local_result.messages_sent +
                         remote_result.messages_sent;
+    uint64_t data_messages = local_result.data_messages_sent +
+                             remote_result.data_messages_sent;
+    uint64_t barrier_messages = local_result.barrier_messages_sent +
+                                remote_result.barrier_messages_sent;
     uint64_t bytes = local_result.payload_bytes_sent +
                      remote_result.payload_bytes_sent;
     uint64_t hydra_send_ns = local_result.hydra_send_ns +
@@ -1384,6 +1396,18 @@ static int run_coordinator(const pr_options *options)
     double edges = 2.0 * options->vertices * options->degree *
                    options->iterations;
 
+    if (messages != data_messages + barrier_messages ||
+        data_messages != UINT64_C(2) * options->iterations *
+                             options->chunks * options->threads ||
+        barrier_messages != UINT64_C(2) * options->iterations *
+                                options->threads) {
+        print_error("validate HydraRPC message accounting", EILSEQ);
+        hydra_close(control);
+        hydra_close(reverse_control);
+        node_close(&ctx);
+        return 1;
+    }
+
     printf("pr_run_v1 status=ok backend=%s state=%s notify=%s"
            " effective_notify=%s run_id=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
@@ -1412,6 +1436,8 @@ static int run_coordinator(const pr_options *options)
            " hydra_send_cpu_sum_ms=%.3f hydra_recv_wait_sum_ms=%.3f"
            " hydra_release_sum_ms=%.3f hydra_wait_cpu_sum_ms=%.3f"
            " hydra_wait_calls=%" PRIu64 " messages=%" PRIu64
+           " data_messages=%" PRIu64 " barrier_messages=%" PRIu64
+           " messages_per_iteration=%.3f messages_per_second=%.3f"
            " local_futex_wait_sum_ms=%.3f local_futex_wake_sum_ms=%.3f"
            " local_futex_wait_calls=%" PRIu64
            " local_futex_wake_calls=%" PRIu64
@@ -1469,7 +1495,10 @@ static int run_coordinator(const pr_options *options)
            hydra_send_ns / 1e6,
            hydra_recv_wait_ns / 1e6, hydra_release_ns / 1e6,
            hydra_wait_ns / 1e6, hydra_wait_calls,
-           messages, local_futex_wait_ns / 1e6,
+           messages, data_messages, barrier_messages,
+           (double)messages / options->iterations,
+           messages / (elapsed_ns / 1e9),
+           local_futex_wait_ns / 1e6,
            local_futex_wake_ns / 1e6, local_futex_wait_calls,
            local_futex_wake_calls, local_futex_handoff_ns / 1e6,
            local_futex_handoff_calls,

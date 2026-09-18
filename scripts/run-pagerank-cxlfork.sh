@@ -329,6 +329,13 @@ run_once() {
       [[ $inspected_pages == "$expected_pages" ]]
       [[ $changed_pages == "$expected_pages" ]]
       [[ $leaf_count =~ ^[1-9][0-9]*$ ]]
+      [[ $(field cxlfork_faults "$coordinator_log") == "$expected_pages" ]]
+      [[ $(field cxlfork_local_copy_pages "$coordinator_log") == "$expected_pages" ]]
+      [[ $(field cxlfork_leaf_copy_pages "$coordinator_log") == "$leaf_count" ]]
+      awk -v value="$(field cxlfork_data_cow_ms "$coordinator_log")" \
+        'BEGIN { exit !(value > 0) }'
+      awk -v value="$(field cxlfork_leaf_materialize_ms "$coordinator_log")" \
+        'BEGIN { exit !(value > 0) }'
     fi
     vm_ssh "$PR_VM0_PORT" "sudo '$PR_GUEST_BINARY' inspect \
       --key='$PR_KEY' --generation='$PR_GENERATION'" \

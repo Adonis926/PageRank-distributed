@@ -151,7 +151,9 @@ def main() -> int:
         "local_futex_wake_sum_ms", "local_futex_wait_calls",
         "local_futex_wake_calls", "local_futex_handoff_sum_ms",
         "local_futex_handoff_calls", "local_futex_handoff_mean_us",
-        "messages", "payload_bytes", "source_log",
+        "messages", "data_messages", "barrier_messages",
+        "messages_per_iteration", "messages_per_second",
+        "payload_bytes", "source_log",
     ]
     write_csv(root / "transport.csv", rows, transport)
 
