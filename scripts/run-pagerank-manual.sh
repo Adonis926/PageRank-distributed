@@ -196,6 +196,7 @@ sudo env "${LAUNCH_ENV[@]}" "$START_VMS" cxl
 # The generic launcher binds each QEMU process to its allowed set.  This
 # action pins qemu-vcpuN one-to-one and validates non-overlap for 8--64u.
 sudo env PR_SCALE="$PR_SCALE" PR_PROFILE="$PROFILE" \
+  PR_WORKERS_PER_VM="${PR_WORKERS_PER_VM:-}" \
   "$RUNNER" pin-vcpus
 
 SSH_OPTIONS=(
@@ -226,6 +227,7 @@ PR_RESULT_DIR="$RESULT_DIR" \
 PR_LOCAL_DIAGNOSTIC=0 \
 PR_SCALE="$PR_SCALE" \
 PR_PROFILE="$PROFILE" \
+PR_WORKERS_PER_VM="${PR_WORKERS_PER_VM:-}" \
   "$RUNNER" bench
 
 echo
