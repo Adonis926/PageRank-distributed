@@ -52,9 +52,60 @@ cmdline_has_arg() {
   tr '\0' '\n' <"/proc/$pid/cmdline" | grep -Fqx -- "$expected"
 }
 
+expand_cpu_list() {
+  local specification=$1 part begin end cpu
+  local -a parts
+
+  IFS=',' read -r -a parts <<<"$specification"
+  for part in "${parts[@]}"; do
+    if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      begin=${BASH_REMATCH[1]}
+      end=${BASH_REMATCH[2]}
+    elif [[ $part =~ ^[0-9]+$ ]]; then
+      begin=$part
+      end=$part
+    else
+      echo "invalid CPU list component: $part" >&2
+      return 1
+    fi
+    (( begin <= end )) || return 1
+    for ((cpu = begin; cpu <= end; cpu++)); do
+      printf '%s\n' "$cpu"
+    done
+  done
+}
+
+validate_host_cpu_lists() {
+  local overlap expected_overlap=${PR_EXPECTED_HOST_CPU_OVERLAP:-0}
+  local vm0_count vm1_count vm0_unique vm1_unique
+
+  vm0_count=$(expand_cpu_list "$PR_VM0_HOST_CPUS" | wc -l)
+  vm1_count=$(expand_cpu_list "$PR_VM1_HOST_CPUS" | wc -l)
+  vm0_unique=$(expand_cpu_list "$PR_VM0_HOST_CPUS" | sort -un | wc -l)
+  vm1_unique=$(expand_cpu_list "$PR_VM1_HOST_CPUS" | sort -un | wc -l)
+  [[ $vm0_count -eq $PR_VM_SMP && $vm1_count -eq $PR_VM_SMP &&
+     $vm0_unique -eq $vm0_count && $vm1_unique -eq $vm1_count ]] || {
+    echo "host CPU lists must each contain exactly $PR_VM_SMP unique CPUs" >&2
+    return 1
+  }
+  overlap=$(comm -12 \
+    <(expand_cpu_list "$PR_VM0_HOST_CPUS" | sort -un) \
+    <(expand_cpu_list "$PR_VM1_HOST_CPUS" | sort -un) | wc -l)
+  [[ $overlap -eq $expected_overlap ]] || {
+    echo "host CPU overlap=$overlap expected=$expected_overlap" >&2
+    return 1
+  }
+  if (( overlap > 0 )) && [[ ${PR_ALLOW_HOST_CPU_OVERLAP:-0} != 1 ]]; then
+    echo "host CPU lists overlap on $overlap CPUs without explicit permission" >&2
+    return 1
+  fi
+  echo "pagerank_host_cpu_lists=ok vm_cpus=$PR_VM_SMP overlap=$overlap"
+}
+
 validate_qemu_platform() {
-  local name cpus pid actual_qemu expected_cpu expected_machine expected_smp
-  local begin end index tid actual_cpu
+  local name cpu_spec pid actual_qemu expected_cpu expected_machine expected_smp
+  local index tid actual_cpu
+  local -a host_cpus
   expected_cpu=${PR_CPU_MODEL:?PR_CPU_MODEL is required}
   expected_machine="${PR_MACHINE:?PR_MACHINE is required},accel=kvm,nvdimm=on"
   expected_smp="$PR_VM_SMP,sockets=$PR_VM_SOCKETS,cores=$PR_VM_CORES,threads=$PR_VM_THREADS"
@@ -64,9 +115,10 @@ validate_qemu_platform() {
     return 1
   }
 
+  validate_host_cpu_lists
   for spec in "vm0:$PR_VM0_HOST_CPUS" "vm1:$PR_VM1_HOST_CPUS"; do
     name=${spec%%:*}
-    cpus=${spec#*:}
+    cpu_spec=${spec#*:}
     pid=$(qemu_pid "$name")
     [[ -n $pid ]] || {
       echo "cannot find QEMU process for $name" >&2
@@ -96,13 +148,8 @@ validate_qemu_platform() {
         return 1
       }
 
-    [[ $cpus =~ ^([0-9]+)-([0-9]+)$ ]] || {
-      echo "$name expected CPU range is not contiguous: $cpus" >&2
-      return 1
-    }
-    begin=${BASH_REMATCH[1]}
-    end=${BASH_REMATCH[2]}
-    [[ $((end - begin + 1)) -eq $PR_VM_SMP ]] || return 1
+    mapfile -t host_cpus < <(expand_cpu_list "$cpu_spec")
+    [[ ${#host_cpus[@]} -eq $PR_VM_SMP ]] || return 1
     for ((index = 0; index < PR_VM_SMP; index++)); do
       tid=$(ps -T -p "$pid" -o tid=,comm= |
         awk -v wanted="qemu-vcpu$index" '$2 == wanted {print $1; exit}')
@@ -111,8 +158,8 @@ validate_qemu_platform() {
         return 1
       }
       actual_cpu=$(taskset -pc "$tid" | awk -F': ' '{print $2}')
-      [[ $actual_cpu == $((begin + index)) ]] || {
-        echo "$name qemu-vcpu$index affinity=$actual_cpu expected=$((begin + index))" >&2
+      [[ $actual_cpu == "${host_cpus[$index]}" ]] || {
+        echo "$name qemu-vcpu$index affinity=$actual_cpu expected=${host_cpus[$index]}" >&2
         return 1
       }
     done
@@ -145,16 +192,11 @@ validate_guest_platform() {
 
 pin_one_vm() {
   local name=$1 pidfile=$2 cpus=$3
-  local begin end pid count tid index
-  [[ $cpus =~ ^([0-9]+)-([0-9]+)$ ]] || {
-    echo "$name CPU list must be one contiguous range, found: $cpus" >&2
-    return 1
-  }
-  begin=${BASH_REMATCH[1]}
-  end=${BASH_REMATCH[2]}
-  count=$((end - begin + 1))
-  [[ $count -eq $PR_VM_SMP ]] || {
-    echo "$name CPU range has $count CPUs, expected $PR_VM_SMP" >&2
+  local pid tid index
+  local -a host_cpus
+  mapfile -t host_cpus < <(expand_cpu_list "$cpus")
+  [[ ${#host_cpus[@]} -eq $PR_VM_SMP ]] || {
+    echo "$name CPU list has ${#host_cpus[@]} CPUs, expected $PR_VM_SMP" >&2
     return 1
   }
   pid=$(<"$pidfile")
@@ -166,7 +208,7 @@ pin_one_vm() {
       echo "missing $name qemu-vcpu$index below pid $pid" >&2
       return 1
     }
-    taskset -pc $((begin + index)) "$tid" >/dev/null
+    taskset -pc "${host_cpus[$index]}" "$tid" >/dev/null
   done
 }
 
@@ -175,6 +217,7 @@ pin_vcpus() {
     echo "pin-vcpus must be run with sudo" >&2
     exit 1
   }
+  validate_host_cpu_lists
   pin_one_vm vm0 "$PR_VM_WORKSPACE/pids/vm0.pid" "$PR_VM0_HOST_CPUS"
   pin_one_vm vm1 "$PR_VM_WORKSPACE/pids/vm1.pid" "$PR_VM1_HOST_CPUS"
   echo "pagerank_vcpu_pinning=ok vm0=$PR_VM0_HOST_CPUS vm1=$PR_VM1_HOST_CPUS"
@@ -357,6 +400,8 @@ collect_manifest() {
     printf 'worker_guest_cpus=%s\nrelay_guest_cpus=%s\n' \
       "$PR_GUEST_CPUS" "$PR_RELAY_CPUS"
     printf 'guest_memory=%s\nguest_vcpus=%s\n' "$PR_VM_MEM" "$PR_VM_SMP"
+    printf 'compute_workers_total=%s\nrelay_threads_total=%s\nruntime_threads_total=%s\n' \
+      "$((2 * PR_THREADS))" "$((2 * PR_THREADS))" "$((4 * PR_THREADS))"
     printf 'qemu=%s\nmachine=%s\ncpu_model=%s\nhydra_pci_bus=%s\n' \
       "$PR_QEMU" "$PR_MACHINE" "$PR_CPU_MODEL" "$PR_HYDRA_PCI_BUS"
     printf 'hydra0_pci_addr=%s\nhydra1_pci_addr=%s\n' \
@@ -368,6 +413,8 @@ collect_manifest() {
     printf 'guest_append_extra=%s\n' "$PR_GUEST_APPEND_EXTRA"
     printf 'vm0_host_cpus=%s\nvm1_host_cpus=%s\n' \
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
+    printf 'host_cpu_overlap=%s\nhost_cpu_overlap_allowed=%s\n' \
+      "${PR_EXPECTED_HOST_CPU_OVERLAP:-0}" "${PR_ALLOW_HOST_CPU_OVERLAP:-0}"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
     printf 'notify=%s\n' "$PR_NOTIFY"
     printf 'signal_path=hydra-busy-local-futex\n'
