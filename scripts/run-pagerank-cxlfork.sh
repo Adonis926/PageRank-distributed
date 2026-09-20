@@ -89,8 +89,8 @@ validate_host_cpu_lists() {
     return 1
   }
   overlap=$(comm -12 \
-    <(expand_cpu_list "$PR_VM0_HOST_CPUS" | sort -un) \
-    <(expand_cpu_list "$PR_VM1_HOST_CPUS" | sort -un) | wc -l)
+    <(expand_cpu_list "$PR_VM0_HOST_CPUS" | sort -u) \
+    <(expand_cpu_list "$PR_VM1_HOST_CPUS" | sort -u) | wc -l)
   [[ $overlap -eq $expected_overlap ]] || {
     echo "host CPU overlap=$overlap expected=$expected_overlap" >&2
     return 1
