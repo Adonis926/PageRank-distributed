@@ -493,6 +493,34 @@ static int parse_cpu_list(const char *text, int *cpus, uint32_t capacity)
     return (int)count;
 }
 
+static const char *relay_cpu_policy_name(const pr_options *options)
+{
+    int worker_cpus[PR_MAX_THREADS];
+    int relay_cpus[PR_MAX_THREADS];
+
+    if (options->receive_mode == PR_RECEIVE_DIRECT) {
+        return "none";
+    }
+    if (options->relay_cpu_list == NULL) {
+        return "shared";
+    }
+    int worker_count = parse_cpu_list(options->cpu_list, worker_cpus,
+                                      PR_MAX_THREADS);
+    int relay_count = parse_cpu_list(options->relay_cpu_list, relay_cpus,
+                                     PR_MAX_THREADS);
+    if (worker_count < 0 || relay_count < 0) {
+        return "invalid";
+    }
+    for (int worker = 0; worker < worker_count; worker++) {
+        for (int relay = 0; relay < relay_count; relay++) {
+            if (worker_cpus[worker] == relay_cpus[relay]) {
+                return "shared";
+            }
+        }
+    }
+    return "dedicated";
+}
+
 static int pin_thread(int cpu)
 {
     cpu_set_t set;
@@ -1772,15 +1800,7 @@ static int run_coordinator(const pr_options *options)
            options->threads, options->threads * 2,
            relay_threads_per_node(options),
            signal_path_name(options), receive_mode_name(options->receive_mode),
-           options->receive_mode == PR_RECEIVE_DIRECT
-               ? "none"
-               : (options->receive_mode == PR_RECEIVE_SINGLE_RELAY
-                      ? "shared"
-                      : (options->relay_cpu_list != NULL &&
-                          strcmp(options->relay_cpu_list,
-                                 options->cpu_list) != 0
-                      ? "dedicated"
-                      : "shared")),
+           relay_cpu_policy_name(options),
            options->threads * 2,
            relay_threads_per_node(options) * 2,
            options->threads * 2 + relay_threads_per_node(options) * 2,

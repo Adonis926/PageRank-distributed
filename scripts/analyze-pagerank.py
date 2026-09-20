@@ -129,7 +129,7 @@ def main() -> int:
             if int(row["local_futex_handoff_calls"]) == 0:
                 raise RuntimeError(f"local futex handoff was not observed in {path}")
         elif receive_mode == "shared-relay":
-            if row.get("relay_cpu_policy") != "shared":
+            if row.get("relay_cpu_policy") not in {"shared", "dedicated"}:
                 raise RuntimeError(f"shared relay CPU policy mismatch in {path}")
             relay_count = int(row["relay_threads_per_node"])
             worker_count = int(row["threads_per_node"])

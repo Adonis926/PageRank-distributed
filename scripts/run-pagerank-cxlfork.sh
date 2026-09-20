@@ -13,6 +13,7 @@ case "$PR_RECEIVE_MODE" in
   *) echo "PR_RECEIVE_MODE must be relay, direct, or shared-relay" >&2; exit 2 ;;
 esac
 PR_SHARED_RELAYS=${PR_SHARED_RELAYS:-1}
+PR_EXPECTED_RELAY_CPU_POLICY=${PR_EXPECTED_RELAY_CPU_POLICY:-shared}
 
 ACTION=${1:-bench}
 STAMP=${PR_STAMP:-$(date +%Y%m%d-%H%M%S)}
@@ -383,7 +384,7 @@ run_once() {
     grep -q 'signal_path=hydra-busy-shared-relay-futex' "$coordinator_log"
     grep -q 'receive_mode=shared-relay' "$coordinator_log"
     grep -q "relay_threads_per_node=$PR_SHARED_RELAYS" "$coordinator_log"
-    grep -q 'relay_cpu_policy=shared' "$coordinator_log"
+    grep -q "relay_cpu_policy=$PR_EXPECTED_RELAY_CPU_POLICY" "$coordinator_log"
     grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
     grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
     grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"

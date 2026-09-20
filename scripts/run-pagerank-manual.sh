@@ -43,7 +43,7 @@ source "$PROFILE"
 
 relay_suffix=
 if [[ $PR_RECEIVE_MODE == shared-relay ]]; then
-  relay_suffix=-r${PR_SHARED_RELAYS:-1}
+  relay_suffix=-w${PR_THREADS}-r${PR_SHARED_RELAYS:-1}
 fi
 STAMP=manual-${PR_RECEIVE_MODE}${relay_suffix}-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
 RESULT_DIR=/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/$STAMP
@@ -112,7 +112,7 @@ print_plan() {
   fi
   cat <<EOF
 profile_check=ok
-compute_workers_total=$PR_SCALE
+compute_workers_total=$((2 * PR_THREADS))
 compute_workers_per_vm=$PR_THREADS
 receive_mode=$PR_RECEIVE_MODE
 relay_threads_per_vm=$relay_threads_per_vm
