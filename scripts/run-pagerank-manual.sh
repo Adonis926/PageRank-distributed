@@ -100,12 +100,18 @@ require_paths() {
 }
 
 print_plan() {
+  local relay_threads_per_vm=0
+  if [[ $PR_RECEIVE_MODE == relay ]]; then
+    relay_threads_per_vm=$PR_THREADS
+  elif [[ $PR_RECEIVE_MODE == single-relay ]]; then
+    relay_threads_per_vm=1
+  fi
   cat <<EOF
 profile_check=ok
 compute_workers_total=$PR_SCALE
 compute_workers_per_vm=$PR_THREADS
 receive_mode=$PR_RECEIVE_MODE
-relay_threads_per_vm=0
+relay_threads_per_vm=$relay_threads_per_vm
 guest_vcpus_per_vm=$PR_VM_SMP
 guest_memory_per_vm=$PR_VM_MEM
 vm0_host_cpus=$PR_VM0_HOST_CPUS
