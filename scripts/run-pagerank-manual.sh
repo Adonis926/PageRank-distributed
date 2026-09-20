@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCALE=${1:-}
 OPTION=${2:-}
-PROFILE=$ROOT/config/pagerank-real-cxl-103-direct-scaling.env
+PROFILE=${PR_PROFILE_OVERRIDE:-$ROOT/config/pagerank-real-cxl-103-direct-scaling.env}
 
 VM_WORKSPACE=/home/xtl/cxlfork/cxlfork-repro
 START_VMS=$VM_WORKSPACE/scripts/start-cxlfork-vms.sh
@@ -22,7 +22,7 @@ usage:
   ./scripts/run-pagerank-manual.sh 8|16|32|64|128 --check
 
 The number is both the total PageRank compute-worker count and the total guest
-vCPU count across both VMs. Direct mode creates no HydraRPC relay threads.
+vCPU count across both VMs. The selected profile defines the relay mode.
 EOF
 }
 
@@ -41,7 +41,7 @@ export PR_PROFILE=$PROFILE
 # shellcheck source=/dev/null
 source "$PROFILE"
 
-STAMP=manual-direct-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
+STAMP=manual-${PR_RECEIVE_MODE}-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
 RESULT_DIR=/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/$STAMP
 
 LAUNCH_ENV=(

@@ -106,13 +106,13 @@ def main() -> int:
         if row.get("residual_mode") != "final-only":
             raise RuntimeError(f"unexpected residual policy in {path}")
         receive_mode = row.get("receive_mode")
-        if receive_mode not in {"relay", "direct"}:
+        if receive_mode not in {"relay", "direct", "single-relay"}:
             raise RuntimeError(f"unexpected receive mode in {path}")
-        expected_signal_path = (
-            "hydra-busy-local-futex"
-            if receive_mode == "relay"
-            else "hydra-busy-direct"
-        )
+        expected_signal_path = {
+            "relay": "hydra-busy-local-futex",
+            "direct": "hydra-busy-direct",
+            "single-relay": "hydra-busy-single-relay-futex",
+        }[receive_mode]
         if row.get("signal_path") != expected_signal_path:
             raise RuntimeError(f"unexpected cross-OS signal path in {path}")
         if row.get("notify") != "busy" or row.get("effective_notify") != "busy":
@@ -128,6 +128,18 @@ def main() -> int:
                 raise RuntimeError(f"local futex wake path was not exercised in {path}")
             if int(row["local_futex_handoff_calls"]) == 0:
                 raise RuntimeError(f"local futex handoff was not observed in {path}")
+        elif receive_mode == "single-relay":
+            if row.get("relay_cpu_policy") != "shared-one":
+                raise RuntimeError(f"single relay CPU policy mismatch in {path}")
+            if int(row["relay_threads_per_node"]) != 1:
+                raise RuntimeError(f"single relay count mismatch in {path}")
+            for field in (
+                "local_futex_wait_calls",
+                "local_futex_wake_calls",
+                "local_futex_handoff_calls",
+            ):
+                if int(row[field]) == 0:
+                    raise RuntimeError(f"single relay did not exercise {field} in {path}")
         else:
             if row.get("relay_cpu_policy") != "none":
                 raise RuntimeError(f"direct mode unexpectedly has relay CPUs in {path}")
