@@ -69,6 +69,7 @@ typedef struct pr_options {
     uint64_t timeout_ms;
     hydra_notify_mode notify_mode;
     pr_receive_mode receive_mode;
+    bool trace_stages;
     bool checksum;
     pr_cxlfork_options cxlfork;
 } pr_options;
@@ -352,6 +353,17 @@ static int open_start_gate(pr_node_ctx *ctx)
 static void print_error(const char *what, int err)
 {
     fprintf(stderr, "%s: %s (%d)\n", what, strerror(err), err);
+}
+
+static void trace_stage(const pr_options *options, const char *role,
+                        const char *stage)
+{
+    if (!options->trace_stages) {
+        return;
+    }
+    fprintf(stderr, "pr_stage_v1 role=%s stage=%s time_ns=%" PRIu64 "\n",
+            role, stage, now_ns());
+    fflush(stderr);
 }
 
 static uint64_t parse_u64(const char *text, const char *name)
@@ -1272,6 +1284,7 @@ static int run_coordinator(const pr_options *options)
     int err;
     uint64_t build_begin = now_ns();
 
+    trace_stage(options, "coordinator", "entry");
     ctx.run_id = now_ns() ^ (uint64_t)getpid();
     err = open_hydra(&control, options, options->tx_path, 0, true);
     if (err == 0) {
@@ -1282,7 +1295,11 @@ static int run_coordinator(const pr_options *options)
         print_error("create HydraRPC endpoints", err);
         return 1;
     }
+    trace_stage(options, "coordinator", "control_open");
     err = node_open_data_contexts(&ctx, true);
+    if (err == 0) {
+        trace_stage(options, "coordinator", "data_contexts_open");
+    }
     if (err == 0) {
         err = pr_graph_build_local(&ctx.graph, 0, options->vertices,
                                    options->degree,
@@ -1290,6 +1307,7 @@ static int run_coordinator(const pr_options *options)
     }
     if (err == 0) {
         ctx.graph_checksum = pr_graph_checksum(&ctx.graph);
+        trace_stage(options, "coordinator", "graph_ready");
     }
     uint64_t graph_build_ns = now_ns() - build_begin;
     if (err != 0) {
@@ -1320,12 +1338,16 @@ static int run_coordinator(const pr_options *options)
         .receive_mode = options->receive_mode,
     };
     uint64_t job_begin_ns = now_ns();
+    trace_stage(options, "coordinator", "arm_send_begin");
     err = send_request_wait(control, ctx.run_id, PR_OP_ARM, &arm,
                             sizeof(arm), options->timeout_ms,
                             options->notify_mode, NULL);
     if (err == 0) {
         err = recv_response_wait(control, &offset, &message, &payload,
                                  options->timeout_ms, options->notify_mode);
+    }
+    if (err == 0) {
+        trace_stage(options, "coordinator", "arm_response_received");
     }
     pr_arm_result_v1 remote_arm;
     if (err == 0 && (message->status != 0 ||
@@ -1360,6 +1382,7 @@ static int run_coordinator(const pr_options *options)
         node_close(&ctx);
         return 1;
     }
+    trace_stage(options, "coordinator", "compute_threads_ready");
     pr_start_v1 start = {
         .magic = PR_WIRE_MAGIC,
         .version = PR_WIRE_VERSION,
@@ -1367,6 +1390,7 @@ static int run_coordinator(const pr_options *options)
         .run_id = ctx.run_id,
     };
     uint64_t start_publish_begin = now_ns();
+    trace_stage(options, "coordinator", "start_send_begin");
     err = send_request_wait(control, ctx.run_id + 1, PR_OP_START, &start,
                             sizeof(start), options->timeout_ms,
                             options->notify_mode, NULL);
@@ -1632,15 +1656,25 @@ static int run_worker(const pr_options *options)
     uint64_t offset;
     int err;
 
+    trace_stage(options, "worker", "entry");
     err = open_hydra_retry(&control, options, options->rx_path, 0);
     if (err == 0) {
         err = open_hydra_retry(&reverse_control, options, options->tx_path, 0);
     }
     if (err == 0) {
+        trace_stage(options, "worker", "control_open");
+    }
+    if (err == 0) {
         err = node_open_data_contexts(&ctx, false);
+    }
+    if (err == 0) {
+        trace_stage(options, "worker", "data_contexts_open");
     }
     if (err == 0 && options->state_mode == PR_STATE_CXLFORK) {
         err = pr_cxlfork_context_open(&options->cxlfork, &cxlfork);
+    }
+    if (err == 0) {
+        trace_stage(options, "worker", "cxlfork_context_open");
     }
     if (err != 0) {
         print_error("worker preopen", err);
@@ -1657,17 +1691,25 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         err = validate_arm(options, message, payload, &arm);
     }
+    if (err == 0) {
+        trace_stage(options, "worker", "arm_received");
+    }
     uint64_t arm_begin_ns = now_ns();
     uint64_t graph_begin_ns = arm_begin_ns;
     if (err == 0) {
         ctx.run_id = arm.run_id;
         if (options->state_mode == PR_STATE_CXLFORK) {
+            trace_stage(options, "worker", "cxlfork_restore_begin");
             err = pr_cxlfork_restore(&options->cxlfork, &cxlfork,
                                      &ctx.graph, ctx.rank);
             if (err == 0) {
+                trace_stage(options, "worker", "cxlfork_restore_done");
                 ctx.rank_template_backed = true;
                 ctx.graph_checksum = cxlfork.graph_checksum;
                 err = pr_cxlfork_collect(&cxlfork);
+                if (err == 0) {
+                    trace_stage(options, "worker", "cxlfork_collect_done");
+                }
             }
         } else {
             err = pr_graph_build_local(&ctx.graph, 1, options->vertices,
@@ -1684,6 +1726,9 @@ static int run_worker(const pr_options *options)
         err = node_init_compute(&ctx);
     }
     uint64_t thread_create_ns = now_ns() - thread_begin_ns;
+    if (err == 0) {
+        trace_stage(options, "worker", "compute_threads_ready");
+    }
     pr_arm_result_v1 arm_result = {
         .magic = PR_WIRE_MAGIC,
         .version = PR_WIRE_VERSION,
@@ -1714,6 +1759,9 @@ static int run_worker(const pr_options *options)
         control, message, err == 0 ? 0U : (uint32_t)err,
         &arm_result, sizeof(arm_result), options->timeout_ms,
         options->notify_mode);
+    if (response_error == 0) {
+        trace_stage(options, "worker", "arm_response_sent");
+    }
     err = release_control_message(control, offset,
                                   err != 0 ? err : response_error);
     if (err != 0) {
@@ -1742,6 +1790,9 @@ static int run_worker(const pr_options *options)
                 err = EILSEQ;
             }
         }
+    }
+    if (err == 0) {
+        trace_stage(options, "worker", "start_received");
     }
     hydra_msg start_request;
     if (have_start_request) {
@@ -1936,6 +1987,7 @@ static void usage(const char *program)
             "  --relay-cpus=LIST (defaults to --cpus)\n"
             "  --state=local|cxlfork --checksum=on|off --timeout-ms=N\n"
             "  --notify=umwait|busy --receive-mode=relay|direct\n"
+            "  --trace-stages (diagnostic stage markers on stderr)\n"
             "  --map-size=N --queue-capacity=N --payload-max=N\n"
             "  --key=N --generation=N --page-checksum=N\n"
             "  --template-base=N --template-bytes=N --full-validate\n",
@@ -2055,6 +2107,8 @@ static int parse_options(int argc, char **argv, pr_options *options)
             options->cxlfork.bytes = parse_u64(value, "template bytes");
         } else if (strcmp(arg, "--full-validate") == 0) {
             options->cxlfork.full_validate = true;
+        } else if (strcmp(arg, "--trace-stages") == 0) {
+            options->trace_stages = true;
         } else {
             fprintf(stderr, "unknown option: %s\n", arg);
             return EINVAL;

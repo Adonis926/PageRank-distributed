@@ -7,6 +7,7 @@ PROFILE=${PR_PROFILE:-$ROOT/config/pagerank-real-cxl-103.env}
 source "$PROFILE"
 
 PR_RECEIVE_MODE=${PR_RECEIVE_MODE:-relay}
+PR_TRACE_STAGES=${PR_TRACE_STAGES:-0}
 case "$PR_RECEIVE_MODE" in
   relay|direct) ;;
   *) echo "PR_RECEIVE_MODE must be relay or direct" >&2; exit 2 ;;
@@ -296,6 +297,9 @@ common_args() {
   if [[ $PR_RECEIVE_MODE == relay ]]; then
     printf '%s ' "--relay-cpus=$PR_RELAY_CPUS"
   fi
+  if [[ $PR_TRACE_STAGES == 1 ]]; then
+    printf '%s ' "--trace-stages"
+  fi
 }
 
 prepare_template() {
@@ -440,6 +444,7 @@ collect_manifest() {
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
     printf 'notify=%s\n' "$PR_NOTIFY"
     printf 'receive_mode=%s\n' "$PR_RECEIVE_MODE"
+    printf 'trace_stages=%s\n' "$PR_TRACE_STAGES"
     if [[ $PR_RECEIVE_MODE == relay ]]; then
       printf 'signal_path=hydra-busy-local-futex\n'
       printf 'relay_threads_per_node=%s\n' "$PR_THREADS"
