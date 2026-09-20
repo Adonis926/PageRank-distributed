@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCALE=${1:-}
 OPTION=${2:-}
-PROFILE=$ROOT/config/pagerank-real-cxl-103-scaling.env
+PROFILE=$ROOT/config/pagerank-real-cxl-103-direct-scaling.env
 
 VM_WORKSPACE=/home/xtl/cxlfork/cxlfork-repro
 START_VMS=$VM_WORKSPACE/scripts/start-cxlfork-vms.sh
@@ -18,28 +18,20 @@ RUNNER=$ROOT/scripts/run-pagerank-cxlfork.sh
 usage() {
   cat <<'EOF'
 usage:
-  ./scripts/run-pagerank-manual.sh 8|16|32|64
-  ./scripts/run-pagerank-manual.sh 8|16|32|64 --check
-  ./scripts/run-pagerank-manual.sh 128 --allow-overcommit
+  ./scripts/run-pagerank-manual.sh 8|16|32|64|128
+  ./scripts/run-pagerank-manual.sh 8|16|32|64|128 --check
 
-The number is the total PageRank compute-worker count across both VMs.
-The normal paper sequence is 8, 16, 32, and 64.  The 128 point needs 256
-guest vCPUs and is therefore an overcommit diagnostic on this 192-CPU host.
+The number is both the total PageRank compute-worker count and the total guest
+vCPU count across both VMs. Direct mode creates no HydraRPC relay threads.
 EOF
 }
 
 case "$SCALE" in
-  8|16|32|64) ;;
-  128)
-    [[ $OPTION == --allow-overcommit || $OPTION == --check ]] || {
-      echo "128u is an overcommit diagnostic; add --allow-overcommit explicitly" >&2
-      exit 2
-    }
-    ;;
+  8|16|32|64|128) ;;
   -h|--help|help|"") usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
-[[ -z $OPTION || $OPTION == --check || $OPTION == --allow-overcommit ]] || {
+[[ -z $OPTION || $OPTION == --check ]] || {
   usage >&2
   exit 2
 }
@@ -49,7 +41,7 @@ export PR_PROFILE=$PROFILE
 # shellcheck source=/dev/null
 source "$PROFILE"
 
-STAMP=manual-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
+STAMP=manual-direct-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
 RESULT_DIR=/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/$STAMP
 
 LAUNCH_ENV=(
@@ -112,7 +104,8 @@ print_plan() {
 profile_check=ok
 compute_workers_total=$PR_SCALE
 compute_workers_per_vm=$PR_THREADS
-relay_threads_per_vm=$PR_THREADS
+receive_mode=$PR_RECEIVE_MODE
+relay_threads_per_vm=0
 guest_vcpus_per_vm=$PR_VM_SMP
 guest_memory_per_vm=$PR_VM_MEM
 vm0_host_cpus=$PR_VM0_HOST_CPUS

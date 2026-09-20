@@ -78,7 +78,7 @@ workload，而不是给 `example.sh` 传不同参数。
 进入仓库：
 
 ```bash
-cd /home/xtl/cxlfork/mr-pagerank
+cd /home/xtl/cxlfork/mr-pagerank-direct-hydra-103
 ```
 
 例如，测两台 VM 合计 32 个 PageRank 计算 worker：
@@ -103,16 +103,17 @@ cd /home/xtl/cxlfork/mr-pagerank
 
 ### 3.1 核数参数到底表示什么
 
-命令后的数字表示“两台 VM 合计的 PageRank 计算 worker 数”，不是 QEMU vCPU 总数。
-当前实现给每个计算 worker 配一个专用 HydraRPC busy-poll relay，所以每台 VM 的
-vCPU 数等于总计算 worker 数。
+这个 direct-HydraRPC 分支中，命令后的数字同时表示“两台 VM 合计的 PageRank
+计算 worker 数”和“两台 VM 合计的 guest vCPU 数”。compute worker 自己直接
+轮询 HydraRPC 队列，不创建额外 relay 线程。
 
 | 命令参数 | 每 VM 计算 worker | 每 VM relay | 每 VM vCPU | 两 VM 总 vCPU | 总内存 |
 |---:|---:|---:|---:|---:|---:|
-| 8 | 4 | 4 | 8 | 16 | 8 GiB |
-| 16 | 8 | 8 | 16 | 32 | 8 GiB |
-| 32 | 16 | 16 | 32 | 64 | 8 GiB |
-| 64 | 32 | 32 | 64 | 128 | 8 GiB |
+| 8 | 4 | 0 | 4 | 8 | 8 GiB |
+| 16 | 8 | 0 | 8 | 16 | 8 GiB |
+| 32 | 16 | 0 | 16 | 32 | 8 GiB |
+| 64 | 32 | 0 | 32 | 64 | 8 GiB |
+| 128 | 64 | 0 | 64 | 128 | 8 GiB |
 
 正式主序列逐个执行：
 
@@ -121,18 +122,12 @@ vCPU 数等于总计算 worker 数。
 ./scripts/run-pagerank-manual.sh 16
 ./scripts/run-pagerank-manual.sh 32
 ./scripts/run-pagerank-manual.sh 64
+./scripts/run-pagerank-manual.sh 128
 ```
 
 每条命令都是一次独立实验：重新清理指定 DAX 区间、重新启动双 VM、运行 1 次预热和
-5 次正式样本，然后停止 VM。不要并行执行这四条命令。
-
-103 只有 192 个 host 逻辑 CPU。128u 会需要 128 个计算 worker 和 128 个 relay，
-也就是 256 个 guest vCPU，必然跨 VM 复用 64 个 host CPU。它不是可比较的正式点，
-脚本默认拒绝；只做超配诊断时才显式执行：
-
-```bash
-./scripts/run-pagerank-manual.sh 128 --allow-overcommit
-```
+5 次正式样本，然后停止 VM。不要并行执行这些命令。direct 模式下 128u 只需要
+128 个 guest vCPU，不再因为一对一 relay 扩大到 256 个 vCPU。
 
 ### 3.2 运行前只检查配置，不启动 VM
 
@@ -150,7 +145,7 @@ vCPU 数等于总计算 worker 数。
 
 ```text
 /home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/
-  manual-<规模>u-8g-<年月日-时分秒>/
+  manual-direct-<规模>u-8g-<年月日-时分秒>/
 ```
 
 最重要的文件是：
@@ -159,7 +154,8 @@ vCPU 数等于总计算 worker 数。
 - `runs.csv`：5 次正式样本的顶层时间与吞吐；
 - `breakdown-summary.csv`：激活、CXLfork、HydraRPC 等 breakdown 的汇总；
 - `cxlfork.csv`：restore、shared-leaf attach、数据页 CoW 和 leaf CoW；
-- `transport.csv`：HydraRPC 消息数、字节数和 relay 到 worker 的本地 futex handoff；
+- `transport.csv`：HydraRPC 消息数、字节数和直接等待时间；direct 模式要求本地
+  futex handoff 计数为 0；
 - `manifest/config.txt`：实际 worker、relay、vCPU、内存和 workload；
 - `manifest/qemu-vcpu-affinity.txt`：QEMU 参数与实际绑核证据；
 - `runs/*.coordinator.log`、`runs/*.worker.log`：不可丢失的原始日志。
