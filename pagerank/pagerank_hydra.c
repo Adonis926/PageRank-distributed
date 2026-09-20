@@ -70,6 +70,7 @@ typedef struct pr_options {
     uint64_t timeout_ms;
     hydra_notify_mode notify_mode;
     pr_receive_mode receive_mode;
+    uint32_t shared_relays;
     bool trace_stages;
     bool checksum;
     pr_cxlfork_options cxlfork;
@@ -246,7 +247,7 @@ struct pr_node_ctx {
     pthread_t worker[PR_MAX_THREADS];
     pr_worker_arg worker_arg[PR_MAX_THREADS];
     pr_rx_relay relay[PR_MAX_THREADS];
-    pr_transport_stats single_relay_transport;
+    pr_transport_stats shared_relay_transport[PR_MAX_THREADS];
     pthread_barrier_t barrier;
     atomic_uint start_gate;
     atomic_int worker_error;
@@ -418,7 +419,7 @@ static const char *receive_mode_name(pr_receive_mode mode)
     case PR_RECEIVE_DIRECT:
         return "direct";
     case PR_RECEIVE_SINGLE_RELAY:
-        return "single-relay";
+        return "shared-relay";
     case PR_RECEIVE_RELAY:
         return "relay";
     }
@@ -430,7 +431,9 @@ static uint32_t relay_threads_per_node(const pr_options *options)
     if (options->receive_mode == PR_RECEIVE_RELAY) {
         return options->threads;
     }
-    return options->receive_mode == PR_RECEIVE_SINGLE_RELAY ? 1U : 0U;
+    return options->receive_mode == PR_RECEIVE_SINGLE_RELAY
+               ? options->shared_relays
+               : 0U;
 }
 
 static const char *signal_path_name(const pr_options *options)
@@ -443,7 +446,7 @@ static const char *signal_path_name(const pr_options *options)
              options->receive_mode == PR_RECEIVE_DIRECT
                  ? "direct"
                  : (options->receive_mode == PR_RECEIVE_SINGLE_RELAY
-                        ? "single-relay-futex"
+                        ? "shared-relay-futex"
                         : "local-futex"));
     return name;
 }
@@ -728,11 +731,15 @@ static void single_relay_fail(pr_node_ctx *ctx, int error)
     }
 }
 
-static void *single_rx_relay_main(void *opaque)
+static void *shared_rx_relay_main(void *opaque)
 {
-    pr_node_ctx *ctx = opaque;
-    pr_transport_stats *stats = &ctx->single_relay_transport;
-    uint64_t message_count = (uint64_t)ctx->options.threads *
+    pr_rx_relay *relay_arg = opaque;
+    pr_node_ctx *ctx = relay_arg->ctx;
+    uint32_t relay_id = relay_arg->tid;
+    uint32_t relay_count = ctx->options.shared_relays;
+    uint32_t assigned_lanes = ctx->options.threads / relay_count;
+    pr_transport_stats *stats = &ctx->shared_relay_transport[relay_id];
+    uint64_t message_count = (uint64_t)assigned_lanes *
                              ctx->options.iterations *
                              (ctx->options.chunks + 1U);
     int cpus[PR_MAX_THREADS];
@@ -741,17 +748,17 @@ static void *single_rx_relay_main(void *opaque)
                                       : ctx->options.cpu_list;
     int cpu_count = parse_cpu_list(relay_cpu_list, cpus, PR_MAX_THREADS);
 
-    if (cpu_count < 1) {
+    if (cpu_count != (int)relay_count) {
         single_relay_fail(ctx, EINVAL);
         return NULL;
     }
-    int err = pin_thread(cpus[0]);
+    int err = pin_thread(cpus[relay_id]);
     if (err != 0) {
         single_relay_fail(ctx, err);
         return NULL;
     }
 
-    uint32_t next_lane = 0;
+    uint32_t next_slot = 0;
     uint64_t wait_begin = now_ns();
     for (uint64_t index = 0; index < message_count;) {
         uint64_t offset = 0;
@@ -761,15 +768,14 @@ static void *single_rx_relay_main(void *opaque)
         uint32_t sequence = 0;
         uint32_t lane = UINT32_MAX;
 
-        for (uint32_t scanned = 0; scanned < ctx->options.threads;
-             scanned++) {
-            uint32_t candidate =
-                (next_lane + scanned) % ctx->options.threads;
+        for (uint32_t scanned = 0; scanned < assigned_lanes; scanned++) {
+            uint32_t slot = (next_slot + scanned) % assigned_lanes;
+            uint32_t candidate = relay_id + slot * relay_count;
             err = hydra_recv_request(ctx->rx[candidate], &offset,
                                      &message, &payload);
             if (err == 0) {
                 lane = candidate;
-                next_lane = (candidate + 1U) % ctx->options.threads;
+                next_slot = (slot + 1U) % assigned_lanes;
                 break;
             }
             if (err != EAGAIN) {
@@ -783,7 +789,8 @@ static void *single_rx_relay_main(void *opaque)
                 single_relay_fail(ctx, ETIMEDOUT);
                 return NULL;
             }
-            wait_hydra(ctx->rx[next_lane], HYDRA_WAIT_REQUEST,
+            uint32_t wait_lane = relay_id + next_slot * relay_count;
+            wait_hydra(ctx->rx[wait_lane], HYDRA_WAIT_REQUEST,
                        ctx->options.notify_mode, stats);
             continue;
         }
@@ -1302,10 +1309,14 @@ static int node_init_compute(pr_node_ctx *ctx)
             atomic_init(&ctx->relay[tid].consumed, 0);
         }
         if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-            err = pthread_create(&ctx->relay[0].thread, NULL,
-                                 single_rx_relay_main, ctx);
-            if (err != 0) {
-                return err;
+            for (uint32_t relay_id = 0;
+                 relay_id < ctx->options.shared_relays; relay_id++) {
+                err = pthread_create(&ctx->relay[relay_id].thread, NULL,
+                                     shared_rx_relay_main,
+                                     &ctx->relay[relay_id]);
+                if (err != 0) {
+                    return err;
+                }
             }
         } else {
             for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
@@ -1338,9 +1349,12 @@ static int node_join_compute(pr_node_ctx *ctx)
         }
     }
     if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        int err = pthread_join(ctx->relay[0].thread, NULL);
-        if (err != 0 && join_error == 0) {
-            join_error = err;
+        for (uint32_t relay_id = 0;
+             relay_id < ctx->options.shared_relays; relay_id++) {
+            int err = pthread_join(ctx->relay[relay_id].thread, NULL);
+            if (err != 0 && join_error == 0) {
+                join_error = err;
+            }
         }
     } else if (ctx->options.receive_mode == PR_RECEIVE_RELAY) {
         for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
@@ -1386,11 +1400,15 @@ static void sum_transport(const pr_node_ctx *ctx, pr_node_result_v1 *result)
         result->local_futex_handoff_calls += stats->futex.handoff_calls;
     }
     if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        result->hydra_recv_wait_ns +=
-            ctx->single_relay_transport.recv_wait_ns;
-        result->hydra_wait_ns += ctx->single_relay_transport.wait_ns;
-        result->hydra_wait_calls +=
-            ctx->single_relay_transport.wait_calls;
+        for (uint32_t relay_id = 0;
+             relay_id < ctx->options.shared_relays; relay_id++) {
+            result->hydra_recv_wait_ns +=
+                ctx->shared_relay_transport[relay_id].recv_wait_ns;
+            result->hydra_wait_ns +=
+                ctx->shared_relay_transport[relay_id].wait_ns;
+            result->hydra_wait_calls +=
+                ctx->shared_relay_transport[relay_id].wait_calls;
+        }
     }
 }
 
@@ -1757,7 +1775,7 @@ static int run_coordinator(const pr_options *options)
            options->receive_mode == PR_RECEIVE_DIRECT
                ? "none"
                : (options->receive_mode == PR_RECEIVE_SINGLE_RELAY
-                      ? "shared-one"
+                      ? "shared"
                       : (options->relay_cpu_list != NULL &&
                           strcmp(options->relay_cpu_list,
                                  options->cpu_list) != 0
@@ -2184,7 +2202,8 @@ static void usage(const char *program)
             "  --iterations=N --chunks=N --threads=N --cpus=LIST\n"
             "  --relay-cpus=LIST (defaults to --cpus)\n"
             "  --state=local|cxlfork --checksum=on|off --timeout-ms=N\n"
-            "  --notify=umwait|busy --receive-mode=relay|direct|single-relay\n"
+            "  --notify=umwait|busy --receive-mode=relay|direct|shared-relay\n"
+            "  --shared-relays=N (shared-relay mode; divides worker lanes)\n"
             "  --trace-stages (diagnostic stage markers on stderr)\n"
             "  --map-size=N --queue-capacity=N --payload-max=N\n"
             "  --key=N --generation=N --page-checksum=N\n"
@@ -2209,6 +2228,7 @@ static void default_options(pr_options *options)
     options->timeout_ms = 120000;
     options->notify_mode = HYDRA_NOTIFY_UMWAIT;
     options->receive_mode = PR_RECEIVE_RELAY;
+    options->shared_relays = 1;
     options->cxlfork.base = PR_TEMPLATE_BASE_DEFAULT;
     options->cxlfork.bytes = PR_TEMPLATE_BYTES_DEFAULT;
 }
@@ -2280,11 +2300,15 @@ static int parse_options(int argc, char **argv, pr_options *options)
                 options->receive_mode = PR_RECEIVE_RELAY;
             } else if (strcmp(value, "direct") == 0) {
                 options->receive_mode = PR_RECEIVE_DIRECT;
-            } else if (strcmp(value, "single-relay") == 0) {
+            } else if (strcmp(value, "shared-relay") == 0 ||
+                       strcmp(value, "single-relay") == 0) {
                 options->receive_mode = PR_RECEIVE_SINGLE_RELAY;
             } else {
                 return EINVAL;
             }
+        } else if (option_value(arg, "--shared-relays=", &value)) {
+            options->shared_relays =
+                (uint32_t)parse_u64(value, "shared relay count");
         } else if (option_value(arg, "--checksum=", &value)) {
             if (strcmp(value, "on") == 0) {
                 options->checksum = true;
@@ -2322,6 +2346,10 @@ static int parse_options(int argc, char **argv, pr_options *options)
         options->remote_degree >= options->degree ||
         options->iterations == 0 || options->chunks == 0 ||
         options->threads == 0 || options->threads > PR_MAX_THREADS ||
+        options->shared_relays == 0 ||
+        options->shared_relays > options->threads ||
+        (options->receive_mode == PR_RECEIVE_SINGLE_RELAY &&
+         options->threads % options->shared_relays != 0) ||
         (uint64_t)options->iterations * (options->chunks + 1ULL) >
             UINT32_MAX ||
         options->payload_max < sizeof(pr_chunk_v1) + sizeof(double) ||

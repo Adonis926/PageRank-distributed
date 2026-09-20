@@ -41,7 +41,11 @@ export PR_PROFILE=$PROFILE
 # shellcheck source=/dev/null
 source "$PROFILE"
 
-STAMP=manual-${PR_RECEIVE_MODE}-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
+relay_suffix=
+if [[ $PR_RECEIVE_MODE == shared-relay ]]; then
+  relay_suffix=-r${PR_SHARED_RELAYS:-1}
+fi
+STAMP=manual-${PR_RECEIVE_MODE}${relay_suffix}-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
 RESULT_DIR=/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/$STAMP
 
 LAUNCH_ENV=(
@@ -103,8 +107,8 @@ print_plan() {
   local relay_threads_per_vm=0
   if [[ $PR_RECEIVE_MODE == relay ]]; then
     relay_threads_per_vm=$PR_THREADS
-  elif [[ $PR_RECEIVE_MODE == single-relay ]]; then
-    relay_threads_per_vm=1
+  elif [[ $PR_RECEIVE_MODE == shared-relay ]]; then
+    relay_threads_per_vm=${PR_SHARED_RELAYS:-1}
   fi
   cat <<EOF
 profile_check=ok

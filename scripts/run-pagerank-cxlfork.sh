@@ -9,9 +9,10 @@ source "$PROFILE"
 PR_RECEIVE_MODE=${PR_RECEIVE_MODE:-relay}
 PR_TRACE_STAGES=${PR_TRACE_STAGES:-0}
 case "$PR_RECEIVE_MODE" in
-  relay|direct|single-relay) ;;
-  *) echo "PR_RECEIVE_MODE must be relay, direct, or single-relay" >&2; exit 2 ;;
+  relay|direct|shared-relay) ;;
+  *) echo "PR_RECEIVE_MODE must be relay, direct, or shared-relay" >&2; exit 2 ;;
 esac
+PR_SHARED_RELAYS=${PR_SHARED_RELAYS:-1}
 
 ACTION=${1:-bench}
 STAMP=${PR_STAMP:-$(date +%Y%m%d-%H%M%S)}
@@ -297,6 +298,9 @@ common_args() {
   if [[ $PR_RECEIVE_MODE != direct ]]; then
     printf '%s ' "--relay-cpus=$PR_RELAY_CPUS"
   fi
+  if [[ $PR_RECEIVE_MODE == shared-relay ]]; then
+    printf '%s ' "--shared-relays=$PR_SHARED_RELAYS"
+  fi
   if [[ $PR_TRACE_STAGES == 1 ]]; then
     printf '%s ' "--trace-stages"
   fi
@@ -375,11 +379,11 @@ run_once() {
     grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
     grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
     grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
-  elif [[ $PR_RECEIVE_MODE == single-relay ]]; then
-    grep -q 'signal_path=hydra-busy-single-relay-futex' "$coordinator_log"
-    grep -q 'receive_mode=single-relay' "$coordinator_log"
-    grep -q 'relay_threads_per_node=1' "$coordinator_log"
-    grep -q 'relay_cpu_policy=shared-one' "$coordinator_log"
+  elif [[ $PR_RECEIVE_MODE == shared-relay ]]; then
+    grep -q 'signal_path=hydra-busy-shared-relay-futex' "$coordinator_log"
+    grep -q 'receive_mode=shared-relay' "$coordinator_log"
+    grep -q "relay_threads_per_node=$PR_SHARED_RELAYS" "$coordinator_log"
+    grep -q 'relay_cpu_policy=shared' "$coordinator_log"
     grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
     grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
     grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
@@ -435,8 +439,8 @@ collect_manifest() {
     local relay_total=0
     if [[ $PR_RECEIVE_MODE == relay ]]; then
       relay_total=$((2 * PR_THREADS))
-    elif [[ $PR_RECEIVE_MODE == single-relay ]]; then
-      relay_total=2
+    elif [[ $PR_RECEIVE_MODE == shared-relay ]]; then
+      relay_total=$((2 * PR_SHARED_RELAYS))
     fi
     printf 'compute_workers_total=%s\nrelay_threads_total=%s\nruntime_threads_total=%s\n' \
       "$((2 * PR_THREADS))" "$relay_total" "$((2 * PR_THREADS + relay_total))"
@@ -461,9 +465,9 @@ collect_manifest() {
     if [[ $PR_RECEIVE_MODE == relay ]]; then
       printf 'signal_path=hydra-busy-local-futex\n'
       printf 'relay_threads_per_node=%s\n' "$PR_THREADS"
-    elif [[ $PR_RECEIVE_MODE == single-relay ]]; then
-      printf 'signal_path=hydra-busy-single-relay-futex\n'
-      printf 'relay_threads_per_node=1\n'
+    elif [[ $PR_RECEIVE_MODE == shared-relay ]]; then
+      printf 'signal_path=hydra-busy-shared-relay-futex\n'
+      printf 'relay_threads_per_node=%s\n' "$PR_SHARED_RELAYS"
     else
       printf 'signal_path=hydra-busy-direct\n'
       printf 'relay_threads_per_node=0\n'
