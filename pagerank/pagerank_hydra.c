@@ -45,6 +45,11 @@ typedef enum pr_state_mode {
     PR_STATE_CXLFORK,
 } pr_state_mode;
 
+typedef enum pr_receive_mode {
+    PR_RECEIVE_RELAY,
+    PR_RECEIVE_DIRECT,
+} pr_receive_mode;
+
 typedef struct pr_options {
     pr_backend backend;
     pr_state_mode state_mode;
@@ -63,6 +68,7 @@ typedef struct pr_options {
     uint32_t threads;
     uint64_t timeout_ms;
     hydra_notify_mode notify_mode;
+    pr_receive_mode receive_mode;
     bool checksum;
     pr_cxlfork_options cxlfork;
 } pr_options;
@@ -84,7 +90,8 @@ typedef struct pr_arm_v1 {
     uint64_t page_checksum;
     uint64_t template_base;
     uint64_t template_bytes;
-    uint64_t reserved[8];
+    uint64_t receive_mode;
+    uint64_t reserved[7];
 } pr_arm_v1;
 
 typedef struct pr_arm_result_v1 {
@@ -391,6 +398,24 @@ static const char *state_name(pr_state_mode mode)
     return mode == PR_STATE_CXLFORK ? "cxlfork" : "local";
 }
 
+static const char *receive_mode_name(pr_receive_mode mode)
+{
+    return mode == PR_RECEIVE_DIRECT ? "direct" : "relay";
+}
+
+static const char *signal_path_name(const pr_options *options)
+{
+    static _Thread_local char name[64];
+
+    snprintf(name, sizeof(name), "hydra-%s-%s",
+             hydra_notify_mode_name(
+                 hydra_effective_notify_mode(options->notify_mode)),
+             options->receive_mode == PR_RECEIVE_DIRECT
+                 ? "direct"
+                 : "local-futex");
+    return name;
+}
+
 static int parse_cpu_list(const char *text, int *cpus, uint32_t capacity)
 {
     char *copy;
@@ -648,6 +673,19 @@ static int release_relay_message(pr_node_ctx *ctx, uint32_t tid,
     return err != 0 ? err : consume_error;
 }
 
+static int release_data_message(pr_node_ctx *ctx, uint32_t tid,
+                                uint32_t sequence, uint64_t offset)
+{
+    if (ctx->options.receive_mode == PR_RECEIVE_RELAY) {
+        return release_relay_message(ctx, tid, sequence, offset);
+    }
+
+    uint64_t begin = now_ns();
+    int err = hydra_release_message(ctx->rx[tid], offset);
+    ctx->transport[tid].release_ns += now_ns() - begin;
+    return err;
+}
+
 static int recv_response_wait(hydra_ctx *context, uint64_t *offset,
                               const hydra_msg **message,
                               const uint8_t **payload, uint64_t timeout_ms,
@@ -775,13 +813,22 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
     const hydra_msg *message;
     const uint8_t *payload;
     uint32_t sequence = iteration * (ctx->options.chunks + 1U) + chunk + 1U;
-    int err = relay_receive(ctx, tid, sequence, message_offset, &message,
+    int err;
+
+    if (ctx->options.receive_mode == PR_RECEIVE_DIRECT) {
+        err = recv_request_wait(ctx->rx[tid], message_offset, &message,
+                                &payload, ctx->options.timeout_ms,
+                                &stats->recv_wait_ns,
+                                ctx->options.notify_mode, stats);
+    } else {
+        err = relay_receive(ctx, tid, sequence, message_offset, &message,
                             &payload);
+    }
     if (err != 0) {
         return err;
     }
     if (message->op != PR_OP_DATA || message->len < sizeof(pr_chunk_v1)) {
-        (void)release_relay_message(ctx, tid, sequence, *message_offset);
+        (void)release_data_message(ctx, tid, sequence, *message_offset);
         return EPROTO;
     }
     const pr_chunk_v1 *header = (const pr_chunk_v1 *)payload;
@@ -791,7 +838,7 @@ static int recv_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
         header->iteration != iteration || header->tid != tid ||
         header->chunk != chunk || header->value_count != expected_count ||
         message->len != sizeof(*header) + expected_count * sizeof(double)) {
-        (void)release_relay_message(ctx, tid, sequence, *message_offset);
+        (void)release_data_message(ctx, tid, sequence, *message_offset);
         return EILSEQ;
     }
     *values = (const double *)(payload + sizeof(*header));
@@ -839,7 +886,16 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     uint64_t offset;
     uint32_t sequence = iteration * (ctx->options.chunks + 1U) +
                         ctx->options.chunks + 1U;
-    int err = relay_receive(ctx, tid, sequence, &offset, &message, &payload);
+    int err;
+
+    if (ctx->options.receive_mode == PR_RECEIVE_DIRECT) {
+        err = recv_request_wait(ctx->rx[tid], &offset, &message, &payload,
+                                ctx->options.timeout_ms,
+                                &stats->recv_wait_ns,
+                                ctx->options.notify_mode, stats);
+    } else {
+        err = relay_receive(ctx, tid, sequence, &offset, &message, &payload);
+    }
     if (err != 0) {
         return err;
     }
@@ -852,7 +908,7 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
         !isfinite(header->local_residual) ||
         ((tid != 0 || iteration + 1U != ctx->options.iterations) &&
          header->local_residual != 0.0)) {
-        (void)release_relay_message(ctx, tid, sequence, offset);
+        (void)release_data_message(ctx, tid, sequence, offset);
         return EILSEQ;
     }
     if (tid == 0 && iteration + 1U == ctx->options.iterations) {
@@ -861,7 +917,7 @@ static int recv_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     }
     stats->messages_received++;
     stats->payload_bytes_received += message->len;
-    return release_relay_message(ctx, tid, sequence, offset);
+    return release_data_message(ctx, tid, sequence, offset);
 }
 
 static void remember_worker_error(pr_node_ctx *ctx, int err)
@@ -963,7 +1019,7 @@ static void *worker_main(void *opaque)
                     target[vertex] = base_rank + damping * incoming;
                     local_residual += fabs(target[vertex] - source[vertex]);
                 }
-                err = release_relay_message(
+                err = release_data_message(
                     ctx, tid,
                     iteration * (ctx->options.chunks + 1U) + chunk + 1U,
                     message_offset);
@@ -1046,15 +1102,17 @@ static int node_init_compute(pr_node_ctx *ctx)
     }
     atomic_init(&ctx->start_gate, 0);
     atomic_init(&ctx->worker_error, 0);
-    for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
-        ctx->relay[tid].ctx = ctx;
-        ctx->relay[tid].tid = tid;
-        atomic_init(&ctx->relay[tid].delivered, 0);
-        atomic_init(&ctx->relay[tid].consumed, 0);
-        err = pthread_create(&ctx->relay[tid].thread, NULL, rx_relay_main,
-                             &ctx->relay[tid]);
-        if (err != 0) {
-            return err;
+    if (ctx->options.receive_mode == PR_RECEIVE_RELAY) {
+        for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
+            ctx->relay[tid].ctx = ctx;
+            ctx->relay[tid].tid = tid;
+            atomic_init(&ctx->relay[tid].delivered, 0);
+            atomic_init(&ctx->relay[tid].consumed, 0);
+            err = pthread_create(&ctx->relay[tid].thread, NULL,
+                                 rx_relay_main, &ctx->relay[tid]);
+            if (err != 0) {
+                return err;
+            }
         }
     }
     for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
@@ -1077,10 +1135,12 @@ static int node_join_compute(pr_node_ctx *ctx)
             join_error = err;
         }
     }
-    for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
-        int err = pthread_join(ctx->relay[tid].thread, NULL);
-        if (err != 0 && join_error == 0) {
-            join_error = err;
+    if (ctx->options.receive_mode == PR_RECEIVE_RELAY) {
+        for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
+            int err = pthread_join(ctx->relay[tid].thread, NULL);
+            if (err != 0 && join_error == 0) {
+                join_error = err;
+            }
         }
     }
     int worker_error = atomic_load(&ctx->worker_error);
@@ -1103,14 +1163,18 @@ static void sum_transport(const pr_node_ctx *ctx, pr_node_result_v1 *result)
         result->send_retries += stats->send_retries;
         result->hydra_wait_ns += stats->wait_ns;
         result->hydra_wait_calls += stats->wait_calls;
-        result->local_futex_wait_ns += stats->futex.wait_ns +
-                                       ctx->relay[tid].futex.wait_ns;
-        result->local_futex_wake_ns += stats->futex.wake_ns +
-                                       ctx->relay[tid].futex.wake_ns;
-        result->local_futex_wait_calls += stats->futex.wait_calls +
-                                          ctx->relay[tid].futex.wait_calls;
-        result->local_futex_wake_calls += stats->futex.wake_calls +
-                                          ctx->relay[tid].futex.wake_calls;
+        result->local_futex_wait_ns += stats->futex.wait_ns;
+        result->local_futex_wake_ns += stats->futex.wake_ns;
+        result->local_futex_wait_calls += stats->futex.wait_calls;
+        result->local_futex_wake_calls += stats->futex.wake_calls;
+        if (ctx->options.receive_mode == PR_RECEIVE_RELAY) {
+            result->local_futex_wait_ns += ctx->relay[tid].futex.wait_ns;
+            result->local_futex_wake_ns += ctx->relay[tid].futex.wake_ns;
+            result->local_futex_wait_calls +=
+                ctx->relay[tid].futex.wait_calls;
+            result->local_futex_wake_calls +=
+                ctx->relay[tid].futex.wake_calls;
+        }
         result->local_futex_handoff_ns += stats->futex.handoff_ns;
         result->local_futex_handoff_calls += stats->futex.handoff_calls;
     }
@@ -1253,6 +1317,7 @@ static int run_coordinator(const pr_options *options)
         .page_checksum = options->cxlfork.page_checksum,
         .template_base = options->cxlfork.base,
         .template_bytes = options->cxlfork.bytes,
+        .receive_mode = options->receive_mode,
     };
     uint64_t job_begin_ns = now_ns();
     err = send_request_wait(control, ctx.run_id, PR_OP_ARM, &arm,
@@ -1412,8 +1477,8 @@ static int run_coordinator(const pr_options *options)
            " effective_notify=%s run_id=%" PRIu64
            " vertices=%" PRIu64 " degree=%u remote_degree=%u"
            " iterations=%u chunks=%u threads_per_node=%u total_threads=%u"
-           " relay_threads_per_node=%u signal_path=hydra-%s-local-futex"
-           " relay_cpu_policy=%s"
+           " relay_threads_per_node=%u signal_path=%s"
+           " receive_mode=%s relay_cpu_policy=%s"
            " compute_threads_total=%u relay_threads_total=%u"
            " runtime_threads_total=%u"
            " elapsed_ms=%.3f medges_per_sec=%.3f job_e2e_ms=%.3f"
@@ -1459,15 +1524,24 @@ static int run_coordinator(const pr_options *options)
            ctx.run_id, 2 * options->vertices, options->degree,
            options->remote_degree, options->iterations, options->chunks,
            options->threads, options->threads * 2,
-           options->threads,
-           hydra_notify_mode_name(
-               hydra_effective_notify_mode(options->notify_mode)),
-           options->relay_cpu_list != NULL &&
-                   strcmp(options->relay_cpu_list, options->cpu_list) != 0
-               ? "dedicated"
-               : "shared",
-           options->threads * 2, options->threads * 2,
-           options->threads * 4,
+           options->receive_mode == PR_RECEIVE_RELAY
+               ? options->threads
+               : 0,
+           signal_path_name(options), receive_mode_name(options->receive_mode),
+           options->receive_mode == PR_RECEIVE_DIRECT
+               ? "none"
+               : (options->relay_cpu_list != NULL &&
+                          strcmp(options->relay_cpu_list,
+                                 options->cpu_list) != 0
+                      ? "dedicated"
+                      : "shared"),
+           options->threads * 2,
+           options->receive_mode == PR_RECEIVE_RELAY
+               ? options->threads * 2
+               : 0,
+           options->receive_mode == PR_RECEIVE_RELAY
+               ? options->threads * 4
+               : options->threads * 2,
            elapsed_ns / 1e6, edges / (elapsed_ns / 1e9) / 1e6,
            (job_end_ns - job_begin_ns) / 1e6, graph_build_ns / 1e6,
            remote_arm.arm_total_ns / 1e6,
@@ -1532,7 +1606,8 @@ static int validate_arm(const pr_options *options, const hydra_msg *message,
         arm->remote_degree != options->remote_degree ||
         arm->iterations != options->iterations ||
         arm->chunks != options->chunks || arm->threads != options->threads ||
-        arm->state_mode != (uint32_t)options->state_mode) {
+        arm->state_mode != (uint32_t)options->state_mode ||
+        arm->receive_mode != (uint64_t)options->receive_mode) {
         return EILSEQ;
     }
     if (options->state_mode == PR_STATE_CXLFORK &&
@@ -1712,7 +1787,7 @@ static int run_worker(const pr_options *options)
     if (err == 0) {
         printf("pr_worker_v1 status=ok state=%s run_id=%" PRIu64
                " elapsed_ms=%.3f restore_wrapper_ms=%.3f"
-               " relay_threads=%u signal_path=hydra-%s-local-futex"
+               " relay_threads=%u signal_path=%s receive_mode=%s"
                " local_futex_wait_sum_ms=%.3f"
                " local_futex_wake_sum_ms=%.3f"
                " local_futex_wait_calls=%" PRIu64
@@ -1734,9 +1809,11 @@ static int run_worker(const pr_options *options)
                " checksum=%.12g verify=ok\n",
                state_name(options->state_mode), ctx.run_id,
                ctx.elapsed_ns / 1e6, cxlfork.timing.wrapper_total_ns / 1e6,
-               options->threads,
-               hydra_notify_mode_name(
-                   hydra_effective_notify_mode(options->notify_mode)),
+               options->receive_mode == PR_RECEIVE_RELAY
+                   ? options->threads
+                   : 0,
+               signal_path_name(options),
+               receive_mode_name(options->receive_mode),
                result.local_futex_wait_ns / 1e6,
                result.local_futex_wake_ns / 1e6,
                result.local_futex_wait_calls,
@@ -1858,7 +1935,7 @@ static void usage(const char *program)
             "  --iterations=N --chunks=N --threads=N --cpus=LIST\n"
             "  --relay-cpus=LIST (defaults to --cpus)\n"
             "  --state=local|cxlfork --checksum=on|off --timeout-ms=N\n"
-            "  --notify=umwait|busy\n"
+            "  --notify=umwait|busy --receive-mode=relay|direct\n"
             "  --map-size=N --queue-capacity=N --payload-max=N\n"
             "  --key=N --generation=N --page-checksum=N\n"
             "  --template-base=N --template-bytes=N --full-validate\n",
@@ -1881,6 +1958,7 @@ static void default_options(pr_options *options)
     options->threads = 16;
     options->timeout_ms = 120000;
     options->notify_mode = HYDRA_NOTIFY_UMWAIT;
+    options->receive_mode = PR_RECEIVE_RELAY;
     options->cxlfork.base = PR_TEMPLATE_BASE_DEFAULT;
     options->cxlfork.bytes = PR_TEMPLATE_BYTES_DEFAULT;
 }
@@ -1944,6 +2022,14 @@ static int parse_options(int argc, char **argv, pr_options *options)
                 options->notify_mode = HYDRA_NOTIFY_UMWAIT;
             } else if (strcmp(value, "busy") == 0) {
                 options->notify_mode = HYDRA_NOTIFY_BUSY;
+            } else {
+                return EINVAL;
+            }
+        } else if (option_value(arg, "--receive-mode=", &value)) {
+            if (strcmp(value, "relay") == 0) {
+                options->receive_mode = PR_RECEIVE_RELAY;
+            } else if (strcmp(value, "direct") == 0) {
+                options->receive_mode = PR_RECEIVE_DIRECT;
             } else {
                 return EINVAL;
             }

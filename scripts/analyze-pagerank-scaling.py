@@ -47,6 +47,7 @@ def main() -> int:
             {
                 "compute_workers_total": int(config["compute_workers_total"]),
                 "compute_workers_per_vm": int(config["threads_per_node"]),
+                "receive_mode": config["receive_mode"],
                 "relay_threads_total": int(config["relay_threads_total"]),
                 "guest_vcpus_per_vm": int(config["guest_vcpus"]),
                 "total_guest_vcpus": 2 * int(config["guest_vcpus"]),

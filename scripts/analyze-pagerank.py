@@ -105,20 +105,41 @@ def main() -> int:
             raise RuntimeError(f"PageRank checksum is not one in {path}")
         if row.get("residual_mode") != "final-only":
             raise RuntimeError(f"unexpected residual policy in {path}")
-        if row.get("signal_path") != "hydra-busy-local-futex":
+        receive_mode = row.get("receive_mode")
+        if receive_mode not in {"relay", "direct"}:
+            raise RuntimeError(f"unexpected receive mode in {path}")
+        expected_signal_path = (
+            "hydra-busy-local-futex"
+            if receive_mode == "relay"
+            else "hydra-busy-direct"
+        )
+        if row.get("signal_path") != expected_signal_path:
             raise RuntimeError(f"unexpected cross-OS signal path in {path}")
         if row.get("notify") != "busy" or row.get("effective_notify") != "busy":
             raise RuntimeError(f"HydraRPC busy-poll path is not effective in {path}")
-        if row.get("relay_cpu_policy") != "dedicated":
-            raise RuntimeError(f"relay CPUs are not dedicated in {path}")
-        if int(row["relay_threads_per_node"]) != int(row["threads_per_node"]):
-            raise RuntimeError(f"relay/worker count mismatch in {path}")
-        if int(row["local_futex_wait_calls"]) == 0:
-            raise RuntimeError(f"local futex wait path was not exercised in {path}")
-        if int(row["local_futex_wake_calls"]) == 0:
-            raise RuntimeError(f"local futex wake path was not exercised in {path}")
-        if int(row["local_futex_handoff_calls"]) == 0:
-            raise RuntimeError(f"local futex handoff was not observed in {path}")
+        if receive_mode == "relay":
+            if row.get("relay_cpu_policy") != "dedicated":
+                raise RuntimeError(f"relay CPUs are not dedicated in {path}")
+            if int(row["relay_threads_per_node"]) != int(row["threads_per_node"]):
+                raise RuntimeError(f"relay/worker count mismatch in {path}")
+            if int(row["local_futex_wait_calls"]) == 0:
+                raise RuntimeError(f"local futex wait path was not exercised in {path}")
+            if int(row["local_futex_wake_calls"]) == 0:
+                raise RuntimeError(f"local futex wake path was not exercised in {path}")
+            if int(row["local_futex_handoff_calls"]) == 0:
+                raise RuntimeError(f"local futex handoff was not observed in {path}")
+        else:
+            if row.get("relay_cpu_policy") != "none":
+                raise RuntimeError(f"direct mode unexpectedly has relay CPUs in {path}")
+            if int(row["relay_threads_per_node"]) != 0:
+                raise RuntimeError(f"direct mode unexpectedly has relay threads in {path}")
+            for field in (
+                "local_futex_wait_calls",
+                "local_futex_wake_calls",
+                "local_futex_handoff_calls",
+            ):
+                if int(row[field]) != 0:
+                    raise RuntimeError(f"direct mode unexpectedly used {field} in {path}")
         if row.get("restore_policy") != "mow":
             raise RuntimeError(f"CXLfork restore is not MoW in {path}")
         if int(row["rank_pfn_pages"]) != 0:
@@ -150,6 +171,7 @@ def main() -> int:
         "remote_degree", "iterations", "chunks", "threads_per_node",
         "total_threads", "compute_threads_total", "relay_threads_total",
         "runtime_threads_total", "relay_threads_per_node", "signal_path",
+        "receive_mode",
         "relay_cpu_policy",
         "elapsed_ms", "medges_per_sec", "job_e2e_ms",
         "activation_overhead_ms", "host_orchestration_e2e_ms",
@@ -170,6 +192,7 @@ def main() -> int:
 
     transport = [
         "sample", "run_id", "notify", "effective_notify", "signal_path",
+        "receive_mode",
         "relay_threads_per_node", "elapsed_ms",
         "hydra_send_cpu_sum_ms", "hydra_recv_wait_sum_ms",
         "hydra_release_sum_ms", "hydra_wait_cpu_sum_ms",

@@ -6,6 +6,12 @@ PROFILE=${PR_PROFILE:-$ROOT/config/pagerank-real-cxl-103.env}
 # shellcheck source=/dev/null
 source "$PROFILE"
 
+PR_RECEIVE_MODE=${PR_RECEIVE_MODE:-relay}
+case "$PR_RECEIVE_MODE" in
+  relay|direct) ;;
+  *) echo "PR_RECEIVE_MODE must be relay or direct" >&2; exit 2 ;;
+esac
+
 ACTION=${1:-bench}
 STAMP=${PR_STAMP:-$(date +%Y%m%d-%H%M%S)}
 RESULT_DIR=${PR_RESULT_DIR:-/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/$STAMP}
@@ -281,12 +287,15 @@ common_args() {
     "--chunks=$PR_CHUNKS" \
     "--threads=$PR_THREADS" \
     "--cpus=$PR_GUEST_CPUS" \
-    "--relay-cpus=$PR_RELAY_CPUS" \
+    "--receive-mode=$PR_RECEIVE_MODE" \
     "--map-size=$PR_MAP_SIZE" \
     "--queue-capacity=$PR_QUEUE_CAPACITY" \
     "--payload-max=$PR_PAYLOAD_MAX" \
     "--timeout-ms=$PR_TIMEOUT_MS" \
     "--notify=$PR_NOTIFY"
+  if [[ $PR_RECEIVE_MODE == relay ]]; then
+    printf '%s ' "--relay-cpus=$PR_RELAY_CPUS"
+  fi
 }
 
 prepare_template() {
@@ -355,11 +364,22 @@ run_once() {
     return 1
   fi
   grep -q 'pr_run_v1 status=ok .* verify=ok' "$coordinator_log"
-  grep -q 'signal_path=hydra-busy-local-futex' "$coordinator_log"
-  grep -q 'relay_cpu_policy=dedicated' "$coordinator_log"
-  grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
-  grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
-  grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
+  if [[ $PR_RECEIVE_MODE == relay ]]; then
+    grep -q 'signal_path=hydra-busy-local-futex' "$coordinator_log"
+    grep -q 'receive_mode=relay' "$coordinator_log"
+    grep -q 'relay_cpu_policy=dedicated' "$coordinator_log"
+    grep -Eq 'local_futex_wait_calls=[1-9][0-9]*' "$coordinator_log"
+    grep -Eq 'local_futex_wake_calls=[1-9][0-9]*' "$coordinator_log"
+    grep -Eq 'local_futex_handoff_calls=[1-9][0-9]*' "$coordinator_log"
+  else
+    grep -q 'signal_path=hydra-busy-direct' "$coordinator_log"
+    grep -q 'receive_mode=direct' "$coordinator_log"
+    grep -q 'relay_threads_per_node=0' "$coordinator_log"
+    grep -q 'relay_cpu_policy=none' "$coordinator_log"
+    grep -q 'local_futex_wait_calls=0' "$coordinator_log"
+    grep -q 'local_futex_wake_calls=0' "$coordinator_log"
+    grep -q 'local_futex_handoff_calls=0' "$coordinator_log"
+  fi
   grep -q 'pr_worker_v1 status=ok .* verify=ok' "$worker_log"
   if [[ "$state" == cxlfork ]]; then
     grep -q 'restore_policy=mow' "$coordinator_log"
@@ -398,10 +418,12 @@ collect_manifest() {
     printf 'iterations=%s\nchunks=%s\nthreads_per_node=%s\n' \
       "$PR_ITERATIONS" "$PR_CHUNKS" "$PR_THREADS"
     printf 'worker_guest_cpus=%s\nrelay_guest_cpus=%s\n' \
-      "$PR_GUEST_CPUS" "$PR_RELAY_CPUS"
+      "$PR_GUEST_CPUS" "${PR_RELAY_CPUS:-none}"
     printf 'guest_memory=%s\nguest_vcpus=%s\n' "$PR_VM_MEM" "$PR_VM_SMP"
+    local relay_total=0
+    [[ $PR_RECEIVE_MODE == relay ]] && relay_total=$((2 * PR_THREADS))
     printf 'compute_workers_total=%s\nrelay_threads_total=%s\nruntime_threads_total=%s\n' \
-      "$((2 * PR_THREADS))" "$((2 * PR_THREADS))" "$((4 * PR_THREADS))"
+      "$((2 * PR_THREADS))" "$relay_total" "$((2 * PR_THREADS + relay_total))"
     printf 'qemu=%s\nmachine=%s\ncpu_model=%s\nhydra_pci_bus=%s\n' \
       "$PR_QEMU" "$PR_MACHINE" "$PR_CPU_MODEL" "$PR_HYDRA_PCI_BUS"
     printf 'hydra0_pci_addr=%s\nhydra1_pci_addr=%s\n' \
@@ -417,8 +439,14 @@ collect_manifest() {
       "${PR_EXPECTED_HOST_CPU_OVERLAP:-0}" "${PR_ALLOW_HOST_CPU_OVERLAP:-0}"
     printf 'endpoint0=%s\nendpoint1=%s\n' "$PR_ENDPOINT0" "$PR_ENDPOINT1"
     printf 'notify=%s\n' "$PR_NOTIFY"
-    printf 'signal_path=hydra-busy-local-futex\n'
-    printf 'relay_threads_per_node=%s\n' "$PR_THREADS"
+    printf 'receive_mode=%s\n' "$PR_RECEIVE_MODE"
+    if [[ $PR_RECEIVE_MODE == relay ]]; then
+      printf 'signal_path=hydra-busy-local-futex\n'
+      printf 'relay_threads_per_node=%s\n' "$PR_THREADS"
+    else
+      printf 'signal_path=hydra-busy-direct\n'
+      printf 'relay_threads_per_node=0\n'
+    fi
   } >"$RESULT_DIR/manifest/config.txt"
   uname -a >"$RESULT_DIR/manifest/host-uname.txt"
   lscpu >"$RESULT_DIR/manifest/host-lscpu.txt"
