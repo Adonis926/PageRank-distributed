@@ -112,6 +112,7 @@ compute_workers_total=$PR_SCALE
 compute_workers_per_vm=$PR_THREADS
 receive_mode=$PR_RECEIVE_MODE
 relay_threads_per_vm=$relay_threads_per_vm
+data_lanes_per_vm=$PR_THREADS
 guest_vcpus_per_vm=$PR_VM_SMP
 guest_memory_per_vm=$PR_VM_MEM
 vm0_host_cpus=$PR_VM0_HOST_CPUS

@@ -440,6 +440,7 @@ collect_manifest() {
     fi
     printf 'compute_workers_total=%s\nrelay_threads_total=%s\nruntime_threads_total=%s\n' \
       "$((2 * PR_THREADS))" "$relay_total" "$((2 * PR_THREADS + relay_total))"
+    printf 'data_lanes_per_node=%s\n' "$PR_THREADS"
     printf 'qemu=%s\nmachine=%s\ncpu_model=%s\nhydra_pci_bus=%s\n' \
       "$PR_QEMU" "$PR_MACHINE" "$PR_CPU_MODEL" "$PR_HYDRA_PCI_BUS"
     printf 'hydra0_pci_addr=%s\nhydra1_pci_addr=%s\n' \

@@ -247,8 +247,6 @@ struct pr_node_ctx {
     pr_worker_arg worker_arg[PR_MAX_THREADS];
     pr_rx_relay relay[PR_MAX_THREADS];
     pr_transport_stats single_relay_transport;
-    pthread_mutex_t data_tx_lock;
-    pthread_mutex_t data_release_lock;
     pthread_barrier_t barrier;
     atomic_uint start_gate;
     atomic_int worker_error;
@@ -753,27 +751,50 @@ static void *single_rx_relay_main(void *opaque)
         return NULL;
     }
 
-    for (uint64_t index = 0; index < message_count; index++) {
+    uint32_t next_lane = 0;
+    uint64_t wait_begin = now_ns();
+    for (uint64_t index = 0; index < message_count;) {
         uint64_t offset = 0;
         const hydra_msg *message = NULL;
         const uint8_t *payload = NULL;
         uint32_t tid = 0;
         uint32_t sequence = 0;
+        uint32_t lane = UINT32_MAX;
 
-        err = recv_request_wait(ctx->rx[0], &offset, &message, &payload,
-                                ctx->options.timeout_ms,
-                                &stats->recv_wait_ns,
-                                ctx->options.notify_mode, stats);
-        if (err == 0) {
-            err = single_relay_route(ctx, message, payload, &tid,
-                                     &sequence);
+        for (uint32_t scanned = 0; scanned < ctx->options.threads;
+             scanned++) {
+            uint32_t candidate =
+                (next_lane + scanned) % ctx->options.threads;
+            err = hydra_recv_request(ctx->rx[candidate], &offset,
+                                     &message, &payload);
+            if (err == 0) {
+                lane = candidate;
+                next_lane = (candidate + 1U) % ctx->options.threads;
+                break;
+            }
+            if (err != EAGAIN) {
+                single_relay_fail(ctx, err);
+                return NULL;
+            }
+        }
+        if (lane == UINT32_MAX) {
+            if (now_ns() - wait_begin >=
+                ctx->options.timeout_ms * UINT64_C(1000000)) {
+                single_relay_fail(ctx, ETIMEDOUT);
+                return NULL;
+            }
+            wait_hydra(ctx->rx[next_lane], HYDRA_WAIT_REQUEST,
+                       ctx->options.notify_mode, stats);
+            continue;
+        }
+        stats->recv_wait_ns += now_ns() - wait_begin;
+
+        err = single_relay_route(ctx, message, payload, &tid, &sequence);
+        if (err == 0 && tid != lane) {
+            err = EILSEQ;
         }
         if (err != 0) {
-            if (message != NULL) {
-                pthread_mutex_lock(&ctx->data_release_lock);
-                (void)hydra_release_message(ctx->rx[0], offset);
-                pthread_mutex_unlock(&ctx->data_release_lock);
-            }
+            (void)hydra_release_message(ctx->rx[lane], offset);
             single_relay_fail(ctx, err);
             return NULL;
         }
@@ -784,9 +805,7 @@ static void *single_rx_relay_main(void *opaque)
                                           sequence - 1,
                                           &mailbox->futex);
             if (err != 0) {
-                pthread_mutex_lock(&ctx->data_release_lock);
-                (void)hydra_release_message(ctx->rx[0], offset);
-                pthread_mutex_unlock(&ctx->data_release_lock);
+                (void)hydra_release_message(ctx->rx[lane], offset);
                 single_relay_fail(ctx, err);
                 return NULL;
             }
@@ -795,6 +814,8 @@ static void *single_rx_relay_main(void *opaque)
         mailbox->message = message;
         mailbox->payload = payload;
         relay_publish(mailbox, sequence, 0);
+        index++;
+        wait_begin = now_ns();
     }
     return NULL;
 }
@@ -833,16 +854,7 @@ static int release_relay_message(pr_node_ctx *ctx, uint32_t tid,
                                  uint32_t sequence, uint64_t offset)
 {
     uint64_t begin = now_ns();
-    hydra_ctx *rx = ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY
-                        ? ctx->rx[0]
-                        : ctx->rx[tid];
-    if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        pthread_mutex_lock(&ctx->data_release_lock);
-    }
-    int err = hydra_release_message(rx, offset);
-    if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        pthread_mutex_unlock(&ctx->data_release_lock);
-    }
+    int err = hydra_release_message(ctx->rx[tid], offset);
     ctx->transport[tid].release_ns += now_ns() - begin;
     int consume_error = relay_consume(ctx, tid, sequence);
 
@@ -953,9 +965,7 @@ static int send_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
                         ctx->options.timeout_ms * UINT64_C(1000000);
     uint64_t begin = now_ns();
     int err;
-    hydra_ctx *tx = ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY
-                        ? ctx->tx[0]
-                        : ctx->tx[tid];
+    hydra_ctx *tx = ctx->tx[tid];
 
     if (count > UINT32_MAX || length64 > ctx->options.payload_max ||
         length64 > UINT32_MAX) {
@@ -963,9 +973,6 @@ static int send_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
     }
     uint64_t req_id = ((uint64_t)iteration << 32) |
                       ((uint64_t)tid << 20) | chunk;
-    if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        pthread_mutex_lock(&ctx->data_tx_lock);
-    }
     do {
         err = hydra_send_request_with_writer_observed(
             tx, req_id, PR_OP_DATA, (uint32_t)length64, now_ns(),
@@ -986,9 +993,6 @@ static int send_chunk(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration,
     } while (now_ns() < deadline);
     if (err == EAGAIN) {
         err = ETIMEDOUT;
-    }
-    if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        pthread_mutex_unlock(&ctx->data_tx_lock);
     }
     return err;
 }
@@ -1053,19 +1057,10 @@ static int send_barrier(pr_node_ctx *ctx, uint32_t tid, uint32_t iteration)
     uint64_t begin = now_ns();
     uint64_t req_id = ((uint64_t)iteration << 32) |
                       ((uint64_t)tid << 20) | UINT64_C(0xfffff);
-    hydra_ctx *tx = ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY
-                        ? ctx->tx[0]
-                        : ctx->tx[tid];
-    if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        pthread_mutex_lock(&ctx->data_tx_lock);
-    }
-    int err = send_request_wait(tx, req_id, PR_OP_BARRIER,
+    int err = send_request_wait(ctx->tx[tid], req_id, PR_OP_BARRIER,
                                 &header, sizeof(header),
                                 ctx->options.timeout_ms,
                                 ctx->options.notify_mode, stats);
-    if (ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY) {
-        pthread_mutex_unlock(&ctx->data_tx_lock);
-    }
     stats->send_ns += now_ns() - begin;
     if (err == 0) {
         stats->messages_sent++;
@@ -1299,13 +1294,6 @@ static int node_init_compute(pr_node_ctx *ctx)
     }
     atomic_init(&ctx->start_gate, 0);
     atomic_init(&ctx->worker_error, 0);
-    err = pthread_mutex_init(&ctx->data_tx_lock, NULL);
-    if (err == 0) {
-        err = pthread_mutex_init(&ctx->data_release_lock, NULL);
-    }
-    if (err != 0) {
-        return err;
-    }
     if (ctx->options.receive_mode != PR_RECEIVE_DIRECT) {
         for (uint32_t tid = 0; tid < ctx->options.threads; tid++) {
             ctx->relay[tid].ctx = ctx;
@@ -1436,10 +1424,7 @@ static bool valid_node_result(const pr_node_result_v1 *result,
 static int node_open_data_contexts(pr_node_ctx *ctx, bool create)
 {
     int err;
-    uint32_t context_count =
-        ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY
-            ? 1U
-            : ctx->options.threads;
+    uint32_t context_count = ctx->options.threads;
 
     for (uint32_t tid = 0; tid < context_count; tid++) {
         uint64_t connection = tid + 1;
@@ -1468,10 +1453,7 @@ static int node_open_data_contexts(pr_node_ctx *ctx, bool create)
 static void node_close(pr_node_ctx *ctx)
 {
     uint64_t rank_bytes = ctx->options.vertices * sizeof(double);
-    uint32_t context_count =
-        ctx->options.receive_mode == PR_RECEIVE_SINGLE_RELAY
-            ? 1U
-            : ctx->options.threads;
+    uint32_t context_count = ctx->options.threads;
 
     for (uint32_t tid = 0; tid < context_count; tid++) {
         hydra_close(ctx->tx[tid]);
