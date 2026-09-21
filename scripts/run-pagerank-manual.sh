@@ -21,8 +21,8 @@ usage:
   ./scripts/run-pagerank-manual.sh 8|16|32|64|128
   ./scripts/run-pagerank-manual.sh 8|16|32|64|128 --check
 
-The number is both the total PageRank compute-worker count and the total guest
-vCPU count across both VMs. The selected profile defines the relay mode.
+The number is the total guest-vCPU count across both VMs. The selected profile
+divides that fixed budget between PageRank workers and HydraRPC relays.
 EOF
 }
 
