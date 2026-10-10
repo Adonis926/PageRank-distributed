@@ -7,12 +7,7 @@ PROFILE=${PR_PROFILE_OVERRIDE:-$ROOT/config/pagerank-real-cxl-103-direct-scaling
 REQUESTED_BACKEND=${CXLFORK_SHARED_BACKEND:-auto}
 CHECK_ONLY=0
 
-VM_WORKSPACE=/home/xtl/cxlfork/cxlfork-repro
-START_VMS=$VM_WORKSPACE/scripts/start-cxlfork-vms.sh
-STOP_VMS=$VM_WORKSPACE/scripts/stop-cxlfork-vms.sh
-LOAD_KVM=/home/xtl/start/hpca/load-native-kvm.sh
 BACKEND_HELPER=${CXLFORK_BACKEND_HELPER:-$ROOT/scripts/cxlde-shared-backend.sh}
-KERNEL=$VM_WORKSPACE/kernel/build-6.6.32/arch/x86/boot/bzImage
 RUNNER=$ROOT/scripts/run-pagerank-cxlfork.sh
 
 usage() {
@@ -53,6 +48,12 @@ export PR_PROFILE=$PROFILE
 # shellcheck source=/dev/null
 source "$PROFILE"
 
+VM_WORKSPACE=${CXLFORK_VM_WORKSPACE:-$PR_VM_WORKSPACE}
+START_VMS=$VM_WORKSPACE/scripts/start-cxlfork-vms.sh
+STOP_VMS=$VM_WORKSPACE/scripts/stop-cxlfork-vms.sh
+LOAD_KVM=${CXLFORK_LOAD_KVM:-/home/xtl/start/hpca/load-native-kvm.sh}
+KERNEL=${CXLFORK_KERNEL_IMAGE:-$VM_WORKSPACE/kernel/build-6.6.32/arch/x86/boot/bzImage}
+
 relay_suffix=
 if [[ $PR_RECEIVE_MODE == shared-relay ]]; then
   relay_suffix=-w${PR_THREADS}-r${PR_SHARED_RELAYS:-1}
@@ -78,7 +79,7 @@ configure_backend() {
 
   if [[ -z $STAMP ]]; then
     STAMP=manual-${PR_RECEIVE_MODE}${relay_suffix}-${CXLFORK_SHARED_BACKEND}-${SCALE}u-8g-$(date +%Y%m%d-%H%M%S)
-    RESULT_DIR=/home/xtl/cxlfork/results/pagerank-cxlfork-hydrarpc/$STAMP
+    RESULT_DIR=$PR_RESULT_ROOT/$STAMP
   fi
   LAUNCH_ENV=(
     "WS=$VM_WORKSPACE"
