@@ -454,6 +454,12 @@ collect_manifest() {
       "$PR_VM_SOCKETS" "$PR_VM_CORES" "$PR_VM_THREADS" "$PR_VM_NUMA_NODES"
     printf 'cxlfork_guest_phys=%s\ncxlfork_guest_size=%s\n' \
       "$PR_CXL_PHYS" "$PR_CXL_SIZE"
+    printf 'shared_backend=%s\nshared_backend_device=%s\n' \
+      "${PR_SHARED_BACKEND:-unknown}" "${PR_SHARED_BACKEND_DEVICE:-unknown}"
+    printf 'shared_backend_align=%s\nshared_backend_size=%s\n' \
+      "${PR_SHARED_BACKEND_ALIGN:-unknown}" "${PR_SHARED_BACKEND_SIZE:-unknown}"
+    printf 'shared_backend_phys_start=%s\nshared_backend_phys_end=%s\n' \
+      "${PR_SHARED_BACKEND_PHYS_START:-unknown}" "${PR_SHARED_BACKEND_PHYS_END:-unknown}"
     printf 'guest_append_extra=%s\n' "$PR_GUEST_APPEND_EXTRA"
     printf 'vm0_host_cpus=%s\nvm1_host_cpus=%s\n' \
       "$PR_VM0_HOST_CPUS" "$PR_VM1_HOST_CPUS"
